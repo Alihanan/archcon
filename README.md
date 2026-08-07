@@ -106,6 +106,39 @@ archcon
 
 Editable installation means changes under `src/archcon/` are used immediately.
 
+# Initialize and upload to GitHub
+
+Create an empty GitHub repository named `archcon`. Do not add a README, license,
+or `.gitignore` on GitHub because this project already contains them. Then run
+from the project root:
+
+```bash
+git init
+git add .
+git commit -m "Initial ArchCon package"
+git branch -M main
+git remote add origin https://github.com/YOUR_GITHUB_USERNAME/archcon.git
+git push -u origin main
+```
+
+If `origin` already exists, replace the remote URL instead:
+
+```bash
+git remote set-url origin https://github.com/YOUR_GITHUB_USERNAME/archcon.git
+git push -u origin main
+```
+
+Alternatively, after installing and authenticating GitHub CLI:
+
+```bash
+gh auth login
+gh repo create archcon --public --source=. --remote=origin --push
+```
+
+Use `--private` instead of `--public` if the repository should initially be
+private. After the push, open the repository's **Actions** tab and confirm that
+the `CI` workflow passes.
+
 # Shipping a release
 
 ## 1. Update release metadata

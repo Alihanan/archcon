@@ -58,11 +58,11 @@ def read_text_file(
         return f"Could not inspect the file: {exc}", ""
 
     if size > max_size_bytes:
-        return (
+        message = (
             f"File is too large ({format_size(size)}). "
-            f"The current limit is {format_size(max_size_bytes)}.",
-            "",
+            f"The current limit is {format_size(max_size_bytes)}."
         )
+        return message, ""
 
     try:
         data = path.read_bytes()
