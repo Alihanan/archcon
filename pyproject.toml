@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "archcon"
+version = "0.1.0"
+description = "A local browser interface and Python toolkit for the ArchCon project."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Your Name" }
+]
+keywords = [
+  "archetypal-analysis",
+  "contrastive-learning",
+  "deep-learning",
+  "bioinformatics",
+  "gene-expression",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+  "charset-normalizer>=3.4,<4",
+  "gradio>=6.22,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.3,<2",
+  "pytest>=8.4,<9",
+  "ruff>=0.12,<1",
+  "twine>=6,<8",
+]
+
+[project.urls]
+Homepage = "https://github.com/YOUR_GITHUB_USERNAME/archcon"
+Repository = "https://github.com/YOUR_GITHUB_USERNAME/archcon"
+Issues = "https://github.com/YOUR_GITHUB_USERNAME/archcon/issues"
+
+[project.scripts]
+archcon = "archcon.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/archcon"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
