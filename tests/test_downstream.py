@@ -1,0 +1,307 @@
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from archcon.data.downstream import (
+    EmbeddingResult,
+    ValidationCheckpoint,
+    egfr_long,
+    prepare_mixed_model_design,
+    prepare_nested_mixed_model_design,
+    repeated_donor_folds,
+    select_embedding_checkpoints,
+    select_molecular_group_winners,
+    summarize_mixed_model_results,
+)
+from archcon.data.training import TrainingConfig
+
+
+def _record(run: str, architecture: str, mse: float, method: str = "Per-dataset RMA"):
+    config = TrainingConfig(
+        hidden_widths=(8,), latent_dim=2, architecture_family=architecture, epochs=1
+    )
+    return ValidationCheckpoint(
+        run=run,
+        path=Path(f"/{run}/best.pt"),
+        checkpoint={"input_dim": 4},
+        method=method,
+        architecture=architecture,
+        latent_dim=2,
+        validation_mse=mse,
+        validation_r2=0.5,
+        validation_objective=mse,
+        best_epoch=1,
+        config=config,
+    )
+
+
+def _patients(n_donors: int = 10) -> pd.DataFrame:
+    rows = []
+    for donor in range(n_donors):
+        for kidney in (1, 2):
+            rows.append(
+                {
+                    "patient": f"{donor}_{kidney}",
+                    "donor": str(donor),
+                    "KDRI_8": 0.8 + donor * 0.1,
+                    "don_patient_age": 35 + donor,
+                    "Cold_ischemia_hours": 8 + donor * 0.25 + kidney * 0.1,
+                    "egfr_7d": 40 + donor + kidney,
+                    "egfr_3m": 45 + donor + kidney,
+                    "egfr_6m": 48 + donor + kidney,
+                    "egfr_12m": 50 + donor + kidney,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def test_checkpoint_comparison_keeps_other_architecture_when_resnet_wins() -> None:
+    records = [
+        _record("run_0001", "ResNet-LN", 0.10),
+        _record("run_0002", "Stadniuk MLP", 0.11),
+        _record("run_0003", "ResNet-LN", 0.12),
+    ]
+    selected = select_embedding_checkpoints(records)
+    assert [item[0] for item in selected] == ["winner_z", "best_stadniuk_z"]
+
+
+def test_molecular_selection_is_separate_per_preprocessing_and_architecture() -> None:
+    records = []
+    run = 0
+    for method in ("Stadniuk rescaling", "Per-dataset RMA", "Global RMA"):
+        for architecture in ("Stadniuk MLP", "ResNet-LN"):
+            first = _record(f"run_{run:04d}", architecture, 0.1, method)
+            second = _record(f"run_{run + 1:04d}", architecture, 0.2, method)
+            records.extend(
+                [
+                    first.__class__(
+                        **{**first.__dict__, "molecular_selection_mse": 10.0 + run}
+                    ),
+                    second.__class__(
+                        **{**second.__dict__, "molecular_selection_mse": 5.0 + run}
+                    ),
+                ]
+            )
+            run += 2
+    selected = select_molecular_group_winners(records)
+    assert len(selected) == 6
+    assert all(record.run.endswith(("1", "3", "5", "7", "9", "11")) for _, _, record in selected)
+
+
+def test_egfr_long_uses_ordered_categorical_time() -> None:
+    wide = _patients(1)
+    long = egfr_long(wide)
+    assert len(long) == 8
+    assert list(long["time"].cat.categories) == ["7d", "3m", "6m", "12m"]
+    assert set(long["patient"]) == {"0_1", "0_2"}
+
+
+def test_repeated_folds_never_split_sibling_kidneys() -> None:
+    patients = _patients()
+    folds = repeated_donor_folds(patients, n_splits=5, n_repeats=3, seed=7)
+    assert len(folds) == 15
+    for _, _, train, test in folds:
+        train_donors = set(patients.iloc[train]["donor"])
+        test_donors = set(patients.iloc[test]["donor"])
+        assert train_donors.isdisjoint(test_donors)
+
+
+def test_mixed_model_design_has_fold_local_features(tmp_path: Path) -> None:
+    patients = _patients()
+    patients.loc[0, "don_patient_age"] = np.nan
+    patients.loc[3, "Cold_ischemia_hours"] = np.nan
+    samples = pd.DataFrame(
+        {
+            "source_row_index": np.arange(len(patients)),
+            "sample_id": patients["patient"],
+            "donor_id": patients["donor"],
+            "has_egfr": True,
+        }
+    )
+    record = _record("run_0001", "Stadniuk MLP", 0.1)
+    z = np.column_stack(
+        [np.arange(len(patients), dtype=np.float32), np.arange(len(patients), dtype=np.float32) ** 2]
+    )
+    result = EmbeddingResult("winner_z", "Winner z", record, z, samples, 0.01)
+    expression = np.arange(len(patients) * 4, dtype=np.float32).reshape(len(patients), 4)
+    design_path, specs_path, specs = prepare_mixed_model_design(
+        patients,
+        [result],
+        expression,
+        samples,
+        tmp_path,
+        n_splits=5,
+        n_repeats=2,
+        seed=3,
+        stratify_column="KDRI_8",
+        include_pca=True,
+    )
+    design = pd.read_csv(design_path)
+    assert specs_path.is_file()
+    assert set(specs["model_id"]) == {
+        "time_only",
+        "winner_z",
+        "pca",
+        "clinical_age",
+        "clinical_kdri",
+        "clinical_cold_ischemia",
+        "clinical_full",
+        "winner_z_kdri",
+        "winner_z_clinical",
+        "pca_kdri",
+        "pca_clinical",
+    }
+    assert len(specs) == 110
+    full_spec = specs.loc[specs["model_id"].eq("winner_z_clinical")].iloc[0]
+    assert full_spec["n_main_features"] == 2
+    assert full_spec["n_time_interaction_features"] == 3
+    for (repeat, fold), block in design.loc[design["model_id"].eq("winner_z")].groupby(
+        ["repeat", "fold"]
+    ):
+        train = block.loc[block["partition"].eq("train")].drop_duplicates("patient")
+        assert np.allclose(train[["x1", "x2"]].mean(axis=0), 0.0, atol=1e-6), (repeat, fold)
+    for (repeat, fold), block in design.loc[design["model_id"].eq("clinical_full")].groupby(
+        ["repeat", "fold"]
+    ):
+        train = block.loc[block["partition"].eq("train")].drop_duplicates("patient")
+        assert np.isfinite(train[["x1", "x2", "x3"]].to_numpy()).all()
+        assert np.allclose(train[["x1", "x2", "x3"]].mean(axis=0), 0.0, atol=1e-6), (
+            repeat,
+            fold,
+        )
+
+
+def test_mixed_model_design_can_disable_clinical_models(tmp_path: Path) -> None:
+    patients = _patients()
+    samples = pd.DataFrame(
+        {
+            "source_row_index": np.arange(len(patients)),
+            "sample_id": patients["patient"],
+            "donor_id": patients["donor"],
+            "has_egfr": True,
+        }
+    )
+    record = _record("run_0001", "Stadniuk MLP", 0.1)
+    z = np.ones((len(patients), 2), dtype=np.float32)
+    result = EmbeddingResult("winner_z", "Winner z", record, z, samples, 0.01)
+    expression = np.arange(len(patients) * 4, dtype=np.float32).reshape(len(patients), 4)
+    _, _, specs = prepare_mixed_model_design(
+        patients,
+        [result],
+        expression,
+        samples,
+        tmp_path,
+        n_splits=5,
+        n_repeats=1,
+        include_pca=True,
+        include_clinical=False,
+    )
+    assert set(specs["model_id"]) == {"time_only", "winner_z", "pca"}
+
+
+def test_nested_design_has_inner_selection_and_unique_outer_fits(tmp_path: Path) -> None:
+    patients = _patients()
+    samples = pd.DataFrame(
+        {
+            "source_row_index": np.arange(len(patients)),
+            "sample_id": patients["patient"],
+            "donor_id": patients["donor"],
+            "has_egfr": True,
+        }
+    )
+    embeddings = []
+    for index in range(6):
+        record = _record(
+            f"run_{index:04d}",
+            "Stadniuk MLP" if index % 2 == 0 else "ResNet-LN",
+            0.1,
+            f"method_{index // 2}",
+        )
+        z = np.column_stack(
+            [
+                np.arange(len(patients), dtype=np.float32) + index,
+                np.arange(len(patients), dtype=np.float32) ** 2 + index,
+            ]
+        )
+        embeddings.append(
+            EmbeddingResult(f"candidate_{index}", f"Candidate {index}", record, z, samples, 0.01)
+        )
+    expression = np.arange(len(patients) * 4, dtype=np.float32).reshape(len(patients), 4)
+    design_path, _, specs = prepare_nested_mixed_model_design(
+        patients,
+        embeddings,
+        expression,
+        samples,
+        tmp_path,
+        n_splits=5,
+        n_repeats=1,
+        inner_splits=4,
+        include_pca=True,
+        include_clinical=True,
+    )
+    design = pd.read_csv(design_path)
+    assert specs["fit_id"].is_unique
+    assert design["fit_id"].nunique() == len(specs)
+    assert set(specs["stage"]) == {"inner_selection", "outer_evaluation"}
+    inner = specs.loc[specs["stage"].eq("inner_selection")]
+    assert len(inner) == 5 * 4 * 6
+    assert set(inner["model_id"]) == {f"candidate_{index}" for index in range(6)}
+
+
+def test_summary_uses_matched_fold_deltas(tmp_path: Path) -> None:
+    fold_values = [
+        (0, 10.0, 8.0, 9.0, 7.0, 8.0, 7.0, 7.5),
+        (1, 12.0, 11.0, 10.0, 9.0, 9.0, 8.0, 8.5),
+    ]
+    metrics = pd.DataFrame(
+        [
+            {"model_id": model, "model_label": label, "repeat": repeat, "fold": 0, "rmse": rmse, "mae": rmse / 2}
+            for repeat, baseline, winner, kdri, winner_kdri, full, winner_full, pca_full in fold_values
+            for model, label, rmse in [
+                ("time_only", "Time only", baseline),
+                ("winner_z", "Winner z", winner),
+                ("clinical_kdri", "KDRI × time", kdri),
+                ("winner_z_kdri", "Winner z + KDRI × time", winner_kdri),
+                ("clinical_full", "Full clinical", full),
+                ("winner_z_clinical", "Winner z + full clinical", winner_full),
+                ("pca_clinical", "PCA + full clinical", pca_full),
+            ]
+        ]
+    )
+    predictions = pd.DataFrame(
+        [
+            {
+                "model_id": row.model_id,
+                "model_label": row.model_label,
+                "repeat": row.repeat,
+                "fold": row.fold,
+                "patient": f"p{row.repeat}",
+                "donor": f"d{row.repeat}",
+                "time": "3m",
+                "egfr": row.rmse,
+                "prediction": 0.0,
+            }
+            for row in metrics.itertuples()
+        ]
+    )
+    metrics_path = tmp_path / "metrics.csv"
+    predictions_path = tmp_path / "predictions.csv"
+    metrics.to_csv(metrics_path, index=False)
+    predictions.to_csv(predictions_path, index=False)
+    summary, pairwise, clinical_incremental = summarize_mixed_model_results(
+        metrics_path, predictions_path, tmp_path
+    )
+    winner = summary.set_index("model_id").loc["winner_z"]
+    assert winner["mean_delta_vs_time"] == 1.5
+    time = pairwise.set_index("model_id").loc["time_only"]
+    assert time["mean_winner_gain"] == 1.5
+    beyond_kdri = clinical_incremental.set_index("comparison_label").loc[
+        "Winner z beyond KDRI"
+    ]
+    assert beyond_kdri["mean_gain"] == 1.5
+    beyond_full = clinical_incremental.set_index("comparison_label").loc[
+        "Winner z beyond full clinical"
+    ]
+    assert beyond_full["mean_gain"] == 1.0
+    assert (tmp_path / "clinical_incremental_summary.csv").is_file()
