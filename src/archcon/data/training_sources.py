@@ -5,9 +5,8 @@ rows are assigned by connected source-GSE component, while supervised-dataset
 rows with no eGFR are independently assigned at the same target fractions and
 virtually appended.  Outcome-bearing supervised rows are never exposed to the
 autoencoder.  GEO itself is compared in three representations: Stadniuk
-rescaling, per-study RMA, and global RMA.  Per-study RMA is the leakage-safe
-deployment-style arm; global RMA remains a transductive comparison because all
-GEO arrays contributed to its shared normalization.
+rescaling, per-study RMA, and a legacy-named ``Global RMA`` arm rebuilt as
+train-reference quantile normalization from the available probe-set PM medians.
 """
 
 from __future__ import annotations
@@ -36,8 +35,8 @@ from .supervised import classify_supervised_samples, split_outcome_blind_samples
 
 METHOD_STADNIUK_RESCALED = "Stadniuk rescaling"
 # Comparison arms used by Stage 05 and the exported sweep.  Keep the distinction
-# explicit: per-study RMA is leakage-safe across held-out GSEs; global RMA is a
-# transductive benchmark because held-out arrays participated in normalization.
+# explicit: the legacy Global RMA label is retained for existing sweep configs,
+# while prepared jobs require leakage-safe train-reference provenance.
 TRAINING_PREPROCESSING_OPTIONS = [
     METHOD_STADNIUK_RESCALED,
     METHOD_PER_GSE_RMA,
@@ -365,6 +364,41 @@ def _method_file_stem(method: str) -> str:
         return mapping[str(method)]
     except KeyError as exc:
         raise ValueError(f"Unknown preprocessing method for prepared assets: {method}") from exc
+
+
+def _validate_global_reference_for_prepared_sweep(
+    store_root: Path,
+    prepared_root: Path,
+) -> None:
+    """Require the global matrix to be fitted from this sweep's training rows."""
+    from archcon.rebuild_global_normalization import (
+        METHOD_ID,
+        PROVENANCE_FILENAME,
+        PROVENANCE_FORMAT,
+        _sha256,
+    )
+
+    provenance_path = store_root / PROVENANCE_FILENAME
+    if not provenance_path.is_file():
+        raise RuntimeError(
+            "Refusing the legacy Global RMA matrix because it has no train-reference "
+            "provenance and may include held-out arrays. Run "
+            "archcon-rebuild-global-normalization --data-dir ... --sweep-root ... --replace."
+        )
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    if (
+        int(provenance.get("format", -1)) != PROVENANCE_FORMAT
+        or provenance.get("method") != METHOD_ID
+    ):
+        raise RuntimeError(f"Unsupported global-normalization provenance: {provenance_path}")
+    split_path = prepared_root / "sample_index.csv"
+    expected = str(provenance.get("frozen_split_sha256", ""))
+    observed = _sha256(split_path)
+    if not expected or expected != observed:
+        raise RuntimeError(
+            "The installed global-normalization matrix was fitted for a different frozen "
+            "split. Rebuild it with this sweep root before running Global RMA jobs."
+        )
 
 
 def load_pretraining_source(
@@ -701,6 +735,8 @@ def load_prepared_pretraining_source(
         raise ValueError(f"Prepared sweep has no frozen GEO row map for {method}.")
     if not isinstance(method_columns, dict) or method not in method_columns:
         raise ValueError(f"Prepared sweep has no frozen GEO probe map for {method}.")
+    if method == METHOD_GLOBAL_RMA:
+        _validate_global_reference_for_prepared_sweep(layout.geo_rma_store, root)
     geo = load_training_source(layout, method)
     primary_rows = np.load(root / str(method_rows[method]), mmap_mode="r", allow_pickle=False)
     primary_columns = np.load(

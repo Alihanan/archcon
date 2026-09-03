@@ -41,6 +41,22 @@ def test_evaluation_console_script_is_packaged() -> None:
     assert callable(main)
 
 
+def test_global_normalization_console_script_is_packaged() -> None:
+    from pathlib import Path
+
+    import tomllib
+
+    project_root = Path(__file__).resolve().parents[1]
+    config = tomllib.loads((project_root / "pyproject.toml").read_text())
+    assert config["project"]["scripts"]["archcon-rebuild-global-normalization"] == (
+        "archcon.rebuild_global_normalization:main"
+    )
+
+    from archcon.rebuild_global_normalization import main
+
+    assert callable(main)
+
+
 def test_mixed_model_r_script_quotes_reserved_repeat_column() -> None:
     from pathlib import Path
 

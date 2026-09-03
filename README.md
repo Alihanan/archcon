@@ -2,9 +2,11 @@
 
 ArchCon is a local Python/Gradio research application for rebuilding, inspecting, and modelling the gene-expression pipeline developed around **Modern Alternatives to Archetypal Analysis of Gene Expression Data**.
 
-**Current scope (0.5.10):** a beginner-readable molecular pipeline with a large public **unsupervised dataset**, a smaller kidney-donor **supervised dataset**, reproducible outcome-blind pretraining splits, configurable reconstruction-only autoencoders, direct persistent PyTorch checkpoints, non-blocking visual exploration, and a leakage-safe molecular/clinical eGFR benchmark.
+**Current scope (0.5.12):** a beginner-readable molecular pipeline with a large public **unsupervised dataset**, a smaller kidney-donor **supervised dataset**, reproducible outcome-blind pretraining splits, configurable reconstruction-only autoencoders, direct persistent PyTorch checkpoints, non-blocking visual exploration, and a leakage-safe molecular/clinical eGFR benchmark.
 
-**0.5.8 frozen-input update:** the complete molecular training universe is prepared **once when the sweep is generated**. ArchCon aligns the supervised 42,921-probe store to the exact 42,917 canonical GEO probe IDs/order, freezes method-specific GEO row **and probe-column** mappings (so Stadniuk/RMA stores may have different native order), materializes only supervised samples already classified as having no eGFR, freezes one canonical logical sample order, and saves final `train_rows.npy`, `validation_rows.npy`, and `test_rows.npy`. Generated `run_XXXX.py` jobs only memory-map these prepared arrays; they do **not** reclassify outcomes, compare/reorder probes, remap samples, or recompute a split. The direct persistent checkpoint/resume behavior introduced in 0.5.6 remains unchanged. Verify `dist/archcon-0.5.10-py3-none-any.whl` after building.
+**0.5.8 frozen-input update:** the complete molecular training universe is prepared **once when the sweep is generated**. ArchCon aligns the supervised 42,921-probe store to the exact 42,917 canonical GEO probe IDs/order, freezes method-specific GEO row **and probe-column** mappings (so Stadniuk/RMA stores may have different native order), materializes only supervised samples already classified as having no eGFR, freezes one canonical logical sample order, and saves final `train_rows.npy`, `validation_rows.npy`, and `test_rows.npy`. Generated `run_XXXX.py` jobs only memory-map these prepared arrays; they do **not** reclassify outcomes, compare/reorder probes, remap samples, or recompute a split. The direct persistent checkpoint/resume behavior introduced in 0.5.6 remains unchanged.
+
+**0.5.12 train-reference correction:** `archcon-rebuild-global-normalization` fits a quantile reference using only the frozen GEO training rows, maps every GEO row independently to that reference, and atomically replaces `rma_global.npy`. Global-arm batch jobs refuse matrices without provenance matching their frozen split. Since `raw_original.npy` is already probe-set PM-median summarized, this leakage-safe replacement is not exact CEL-level RMA.
 
 **0.5.9 downstream update:** `archcon-evaluate-egfr` selects encoders by clean validation MSE, freezes them, aligns every supervised expression row to the prepared 42,917-probe order, and exports exact latent arrays plus sample/donor metadata. It then compares a time-only mixed model, the winning z, the best validation-selected alternative architecture, and a fold-fitted PCA baseline under repeated donor-grouped CV. The fitted formulas contain molecular features only; KDRI may stratify folds but never enters the model. The source-tree `evaluate_molecular_egfr.py` wrapper remains available for compatibility.
 
@@ -42,7 +44,7 @@ Stage 06 now focuses the architecture experiment on two interpretable MLP famili
 - **Stadniuk MLP:** dense ReLU autoencoder, default `256 → 64`, with the final no-normalization form as the faithful preset. The sweep also tests the earlier/experimental BatchNorm variant.
 - **ResNet-LN:** dense MLP with LayerNorm same-width residual FFN blocks, configurable hidden depth, residual blocks per stage, and FFN expansion.
 
-The MetaCentrum comparison remains a **900-run CPU grid**. For each of three GEO preprocessing arms — **Stadniuk rescaling**, **per-study RMA**, and **global RMA** — it evaluates 180 Stadniuk-MLP and 120 ResNet-LN configurations. Public GEO is split by whole connected GSE components at approximately 90/5/5. The supervised kidney-donor dataset is shown separately in the web UI: only molecular samples with **no eGFR** are added to pretraining, and those samples are independently assigned to ~90/5/5 using the same seed. Samples with any eGFR are reserved for downstream evaluation and never enter reconstruction training. Per-study RMA remains the leakage-safe GEO arm; global RMA remains a transductive comparison.
+The MetaCentrum comparison remains a **900-run CPU grid**. For each of three GEO preprocessing arms — **Stadniuk rescaling**, **per-study RMA**, and the legacy-named **global RMA** arm — it evaluates 180 Stadniuk-MLP and 120 ResNet-LN configurations. Public GEO is split by whole connected GSE components at approximately 90/5/5. The supervised kidney-donor dataset is shown separately in the web UI: only molecular samples with **no eGFR** are added to pretraining, and those samples are independently assigned to ~90/5/5 using the same seed. Samples with any eGFR are reserved for downstream evaluation and never enter reconstruction training. The global arm requires a reference fitted only from its frozen GEO training rows.
 
 Training uses memory-mapped NumPy matrices, optional one-batch background prefetch, CUDA pinned transfers, mixed precision, optional `torch.compile`, configurable validation cadence, live loss/MSE/R² plots, and asynchronous validation latent PCA. Model/training controls are locked during an active run. Checkpoints save the architecture, optimizer/scheduler state, preprocessing choice, and exact train/validation indices.
 
@@ -111,7 +113,7 @@ values. Sweep generation first creates a `prepared/` directory containing the al
   --output-root /storage/.../ArchCon/results
 ```
 
-The 0.5.8 comparison uses the already-built Stadniuk-rescaled store, `rma_per_gse.npy`, and `rma_global.npy` on the same shared molecular split. A strict train-reference/add-on RMA would require the original probe-level CEL data: `raw_original.npy` is a pre-RMA probe-set summary, not CEL bytes, and must not be presented as sufficient to refit exact RMA parameters. Global RMA is kept for comparison only and is marked transductive because its normalization saw all arrays.
+The corrected comparison uses the already-built Stadniuk-rescaled store and `rma_per_gse.npy`, plus a replacement `rma_global.npy` derived after the split is frozen. Run `archcon-rebuild-global-normalization --data-dir DATA --sweep-root SWEEP --replace` before any global-arm jobs. This fits a training-only quantile target from `raw_original.npy` and applies it independently to all rows. Since `raw_original.npy` is a pre-RMA probe-set summary rather than CEL/probe-level data, this representation must not be presented as exact RMA.
 
 The matching `configs/run_0001.json` is retained for programmatic bookkeeping. The exported
 bundle also contains `prepared/`, `run_array.pbs.sh`, `submit.sh`, and `manifest.csv`.
@@ -395,7 +397,7 @@ The large row-major matrix cache remains under `data/training_cache/`; moving ch
 
 The old generic text/log viewer and its dedicated text-reader dependency have been removed; ArchCon now focuses on the GEO preprocessing/training workflow.
 
-## Molecular and clinical eGFR benchmark (0.5.10)
+## Molecular and clinical eGFR benchmark
 
 Run this only after the sweep has enough completed checkpoints and the validation-selected
 winner has been evaluated once on the frozen molecular test rows:

@@ -12,6 +12,7 @@ REQUIRED_MEMBERS = {
     "archcon/__main__.py",
     "archcon/cli.py",
     "archcon/evaluate_egfr.py",
+    "archcon/rebuild_global_normalization.py",
     "archcon/app.py",
     "archcon/batch.py",
     "archcon/data/__init__.py",

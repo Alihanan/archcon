@@ -69,6 +69,15 @@ def main() -> None:
             "These are best-so-far snapshots and may change while evaluation runs."
         ),
     )
+    parser.add_argument(
+        "--evaluate-all-readable-checkpoints",
+        action="store_true",
+        help=(
+            "Send every eligible best.pt checkpoint to preliminary eGFR CV instead of only "
+            "one molecular winner per preprocessing×architecture group. This can become very "
+            "expensive when many runs are available."
+        ),
+    )
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument(
@@ -214,21 +223,21 @@ def main() -> None:
         batch_size=args.batch_size,
         progress=report_progress,
     )
-    selected = select_molecular_group_winners(
+    group_winners = select_molecular_group_winners(
         scored, expected_groups=6 if complete else None
     )
     score_path, group_path = save_molecular_selection(
-        scored, selected, output_root / "molecular_selection"
+        scored, group_winners, output_root / "molecular_selection"
     )
 
     print("\n" + LINE)
     print(
         "SIX MOLECULAR GROUP WINNERS"
         if complete
-        else f"CURRENT GROUP WINNERS ({len(selected)}/6 GROUPS)"
+        else f"CURRENT GROUP WINNERS ({len(group_winners)}/6 GROUPS)"
     )
     print(LINE)
-    for model_id, label, record in selected:
+    for model_id, label, record in group_winners:
         print(
             f"{record.run:<10} pooled MSE={record.molecular_selection_mse:.10g} | "
             f"VAL={record.molecular_validation_mse:.10g} | TEST={record.molecular_test_mse:.10g} | "
@@ -241,9 +250,34 @@ def main() -> None:
         "reported as an untouched test set."
     )
     print(
-        "NOTE: Per-dataset RMA is study-isolated. Global RMA remains transductive because "
-        "all GEO arrays contributed to its shared normalization."
+        "NOTE: Per-dataset RMA is study-isolated. The legacy-named Global RMA arm must "
+        "carry matching train-reference provenance; held-out GEO rows do not fit its reference."
     )
+
+    if args.evaluate_all_readable_checkpoints:
+        selected = [
+            (
+                f"candidate_{record.run}_z",
+                (
+                    f"{record.run} · {record.method} × {record.architecture} "
+                    f"· z={record.latent_dim}"
+                ),
+                record,
+            )
+            for record in sorted(
+                scored,
+                key=lambda item: (float(item.molecular_selection_mse), item.run),
+            )
+        ]
+        print(
+            f"\nPRELIMINARY eGFR MODE: evaluating all {len(selected)} readable checkpoints."
+        )
+        print(
+            "Final-sweep analysis should omit --evaluate-all-readable-checkpoints so only "
+            "the six molecular group winners enter eGFR selection."
+        )
+    else:
+        selected = group_winners
 
     embeddings = []
     for model_id, label, record in selected:

@@ -1,11 +1,11 @@
-# ArchCon 0.5.10 on MetaCentrum
+# ArchCon 0.5.12 on MetaCentrum
 
 > **0.5.8 frozen-input fix.** The supervised store may contain 42,921 probes while the GEO experiment uses 42,917, and the Stadniuk-rescaled GEO store may contain the same 42,917 probes in a different native column order. ArchCon now resolves **all** of those mappings exactly once during sweep generation by probe ID, freezes method-specific GEO row and column arrays, writes the outcome-blind supervised subset into one canonical 42,917-probe space, and freezes final train/validation/test logical row arrays. Generated jobs only read those prepared artifacts. Persistent `latest.pt`/`best.pt` checkpointing from 0.5.6 is unchanged.
 
 
 This release uses one fixed **molecular ~90/5/5 train/validation/test split** across all preprocessing/model combinations. GEO rows are grouped by connected GSE component. Supervised-dataset rows without eGFR are independently assigned using the same target fractions. Every sample with eGFR is kept outside molecular pretraining and reserved for downstream evaluation.
 
-The default CPU sweep contains **900 runs**: for each of three preprocessing arms there are 180 Stadniuk-MLP and 120 ResNet-LN configurations. Every PBS subjob uses one CPU and executes its own readable `jobs/run_XXXX.py`. Per-study RMA is the leakage-safe arm; global RMA is a deliberately retained transductive benchmark because held-out arrays participated in the shared RMA normalization.
+The default CPU sweep contains **900 runs**: for each of three preprocessing arms there are 180 Stadniuk-MLP and 120 ResNet-LN configurations. Every PBS subjob uses one CPU and executes its own readable `jobs/run_XXXX.py`. Per-study RMA is normalized inside each study. The legacy-named global-RMA arm requires a reference fitted only on the frozen GEO training rows; jobs refuse an unmarked all-sample matrix.
 
 ## 1. Data already on MetaCentrum
 
@@ -21,31 +21,45 @@ Keep the transferred data here:
 /storage/praha1/home/anuarali/DP/ARCHCON/data/GEO_NUMPY_STORE/
 ```
 
-The sweep reads all three existing public-data representations: `GEO_STADNIUK_STORE/expression.npy`, `GEO_NUMPY_STORE/rma_per_gse.npy`, and `GEO_NUMPY_STORE/rma_global.npy`, plus `IKEM_NUMPY_STORE/expression.npy` internally as the supervised molecular store. No GEO re-download is needed if those stores are already present. Per-study RMA keeps held-out GSE normalization independent; global RMA is included only as a transductive comparison. `raw_original.npy` is a probe-set-level pre-RMA summary rather than raw CEL/probe-level data, so an exact train-reference/add-on RMA experiment would still require access to original CEL files.
+The sweep reads `GEO_STADNIUK_STORE/expression.npy`, `GEO_NUMPY_STORE/rma_per_gse.npy`, the corrected `GEO_NUMPY_STORE/rma_global.npy`, and `IKEM_NUMPY_STORE/expression.npy`. After generating the sweep, run `archcon-rebuild-global-normalization --data-dir DATA --sweep-root SWEEP --replace`. It uses only frozen GEO training rows to fit a shared quantile reference. `raw_original.npy` is probe-set-level PM-median data, so the replacement is leakage-safe train-reference normalization, not exact CEL-level RMA.
 
-## 2. Build 0.5.10 locally
+Install ArchCon 0.5.12 first, then rebuild and replace the contaminated matrix:
 
-From the 0.5.10 source root on your workstation:
+```bash
+/storage/praha1/home/anuarali/DP/ARCHCON/.venv/bin/archcon-rebuild-global-normalization \
+  --data-dir /storage/praha1/home/anuarali/DP/ARCHCON/data \
+  --sweep-root /storage/praha1/home/anuarali/DP/ARCHCON/sweeps/archcon-pretrain-058 \
+  --replace
+```
+
+The replacement is atomic and the old matrix receives a timestamped
+`rma_global.all_samples_backup_*.npy` name. The command also removes the stale
+row-major training cache and writes `rma_global_provenance.json`; Global-RMA jobs refuse to
+start unless that provenance matches the sweep's frozen `prepared/sample_index.csv`.
+
+## 2. Build 0.5.12 locally
+
+From the 0.5.12 source root on your workstation:
 
 ```bash
 source .venv/bin/activate
 python -m pip install --upgrade build
 rm -rf build dist
 python -m build
-python scripts/verify_wheel.py dist/archcon-0.5.10-py3-none-any.whl
+python scripts/verify_wheel.py dist/archcon-0.5.12-py3-none-any.whl
 ```
 
 Expected artifacts:
 
 ```text
-dist/archcon-0.5.10-py3-none-any.whl
-dist/archcon-0.5.10.tar.gz
+dist/archcon-0.5.12-py3-none-any.whl
+dist/archcon-0.5.12.tar.gz
 ```
 
 Upload them without touching the already transferred data:
 
 ```bash
-rsync -avhP dist/archcon-0.5.10-py3-none-any.whl dist/archcon-0.5.10.tar.gz \
+rsync -avhP dist/archcon-0.5.12-py3-none-any.whl dist/archcon-0.5.12.tar.gz \
   anuarali@storage-praha1.metacentrum.cz:~/DP/ARCHCON/
 ```
 
@@ -58,7 +72,7 @@ cd /storage/praha1/home/anuarali/DP/ARCHCON
 source .venv/bin/activate
 python --version
 python -c 'import torch; print(torch.__version__, torch.cuda.is_available())'
-python -m pip install --upgrade ./archcon-0.5.10-py3-none-any.whl
+python -m pip install --upgrade ./archcon-0.5.12-py3-none-any.whl
 python -m pip show archcon
 ```
 
@@ -66,7 +80,7 @@ The environment must use Python >= 3.10. `CUDA: False` is expected for this CPU 
 
 ## 4. Generate the corrected split and sweep locally
 
-Start the 0.5.10 web UI against your local `data/` directory. In **05 · Split**, keep seed 42. ArchCon now assigns complete connected source-GSE components to approximately:
+Start the 0.5.12 web UI against your local `data/` directory. In **05 · Split**, keep seed 42. ArchCon now assigns complete connected source-GSE components to approximately:
 
 ```text
 train       90%
@@ -200,7 +214,7 @@ qstat -t
 
 ## Persistent epoch checkpoints
 
-Version 0.5.10 retains the 0.5.6 rule that model checkpoints are never staged in a hidden `.run_XXXX.work` directory. The PBS wrapper creates `results/run_XXXX/` **before training starts**. At the end of every completed epoch, ArchCon atomically replaces:
+Version 0.5.12 retains the 0.5.6 rule that model checkpoints are never staged in a hidden `.run_XXXX.work` directory. The PBS wrapper creates `results/run_XXXX/` **before training starts**. At the end of every completed epoch, ArchCon atomically replaces:
 
 ```text
 results/run_XXXX/latest.pt
@@ -241,7 +255,7 @@ LayerNorm           fixed on
 
 Per preprocessing: **300**. Across three preprocessings: **900** jobs total.
 
-The model-selection rule remains: train only on molecular train rows, monitor/rank on molecular validation rows, and leave molecular test rows untouched. All supervised-dataset samples with eGFR remain outside pretraining. Interpret the global-RMA arm separately because its GEO preprocessing is transductive.
+The model-selection rule remains: train only on molecular train rows, monitor/rank on molecular validation rows, and leave molecular test rows untouched. All supervised-dataset samples with eGFR remain outside pretraining. The global reference is fitted only on frozen GEO training rows and its provenance must match the sweep.
 
 ## 9. Frozen z and clinical-baseline eGFR evaluation
 

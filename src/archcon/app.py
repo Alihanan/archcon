@@ -352,7 +352,7 @@ $$
 
 The thesis pretraining stage uses a reconstruction-only autoencoder. Hidden layers are dense, the decoder mirrors the encoder, ReLU is used in the hidden layers, and no activation is applied at the latent code. In the reported ArchCon experiments the hidden widths were $256\rightarrow64$ and the latent dimension was treated separately.
 
-The comparison keeps the thesis-style **256 → 64** hidden encoder as one anchor while expanding depth and latent-size choices. All model configurations use the same combined molecular 90/5/5 assignment: GEO is grouped by connected source-GSE component, and supervised samples without eGFR are split independently by sample. Per-study RMA is the leakage-safe deployment-style arm because every source GSE was normalized independently. Global RMA is retained deliberately as a transductive comparison because validation/test arrays contributed to its shared normalization. A train-reference/add-on RMA protocol would require probe-level CEL input; `raw_original.npy` is already summarized and cannot reconstruct those exact RMA parameters. Validation is tracked live and checkpoints are saved automatically. Public GEO plus supervised-dataset samples without eGFR form the molecular-only pretraining pool; samples with eGFR are not evaluated or trained on here.
+The comparison keeps the thesis-style **256 → 64** hidden encoder as one anchor while expanding depth and latent-size choices. All model configurations use the same combined molecular 90/5/5 assignment: GEO is grouped by connected source-GSE component, and supervised samples without eGFR are split independently by sample. Per-study RMA is performed within each source GSE. The legacy-named Global RMA arm now requires a reference fitted only on the frozen GEO training rows and applied independently to held-out rows. Because `raw_original.npy` is already summarized to probe-set PM medians, this corrected representation is train-reference quantile normalization followed by log2, not exact CEL-level RMA. Validation is tracked live and checkpoints are saved automatically. Public GEO plus supervised-dataset samples without eGFR form the molecular-only pretraining pool; samples with eGFR are not evaluated or trained on here.
 """,
     "aa": r"""
 ### 07 · Downstream outcome / archetypal design · configuration only
@@ -3386,10 +3386,9 @@ Click a step. Each page answers one simple question; the selected step stays **o
                     value=METHOD_PER_GSE_RMA,
                     label="Training preprocessing",
                     info=(
-                        "The comparison sweep evaluates Stadniuk rescaling, per-study RMA, and global RMA "
-                        "on the same GSE-disjoint 90/5/5 sample identities. Per-study RMA is the leakage-safe "
-                        "deployment-style arm; global RMA is retained as a transductive benchmark because "
-                        "held-out arrays contributed to its shared normalization."
+                        "The comparison sweep evaluates Stadniuk rescaling, per-study RMA, and the legacy-named "
+                        "Global RMA arm on the same GSE-disjoint 90/5/5 identities. Global preprocessing must "
+                        "carry provenance proving that its reference was fitted only on frozen GEO training rows."
                     ),
                 )
 
@@ -3645,7 +3644,7 @@ Click a step. Each page answers one simple question; the selected step stays **o
                     elem_classes=["reading-width"],
                 )
                 training_status = gr.Markdown(
-                    "Ready. Choose one of the three public-data preprocessing representations above. Molecular training uses public GEO plus supervised-dataset samples without eGFR; validation selects checkpoints. Outcome-bearing samples stay outside this stage. Global RMA is a transductive comparison arm.",
+                    "Ready. Choose one of the three public-data preprocessing representations above. Molecular training uses public GEO plus supervised-dataset samples without eGFR; validation selects checkpoints. Outcome-bearing samples stay outside this stage. The legacy-named Global RMA arm requires a frozen train-only reference.",
                     elem_classes=["training-status-card"],
                 )
                 with gr.Row(equal_height=True, elem_classes=["training-live-grid"]):
@@ -3742,7 +3741,8 @@ Click a step. Each page answers one simple question; the selected step stays **o
                         "latent dimensions 3/8/16, MSE/masked MSE, plus architecture-specific L2/BatchNorm or residual-block/expansion axes. "
                         "The preprocessing axis is Stadniuk rescaling / per-study RMA / global RMA. Seed 42, batch size 64, starting LR 1e-3 "
                         "and one-way cosine decay are fixed. Molecular test rows and all samples with eGFR remain blinded during the sweep. "
-                        "Treat global RMA as a transductive benchmark, not an unbiased held-out preprocessing estimate.",
+                        "The legacy-named global arm must be rebuilt against this frozen split before its jobs run; "
+                        "held-out GEO arrays cannot contribute to its reference.",
                         elem_classes=["reading-width"],
                     )
                     sweep_grid_json = gr.Code(

@@ -179,8 +179,8 @@ def preprocessing_policy(method: str) -> str:
         )
     if method == METHOD_GLOBAL_RMA:
         return (
-            "transductive global-RMA benchmark; held-out arrays participated in the shared "
-            "normalization, although they are excluded from neural training/model selection"
+            "legacy-named Global RMA arm; train-reference quantile normalization fitted only "
+            "on frozen GEO training rows from probe-set PM medians; not exact CEL-level RMA"
         )
     if method == METHOD_STADNIUK_RESCALED:
         return "thesis-inspired Stadniuk rescaling comparison on the shared split"
@@ -1151,7 +1151,8 @@ only source of batch split/mapping decisions: train_rows.npy, validation_rows.np
 method-specific GEO row maps, and the already probe-aligned supervised-no-eGFR matrix are written
 once during sweep generation. Jobs only read those files; they never reclassify outcomes, align
 probes, remap samples, or resplit data. Outcome-bearing samples are excluded. The three GEO preprocessing arms are Stadniuk rescaling, independent per-study RMA,
-and global RMA. Global RMA remains a transductive benchmark. Results are written under results/
+and the legacy-named Global RMA arm, which requires a train-reference matrix tied to this
+sweep's frozen split. Results are written under results/
 unless ARCHCON_RESULT_ROOT is overridden. Crucially, run_XXXX/ is created before training and
 latest.pt is atomically written there after every completed epoch; best.pt is updated immediately
 on validation improvement. Resubmitting an interrupted array element resumes from latest.pt.

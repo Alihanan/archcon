@@ -80,11 +80,11 @@ This is the **before-RMA** reference. Values are still on the intensity scale: n
 
 Each **GSE study is normalized separately**. ArchCon holds out complete GSE components, so validation/test studies never contribute to preprocessing of training studies. A newly arriving external GSE is treated the same way: RMA is performed within that new study before inference. This is the leakage-safe deployment-style arm of the three-preprocessing comparison. The reconstructed `raw_original.npy` is already summarized to probe sets, so it is **not** sufficient to refit exact probe-level train/add-on RMA; that alternative requires the original CEL/probe-level files.
 """,
-    METHOD_GLOBAL_RMA: """### ③ One global RMA · transductive comparison arm
+    METHOD_GLOBAL_RMA: """### ③ Train-reference global normalization · legacy “Global RMA” label
 
-`every unique GSM once → background correction → one shared quantile target → median polish + log2`
+`training GEO rows → one quantile reference → freeze → map each array independently → log2`
 
-All available arrays contribute to one RMA solution. A GSM that appears in both a SubSeries and SuperSeries is counted only once. The expanded comparison sweep includes this matrix deliberately as a **transductive benchmark**, but validation/test studies contributed to the shared normalization. Therefore its downstream held-out scores must not be interpreted as an unbiased preprocessing-generalization estimate; the neural network still never trains on validation/test rows.
+The corrected matrix is fitted only on the frozen GEO training rows. Validation and test arrays are mapped independently to that frozen reference and cannot influence it. The historical method name is retained so existing sweep configurations continue to work. Because `raw_original.npy` already contains probe-set PM medians, this corrected representation is **not exact CEL-level RMA**: CEL background correction and probe-level median-polish effects cannot be reconstructed from the summarized matrix.
 """,
 }
 
