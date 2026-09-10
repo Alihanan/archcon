@@ -25,6 +25,8 @@ REQUIRED_MEMBERS = {
     "archcon/assets/__init__.py",
     "archcon/assets/rma_preprocess.R",
     "archcon/assets/molecular_mixed_models.R",
+    "archcon/assets/scratch_run_array.pbs.sh.in",
+    "archcon/assets/scratch_submit.sh.in",
 }
 
 

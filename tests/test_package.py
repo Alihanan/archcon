@@ -74,3 +74,28 @@ def test_mixed_model_r_script_quotes_reserved_repeat_column() -> None:
     assert 'paste0("x", interaction_indices, " * time")' in script
     assert script.count("check.names = FALSE") == 5
     assert "design$fit_id == spec$fit_id" in script
+    assert "do.call(rbind" not in script
+    assert "write.table(" in script
+
+
+def test_scratch_launcher_templates_are_packaged() -> None:
+    from importlib.resources import files
+
+    assets = files("archcon.assets")
+    run_script = assets.joinpath("scratch_run_array.pbs.sh.in").read_text()
+    submit_script = assets.joinpath("scratch_submit.sh.in").read_text()
+    assert 'STAGE_ROOT=$(mktemp -d "$SCRATCHDIR/' in run_script
+    assert 'timeout --signal=TERM' in run_script
+    assert 'shuf --output="$TASK_LIST"' in submit_script
+
+
+def test_standalone_scripts_are_organized_under_scripts_directory() -> None:
+    from pathlib import Path
+
+    project_root = Path(__file__).resolve().parents[1]
+    assert not (project_root / "evaluate_molecular_egfr.py").exists()
+    assert not (project_root / "run_array.pbs.sh").exists()
+    assert not (project_root / "submit.sh").exists()
+    assert (project_root / "scripts" / "evaluate_molecular_egfr.py").is_file()
+    assert (project_root / "scripts" / "metacentrum" / "run_array.pbs.sh").is_file()
+    assert (project_root / "scripts" / "metacentrum" / "submit.sh").is_file()

@@ -11,8 +11,13 @@ specs <- read.csv(args[[2]], stringsAsFactors = FALSE, check.names = FALSE)
 design$time <- factor(design$time, levels = c("7d", "3m", "6m", "12m"))
 design$patient <- factor(design$patient)
 
-metrics <- list()
-predictions <- list()
+# Write each fit immediately.  Keeping every prediction data frame in a list
+# makes R memory grow with the complete benchmark and is unnecessary because
+# the final products are CSV files.
+if (file.exists(args[[3]])) file.remove(args[[3]])
+if (file.exists(args[[4]])) file.remove(args[[4]])
+metrics_header <- TRUE
+predictions_header <- TRUE
 
 for (i in seq_len(nrow(specs))) {
   spec <- specs[i, ]
@@ -66,7 +71,7 @@ for (i in seq_len(nrow(specs))) {
     stringsAsFactors = FALSE,
     check.names = FALSE
   )
-  metrics[[length(metrics) + 1]] <- cbind(metadata, data.frame(
+  metric_row <- cbind(metadata, data.frame(
     n_features = n_features,
     n_main_features = n_main_features,
     n_time_interaction_features = n_time_interaction_features,
@@ -82,7 +87,7 @@ for (i in seq_len(nrow(specs))) {
     stringsAsFactors = FALSE,
     check.names = FALSE
   ))
-  predictions[[length(predictions) + 1]] <- cbind(
+  prediction_rows <- cbind(
     metadata[rep(1, nrow(test)), , drop = FALSE],
     data.frame(
     patient = as.character(test$patient),
@@ -93,7 +98,27 @@ for (i in seq_len(nrow(specs))) {
     stringsAsFactors = FALSE,
     check.names = FALSE
   ))
-}
 
-write.csv(do.call(rbind, metrics), args[[3]], row.names = FALSE)
-write.csv(do.call(rbind, predictions), args[[4]], row.names = FALSE)
+  write.table(
+    metric_row,
+    args[[3]],
+    sep = ",",
+    row.names = FALSE,
+    col.names = metrics_header,
+    append = !metrics_header,
+    qmethod = "double"
+  )
+  write.table(
+    prediction_rows,
+    args[[4]],
+    sep = ",",
+    row.names = FALSE,
+    col.names = predictions_header,
+    append = !predictions_header,
+    qmethod = "double"
+  )
+  metrics_header <- FALSE
+  predictions_header <- FALSE
+  rm(block, train, test, fit, prediction, error, metric_row, prediction_rows)
+  if (i %% 25 == 0) gc(verbose = FALSE)
+}

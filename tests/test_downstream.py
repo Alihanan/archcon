@@ -1,7 +1,11 @@
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+
+import archcon.data.downstream as downstream
 
 from archcon.data.downstream import (
     EmbeddingResult,
@@ -10,6 +14,7 @@ from archcon.data.downstream import (
     prepare_mixed_model_design,
     prepare_nested_mixed_model_design,
     repeated_donor_folds,
+    scan_validation_checkpoints,
     select_embedding_checkpoints,
     select_molecular_group_winners,
     summarize_mixed_model_results,
@@ -54,6 +59,87 @@ def _patients(n_donors: int = 10) -> pd.DataFrame:
                 }
             )
     return pd.DataFrame(rows)
+
+
+def test_checkpoint_scan_retains_metadata_not_tensor_payload(tmp_path, monkeypatch) -> None:
+    checkpoint_path = tmp_path / "run_0001" / "best.pt"
+    checkpoint_path.parent.mkdir()
+    checkpoint_path.touch()
+    payload = {
+        "input_dim": 42_917,
+        "method": "Stadniuk rescaling",
+        "config": {
+            "hidden_widths": [8],
+            "latent_dim": 2,
+            "architecture_family": "Stadniuk MLP",
+            "epochs": 1,
+        },
+        "history": {
+            "val_mse": [0.1],
+            "val_r2": [0.5],
+            "val_loss": [0.1],
+            "val_epoch": [1],
+        },
+        "model_state": {"large_tensor": object()},
+        "optimizer_state": {"large_tensor": object()},
+    }
+    monkeypatch.setattr(downstream, "load_checkpoint_metadata", lambda _path: payload)
+    records, warnings = scan_validation_checkpoints(tmp_path)
+    assert not warnings
+    assert len(records) == 1
+    assert records[0].checkpoint is None
+    assert records[0].input_dim == 42_917
+
+
+def test_model_loader_imports_torch_for_meta_construction(monkeypatch) -> None:
+    class FakeDevice:
+        def __init__(self, name):
+            self.name = name
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    class FakeModel:
+        def __init__(self):
+            self.assigned = False
+            self.target = None
+            self.evaluation = False
+
+        def load_state_dict(self, state, *, strict, assign):
+            assert state == {"weight": "mapped"}
+            assert strict is True
+            self.assigned = assign
+
+        def to(self, target):
+            self.target = target.name
+            return self
+
+        def eval(self):
+            self.evaluation = True
+            return self
+
+    fake_torch = SimpleNamespace(device=FakeDevice)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    fake_model = FakeModel()
+    monkeypatch.setattr(downstream, "build_autoencoder", lambda _input_dim, _config: fake_model)
+
+    record = _record("run_0001", "Stadniuk MLP", 0.1)
+    record = record.__class__(
+        **{
+            **record.__dict__,
+            "checkpoint": {"input_dim": 4, "model_state": {"weight": "mapped"}},
+        }
+    )
+    model, input_dim = downstream._model_from_record(record, "cpu")
+
+    assert input_dim == 4
+    assert model is fake_model
+    assert fake_model.assigned is True
+    assert fake_model.target == "cpu"
+    assert fake_model.evaluation is True
 
 
 def test_checkpoint_comparison_keeps_other_architecture_when_resnet_wins() -> None:

@@ -62,15 +62,17 @@ def test_sweep_bundle_uses_cartesian_product_and_pbs_array(tmp_path: Path) -> No
     submit_script = (root / "submit.sh").read_text(encoding="utf-8")
     assert "PBS_ARRAY_INDEX" in run_script
     assert 'RUN_NAME=$(printf "run_%04d"' in run_script
-    assert 'RUN_DIR="$RESULT_ROOT/$RUN_NAME"' in run_script
-    assert '"$PYTHON_BIN" "$JOB"' in run_script
+    assert 'STAGE_ROOT=$(mktemp -d "$SCRATCHDIR/' in run_script
+    assert 'PERSISTENT_RUN_DIR="$PERSISTENT_RESULT_ROOT/$RUN_NAME"' in run_script
+    assert '"$PYTHON_BIN" "$STAGE_JOB"' in run_script
     assert "--data-dir" in run_script
     assert "--output-root" in run_script
-    assert '--run-directory "$RUN_DIR"' in run_script
+    assert '--run-directory "$STAGE_RUN_DIR"' in run_script
     assert 'latest.pt' in run_script
-    assert 'RESUME_ARGS' in run_script
-    assert '.run_' not in run_script
-    assert "qsub -J 1-8" in submit_script
+    assert 'timeout --signal=TERM' in run_script
+    assert 'copy_atomic_to_persistent' in run_script
+    assert 'shuf --output="$TASK_LIST"' in submit_script
+    assert 'qsub -J "1-$submitted"' in submit_script
 
     job_source = jobs[0].read_text(encoding="utf-8")
     assert "TRAINING_CONFIG = TrainingConfig(" in job_source
@@ -164,11 +166,13 @@ def test_recommended_comparison_sweep_has_900_architecture_preprocessing_runs(tm
     assert set(manifest["lr_decay_epochs"]) == {500}
     assert set(manifest["convergence_window"]) == {5}
     assert (root / "split.csv").is_file()
-    assert "qsub -J 1-900" in (root / "submit.sh").read_text(encoding="utf-8")
+    submit_script = (root / "submit.sh").read_text(encoding="utf-8")
+    assert 'qsub -J "1-$submitted"' in submit_script
+    assert 'find "$run_dir" -maxdepth 1 -type f -name \'*.pt\'' in submit_script
     run_script = (root / "run_array.pbs.sh").read_text(encoding="utf-8")
     assert "ngpus=" not in run_script
     assert "ncpus=1" in run_script
-    assert 'export OMP_NUM_THREADS="1"' in run_script
+    assert 'export OMP_NUM_THREADS="${NCPUS:-1}"' in run_script
     jobs = sorted((root / "jobs").glob("run_*.py"))
     assert len(jobs) == 900
     first_job = jobs[0].read_text(encoding="utf-8")

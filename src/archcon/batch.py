@@ -9,6 +9,7 @@ in a cluster-specific script.
 from __future__ import annotations
 
 from dataclasses import asdict, fields
+from importlib.resources import files
 from itertools import product
 import csv
 import json
@@ -897,7 +898,7 @@ def generate_sweep_bundle(
     ncpus: int = 1,
     memory: str = "10gb",
     scratch: str = "4gb",
-    walltime: str = "48:00:00",
+    walltime: str = "13:00:00",
     ngpus: int = 0,
     gpu_memory: str = "12gb",
     split_frame: pd.DataFrame | None = None,
@@ -1021,118 +1022,32 @@ def generate_sweep_bundle(
             resources.append(f"gpu_mem={gpu_memory.strip()}")
     select_line = ":".join(resources)
 
-    run_script = f"""#!/usr/bin/env bash
-#PBS -N {_safe_name(sweep_name)[:40]}
-#PBS -l select=1:{select_line}
-#PBS -l walltime={walltime}
-#PBS -j oe
-
-set -euo pipefail
-
-: "${{PBS_ARRAY_INDEX:?This script must be submitted as a PBS job array.}}"
-: "${{ARCHCON_SWEEP_DIR:?submit.sh sets ARCHCON_SWEEP_DIR to the copied sweep directory.}}"
-
-PROJECT_DIR="${{ARCHCON_PROJECT_DIR:-{_shell_default(project_dir)}}}"
-DATA_DIR="${{ARCHCON_DATA_DIR:-{_shell_default(data_dir)}}}"
-PYTHON_BIN="${{ARCHCON_PYTHON:-{_shell_default(python_executable)}}}"
-RESULT_ROOT="${{ARCHCON_RESULT_ROOT:-$ARCHCON_SWEEP_DIR/results}}"
-RUN_NAME=$(printf "run_%04d" "$PBS_ARRAY_INDEX")
-CONFIG="$ARCHCON_SWEEP_DIR/configs/${{RUN_NAME}}.json"
-JOB="$ARCHCON_SWEEP_DIR/jobs/${{RUN_NAME}}.py"
-RUN_DIR="$RESULT_ROOT/$RUN_NAME"
-
-mkdir -p "$RESULT_ROOT" "$RUN_DIR"
-
-export OMP_NUM_THREADS="{int(ncpus)}"
-export MKL_NUM_THREADS="{int(ncpus)}"
-export OPENBLAS_NUM_THREADS="{int(ncpus)}"
-export NUMEXPR_NUM_THREADS="{int(ncpus)}"
-export ARCHCON_CPU_THREADS="{int(ncpus)}"
-if [[ -n "${{SCRATCHDIR:-}}" ]]; then
-    export TMPDIR="$SCRATCHDIR"
-    export TEMP="$SCRATCHDIR"
-    export TMP="$SCRATCHDIR"
-    export TORCHINDUCTOR_CACHE_DIR="$SCRATCHDIR/torchinductor"
-    mkdir -p "$TORCHINDUCTOR_CACHE_DIR"
-fi
-cd "$PROJECT_DIR"
-
-echo "ArchCon array index: $PBS_ARRAY_INDEX"
-echo "Run name: $RUN_NAME"
-echo "Python job: $JOB"
-echo "Config: $CONFIG"
-echo "Data: $DATA_DIR"
-echo "Persistent result: $RUN_DIR"
-echo "Checkpoint policy: latest.pt is atomically written here after every completed epoch"
-
-if [[ -f "$RUN_DIR/run_summary.json" ]]; then
-    if "$PYTHON_BIN" - "$RUN_DIR/run_summary.json" <<'PY'
-import json
-import sys
-summary = json.load(open(sys.argv[1], encoding="utf-8"))
-raise SystemExit(0 if summary.get("done") else 1)
-PY
-    then
-        echo "Already completed: $RUN_NAME"
-        exit 0
-    fi
-fi
-
-RESUME_ARGS=()
-if [[ -f "$RUN_DIR/latest.pt" ]]; then
-    echo "Interrupted checkpoint found; resuming from $RUN_DIR/latest.pt"
-    RESUME_ARGS=(--resume-checkpoint "$RUN_DIR/latest.pt")
-fi
-
-"$PYTHON_BIN" "$JOB" \
-    --data-dir "$DATA_DIR" \
-    --output-root "$RESULT_ROOT" \
-    --run-directory "$RUN_DIR" \
-    "${{RESUME_ARGS[@]}}"
-
-if [[ -f "$RUN_DIR/run_summary.json" ]]; then
-    "$PYTHON_BIN" - "$RUN_DIR/run_summary.json" "$RUN_DIR" "$RESULT_ROOT" <<'PY'
-import json
-import sys
-from pathlib import Path
-summary_path = Path(sys.argv[1])
-run_dir = Path(sys.argv[2]).resolve()
-result_root = Path(sys.argv[3]).resolve()
-summary = json.loads(summary_path.read_text(encoding="utf-8"))
-summary["output_root"] = str(result_root)
-summary["result_directory"] = str(run_dir)
-summary["array_index"] = int(run_dir.name.split("_")[-1])
-summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
-PY
-fi
-
-echo "Completed: $RUN_NAME"
-echo "Results stored in: $RUN_DIR"
-"""
+    template_root = files("archcon.assets")
+    run_script = template_root.joinpath("scratch_run_array.pbs.sh.in").read_text(
+        encoding="utf-8"
+    )
+    replacements = {
+        "@@JOB_NAME@@": _safe_name(sweep_name)[:40],
+        "@@SELECT_LINE@@": select_line,
+        "@@WALLTIME@@": str(walltime),
+        "@@PROJECT_DIR@@": _shell_default(project_dir),
+        "@@DATA_DIR@@": _shell_default(data_dir),
+        "@@PYTHON_BIN@@": _shell_default(python_executable),
+    }
+    for placeholder, value in replacements.items():
+        run_script = run_script.replace(placeholder, value)
+    if "@@" in run_script:
+        raise RuntimeError("Unresolved placeholder in generated PBS launcher.")
     run_path = root / "run_array.pbs.sh"
     run_path.write_text(run_script, encoding="utf-8")
     run_path.chmod(0o755)
 
-    submit_script = f"""#!/usr/bin/env bash
-set -euo pipefail
-HERE=$(cd "$(dirname "$0")" && pwd)
-cd "$HERE"
-if [[ ! -f "$HERE/prepared/prepared.json" ]]; then
-    echo "Missing frozen prepared/prepared.json. Regenerate this sweep with ArchCon 0.5.8 before submitting." >&2
-    exit 2
-fi
-for name in train_rows.npy validation_rows.npy test_rows.npy supervised_no_egfr_common.npy; do
-    if [[ ! -f "$HERE/prepared/$name" ]]; then
-        echo "Missing frozen prepared/$name. Refusing to submit." >&2
-        exit 2
-    fi
-done
-qsub -J 1-{len(variants)} -v ARCHCON_SWEEP_DIR="$HERE" run_array.pbs.sh
-"""
+    submit_script = template_root.joinpath("scratch_submit.sh.in").read_text(
+        encoding="utf-8"
+    )
     submit_path = root / "submit.sh"
     submit_path.write_text(submit_script, encoding="utf-8")
     submit_path.chmod(0o755)
-
     readme = f"""ArchCon MetaCentrum sweep
 ==========================
 Runs: {len(variants)}
@@ -1152,11 +1067,12 @@ method-specific GEO row maps, and the already probe-aligned supervised-no-eGFR m
 once during sweep generation. Jobs only read those files; they never reclassify outcomes, align
 probes, remap samples, or resplit data. Outcome-bearing samples are excluded. The three GEO preprocessing arms are Stadniuk rescaling, independent per-study RMA,
 and the legacy-named Global RMA arm, which requires a train-reference matrix tied to this
-sweep's frozen split. Results are written under results/
-unless ARCHCON_RESULT_ROOT is overridden. Crucially, run_XXXX/ is created before training and
-latest.pt is atomically written there after every completed epoch; best.pt is updated immediately
-on validation improvement. Resubmitting an interrupted array element resumes from latest.pt.
-If PBS provides SCRATCHDIR, only temporary Python/Torch compilation files are redirected there.
+sweep's frozen split. `submit.sh` randomly orders unfinished runs and omits result folders that
+already contain a `.pt` checkpoint. Each array element stages only its generated job, frozen
+prepared mappings, supplemental matrix, and selected expression matrix beneath node-local
+`SCRATCHDIR`. Python executes there for at most 12 hours; checkpoints and logs remain local
+during training and are copied atomically to persistent `results/run_XXXX/` only after Python
+stops. The persistent virtual environment is used read-only and is not copied to every node.
 
 For an interactive ArchCon browser session, request an interactive PBS job and run
 `archcon --host 127.0.0.1 --port 7860 --no-browser` on the allocated compute node.

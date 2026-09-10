@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "archcon"
-version = "0.5.12"
+version = "0.5.13"
 description = "A local web interface and Python toolkit for transparent gene-expression data exploration."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -81,7 +81,6 @@ include = [
   "/src",
   "/tests",
   "/scripts",
-  "/evaluate_molecular_egfr.py",
   "/README.md",
   "/METACENTRUM.md",
 ]

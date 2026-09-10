@@ -3771,7 +3771,7 @@ Click a step. Each page answers one simple question; the selected step stays **o
                         pbs_ncpus = gr.Number(value=1, precision=0, minimum=1, label="PBS CPUs")
                         pbs_memory = gr.Textbox(value="10gb", label="PBS RAM")
                         pbs_scratch = gr.Textbox(value="4gb", label="PBS scratch_local")
-                        pbs_walltime = gr.Textbox(value="48:00:00", label="PBS walltime")
+                        pbs_walltime = gr.Textbox(value="13:00:00", label="PBS walltime")
                         pbs_ngpus = gr.Number(value=0, precision=0, minimum=0, label="PBS GPUs")
                         pbs_gpu_memory = gr.Textbox(value="12gb", label="Minimum GPU memory")
                     generate_sweep_button = gr.Button(

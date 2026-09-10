@@ -10,6 +10,7 @@ and clinical scaling, clinical imputation, and PCA are fitted inside each fold.
 
 from __future__ import annotations
 
+import gc
 import json
 import re
 import subprocess
@@ -53,7 +54,11 @@ class ValidationCheckpoint:
 
     run: str
     path: Path
-    checkpoint: dict
+    # Kept only for compatibility with callers that construct an in-memory
+    # record themselves.  Files discovered by scan_validation_checkpoints()
+    # deliberately store None here: retaining model and optimizer tensors for
+    # every best.pt makes RAM scale with the total checkpoint collection.
+    checkpoint: dict | None
     method: str
     architecture: str
     latent_dim: int
@@ -62,6 +67,7 @@ class ValidationCheckpoint:
     validation_objective: float
     best_epoch: int
     config: TrainingConfig
+    input_dim: int = 0
     molecular_validation_mse: float | None = None
     molecular_test_mse: float | None = None
     molecular_selection_mse: float | None = None
@@ -82,8 +88,36 @@ class EmbeddingResult:
     reconstruction_mse: float
 
 
+def _torch_load(path: Path, *, map_location: str, mmap: bool) -> dict:
+    """Load a trusted checkpoint with the leanest supported PyTorch options."""
+
+    import torch
+
+    options = {"map_location": map_location}
+    if mmap:
+        options["mmap"] = True
+    try:
+        checkpoint = torch.load(path, weights_only=True, **options)
+    except TypeError:  # PyTorch without weights_only and/or mmap support
+        options.pop("mmap", None)
+        try:
+            checkpoint = torch.load(path, weights_only=True, **options)
+        except TypeError:
+            checkpoint = torch.load(path, **options)
+    except RuntimeError as exc:
+        # mmap requires the modern zipfile checkpoint format.  Old ArchCon
+        # checkpoints still remain readable, but only one is loaded at once.
+        if mmap and "mmap" in str(exc).lower():
+            checkpoint = _torch_load(path, map_location=map_location, mmap=False)
+        else:
+            raise
+    if not isinstance(checkpoint, dict):
+        raise TypeError(f"Checkpoint is not a dictionary: {path}")
+    return checkpoint
+
+
 def load_checkpoint(path: str | Path) -> dict:
-    """Load a trusted ArchCon checkpoint on CPU without modifying it."""
+    """Memory-map one trusted ArchCon checkpoint on CPU without modifying it."""
 
     try:
         import torch
@@ -93,13 +127,71 @@ def load_checkpoint(path: str | Path) -> dict:
         ) from exc
 
     source = Path(path).expanduser().resolve()
+    return _torch_load(source, map_location="cpu", mmap=True)
+
+
+def load_checkpoint_metadata(path: str | Path) -> dict:
+    """Read checkpoint structure on the meta device without allocating tensors."""
+
     try:
-        checkpoint = torch.load(source, map_location="cpu", weights_only=True)
-    except TypeError:  # PyTorch < 2.0 compatibility
-        checkpoint = torch.load(source, map_location="cpu")
-    if not isinstance(checkpoint, dict):
-        raise TypeError(f"Checkpoint is not a dictionary: {source}")
-    return checkpoint
+        import torch  # noqa: F401
+    except ImportError as exc:  # pragma: no cover - depends on optional extra
+        raise RuntimeError(
+            "PyTorch is required for checkpoint evaluation; install archcon[training]."
+        ) from exc
+    source = Path(path).expanduser().resolve()
+    try:
+        return _torch_load(source, map_location="meta", mmap=True)
+    except (RuntimeError, NotImplementedError):
+        # A legacy/custom tensor type may not support the meta backend.  This
+        # fallback is still bounded because the caller releases each checkpoint
+        # before opening the next one.
+        return load_checkpoint(source)
+
+
+def _record_input_dim(record: ValidationCheckpoint, checkpoint: dict | None = None) -> int:
+    value = int(record.input_dim)
+    if value < 1:
+        source = checkpoint if checkpoint is not None else record.checkpoint
+        value = int(source.get("input_dim", 0)) if source is not None else 0
+    return value
+
+
+def _model_from_record(record: ValidationCheckpoint, device: str):
+    """Build one inference model and release unrelated checkpoint state promptly."""
+
+    try:
+        import torch
+    except ImportError as exc:  # pragma: no cover - depends on optional extra
+        raise RuntimeError(
+            "PyTorch is required for checkpoint evaluation; install archcon[training]."
+        ) from exc
+
+    checkpoint = (
+        record.checkpoint
+        if record.checkpoint is not None
+        else load_checkpoint(record.path)
+    )
+    input_dim = _record_input_dim(record, checkpoint)
+    if input_dim < 1:
+        raise ValueError(f"Checkpoint {record.path} has invalid input_dim.")
+    state = checkpoint["model_state"]
+    try:
+        # Constructing on meta plus assign=True avoids allocating randomly
+        # initialized parameters before attaching the memory-mapped weights.
+        with torch.device("meta"):
+            model = build_autoencoder(input_dim, record.config)
+        model.load_state_dict(state, strict=True, assign=True)
+    except (TypeError, NotImplementedError):
+        # Compatibility fallback for an older/custom PyTorch module.
+        model = build_autoencoder(input_dim, record.config)
+        model.load_state_dict(state, strict=True)
+    del state
+    if record.checkpoint is None:
+        del checkpoint
+    model.to(torch.device(device))
+    model.eval()
+    return model, input_dim
 
 
 def training_config_from_checkpoint(checkpoint: dict) -> TrainingConfig:
@@ -139,7 +231,11 @@ def _checkpoint_validation_metrics(checkpoint: dict) -> tuple[float, float, floa
     )
 
 
-def scan_validation_checkpoints(results_root: str | Path) -> tuple[list[ValidationCheckpoint], list[str]]:
+def scan_validation_checkpoints(
+    results_root: str | Path,
+    *,
+    progress=None,
+) -> tuple[list[ValidationCheckpoint], list[str]]:
     """Rank readable ``best.pt`` files by clean validation MSE.
 
     Returns both records and warning strings so callers can report incomplete or
@@ -149,19 +245,22 @@ def scan_validation_checkpoints(results_root: str | Path) -> tuple[list[Validati
     records: list[ValidationCheckpoint] = []
     warnings: list[str] = []
     root = Path(results_root).expanduser().resolve()
-    for run_dir in sorted(root.glob("run_*")):
+    run_dirs = sorted(root.glob("run_*"))
+    total = len(run_dirs)
+    for index, run_dir in enumerate(run_dirs, start=1):
         path = run_dir / "best.pt"
         if not path.is_file():
             continue
         try:
-            checkpoint = load_checkpoint(path)
+            checkpoint = load_checkpoint_metadata(path)
             mse, r2, objective, epoch = _checkpoint_validation_metrics(checkpoint)
             config = training_config_from_checkpoint(checkpoint)
+            input_dim = int(checkpoint.get("input_dim", 0))
             records.append(
                 ValidationCheckpoint(
                     run=run_dir.name,
                     path=path,
-                    checkpoint=checkpoint,
+                    checkpoint=None,
                     method=str(checkpoint.get("method", "unknown")),
                     architecture=str(config.architecture_family),
                     latent_dim=int(config.latent_dim),
@@ -170,10 +269,18 @@ def scan_validation_checkpoints(results_root: str | Path) -> tuple[list[Validati
                     validation_objective=objective,
                     best_epoch=epoch,
                     config=config,
+                    input_dim=input_dim,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - one corrupt run must not stop the scan
             warnings.append(f"Skipped {path}: {exc}")
+        finally:
+            if "checkpoint" in locals():
+                del checkpoint
+        if progress is not None:
+            progress(index, total, len(records))
+        if index % 50 == 0:
+            gc.collect()
     records.sort(key=lambda record: record.validation_mse)
     return records, warnings
 
@@ -252,64 +359,64 @@ def score_molecular_selection_records(
 
     prepared = Path(prepared_root).expanduser().resolve()
     _, validation_rows, test_rows = load_prepared_split_rows(prepared)
-    source_cache: dict[str, object] = {}
-    validation_target_cache: dict[str, tuple[int, float, float]] = {}
     scored: list[ValidationCheckpoint] = []
     total = len(records)
-    for index, record in enumerate(records, start=1):
-        if progress is not None:
-            progress(index, total, record)
-        source = source_cache.get(record.method)
-        if source is None:
-            source = load_prepared_pretraining_source(layout, record.method, prepared)
-            source_cache[record.method] = source
-            validation_target_cache[record.method] = _target_totals(
-                source.matrix, validation_rows, batch_size=batch_size
-            )
-        input_dim = int(record.checkpoint.get("input_dim", 0))
-        if input_dim < 1 or int(source.matrix.shape[1]) != input_dim:
-            raise ValueError(
-                f"Prepared source/checkpoint feature mismatch for {record.run}: "
-                f"{source.matrix.shape[1]} vs {input_dim}."
-            )
-        model = build_autoencoder(input_dim, record.config)
-        model.load_state_dict(record.checkpoint["model_state"], strict=True)
-        model.to(torch.device(device))
-        model.eval()
-        test = _clean_reconstruction_totals(
-            model,
-            source.matrix,
-            test_rows,
-            device=device,
-            batch_size=batch_size,
+    processed = 0
+    # Keep only one preprocessing store mapped at a time.  This also makes
+    # sequential reads friendlier to the OS page cache on memory-limited nodes.
+    methods = list(dict.fromkeys(record.method for record in records))
+    for method in methods:
+        source = load_prepared_pretraining_source(layout, method, prepared)
+        validation_count, validation_sum, validation_sum2 = _target_totals(
+            source.matrix, validation_rows, batch_size=batch_size
         )
-        del model
-        if str(device).startswith("cuda"):
-            torch.cuda.empty_cache()
+        for record in (item for item in records if item.method == method):
+            processed += 1
+            if progress is not None:
+                progress(processed, total, record)
+            model, input_dim = _model_from_record(record, device)
+            if int(source.matrix.shape[1]) != input_dim:
+                del model
+                raise ValueError(
+                    f"Prepared source/checkpoint feature mismatch for {record.run}: "
+                    f"{source.matrix.shape[1]} vs {input_dim}."
+                )
+            test = _clean_reconstruction_totals(
+                model,
+                source.matrix,
+                test_rows,
+                device=device,
+                batch_size=batch_size,
+            )
+            del model
+            gc.collect()
+            if str(device).startswith("cuda"):
+                torch.cuda.empty_cache()
 
-        validation_count, validation_sum, validation_sum2 = validation_target_cache[
-            record.method
-        ]
-        validation_sse = float(record.validation_mse) * validation_count
-        combined_sse = validation_sse + test[0]
-        combined_count = validation_count + test[1]
-        combined_sum = validation_sum + test[2]
-        combined_sum2 = validation_sum2 + test[3]
-        denominator = combined_sum2 - combined_sum * combined_sum / max(combined_count, 1)
-        combined_r2 = (
-            1.0 - combined_sse / denominator if denominator > 0.0 else float("nan")
-        )
-        scored.append(
-            replace(
-                record,
-                molecular_validation_mse=record.validation_mse,
-                molecular_test_mse=test[0] / max(test[1], 1),
-                molecular_selection_mse=combined_sse / max(combined_count, 1),
-                molecular_selection_r2=combined_r2,
-                n_molecular_validation=len(validation_rows),
-                n_molecular_test=len(test_rows),
+            validation_sse = float(record.validation_mse) * validation_count
+            combined_sse = validation_sse + test[0]
+            combined_count = validation_count + test[1]
+            combined_sum = validation_sum + test[2]
+            combined_sum2 = validation_sum2 + test[3]
+            denominator = combined_sum2 - combined_sum * combined_sum / max(combined_count, 1)
+            combined_r2 = (
+                1.0 - combined_sse / denominator if denominator > 0.0 else float("nan")
             )
-        )
+            scored.append(
+                replace(
+                    record,
+                    checkpoint=None,
+                    input_dim=input_dim,
+                    molecular_validation_mse=record.validation_mse,
+                    molecular_test_mse=test[0] / max(test[1], 1),
+                    molecular_selection_mse=combined_sse / max(combined_count, 1),
+                    molecular_selection_r2=combined_r2,
+                    n_molecular_validation=len(validation_rows),
+                    n_molecular_test=len(test_rows),
+                )
+            )
+        del source
+        gc.collect()
     return sorted(
         scored,
         key=lambda record: (
@@ -550,15 +657,14 @@ def extract_checkpoint_embedding(
     except ImportError as exc:  # pragma: no cover - depends on optional extra
         raise RuntimeError("PyTorch is required; install archcon[training].") from exc
 
-    input_dim = int(record.checkpoint.get("input_dim", 0))
+    input_dim = _record_input_dim(record)
     if input_dim < 1:
         raise ValueError(f"Checkpoint {record.path} has invalid input_dim.")
     source, columns, samples = canonical_ikem_columns(layout, prepared_root, input_dim)
-    model = build_autoencoder(input_dim, record.config)
-    model.load_state_dict(record.checkpoint["model_state"], strict=True)
+    model, loaded_input_dim = _model_from_record(record, device)
+    if loaded_input_dim != input_dim:
+        raise ValueError(f"Checkpoint metadata changed while reading {record.path}.")
     torch_device = torch.device(device)
-    model.to(torch_device)
-    model.eval()
 
     z = np.empty((source.n_samples, record.latent_dim), dtype=np.float32)
     total_sse = 0.0
@@ -573,7 +679,7 @@ def extract_checkpoint_embedding(
             z[start:stop] = latent.detach().cpu().numpy().astype(np.float32, copy=False)
             total_sse += float(((reconstruction.float() - x.float()) ** 2).sum().item())
             total_values += int(values.size)
-    return EmbeddingResult(
+    result = EmbeddingResult(
         model_id=model_id,
         label=label,
         record=record,
@@ -581,6 +687,11 @@ def extract_checkpoint_embedding(
         samples=samples,
         reconstruction_mse=total_sse / max(total_values, 1),
     )
+    del model
+    gc.collect()
+    if str(device).startswith("cuda"):
+        torch.cuda.empty_cache()
+    return result
 
 
 def save_embeddings(

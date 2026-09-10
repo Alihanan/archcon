@@ -148,7 +148,23 @@ def main() -> None:
     if not results_root.is_dir():
         raise SystemExit(f"Missing results directory: {results_root}")
 
-    readable_records, warnings = scan_validation_checkpoints(results_root)
+    print(
+        "Scanning best.pt files in metadata-only mode; model and optimizer tensors are not "
+        "retained in RAM...",
+        flush=True,
+    )
+
+    def report_scan(index, total, readable):
+        if index == 1 or index == total or index % 50 == 0:
+            print(
+                f"  scanned {index:>4}/{total} result folders; "
+                f"{readable} readable checkpoints",
+                flush=True,
+            )
+
+    readable_records, warnings = scan_validation_checkpoints(
+        results_root, progress=report_scan
+    )
     for warning in warnings:
         print(f"WARNING: {warning}", file=sys.stderr)
     if not readable_records:
@@ -301,7 +317,7 @@ def main() -> None:
     if args.embeddings_only:
         return
 
-    winner_input_dim = int(embeddings[0].record.checkpoint["input_dim"])
+    winner_input_dim = int(embeddings[0].record.input_dim)
     expression, expression_samples = aligned_ikem_matrix(
         layout, prepared_root, winner_input_dim
     )
