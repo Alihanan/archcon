@@ -23,6 +23,8 @@ from .data.downstream import (
     select_molecular_group_winners,
     summarize_mixed_model_results,
 )
+from .data.geo_rma import METHOD_PER_GSE_RMA
+from .data.ikem_preprocessing import prepare_ikem_evaluation_sources
 
 LINE = "=" * 88
 
@@ -123,6 +125,14 @@ def main() -> None:
         "--embeddings-only",
         action="store_true",
         help="Extract and save z without invoking R/lme4.",
+    )
+    parser.add_argument(
+        "--rebuild-ikem-preprocessing",
+        action="store_true",
+        help=(
+            "Rebuild cached method-matched IKEM matrices even when their recorded source "
+            "and frozen-pretraining provenance still match."
+        ),
     )
     args = parser.parse_args()
 
@@ -266,8 +276,11 @@ def main() -> None:
         "reported as an untouched test set."
     )
     print(
-        "NOTE: Per-dataset RMA is study-isolated. The legacy-named Global RMA arm must "
-        "carry matching train-reference provenance; held-out GEO rows do not fit its reference."
+        "NOTE: Per-dataset standardization uses one source dataset at a time; each GEO "
+        "dataset stays in one molecular split, while IKEM uses frozen outcome-blind "
+        "pretraining-train parameters. IKEM per-dataset RMA likewise uses only frozen "
+        "outcome-free pretraining-train parameters and transforms every evaluation CEL "
+        "independently. Global RMA must carry matching GEO-train-reference provenance."
     )
 
     if args.evaluate_all_readable_checkpoints:
@@ -295,6 +308,33 @@ def main() -> None:
     else:
         selected = group_winners
 
+    print("\nPreparing method-matched IKEM inputs without using eGFR outcomes or CV folds...")
+    required_ikem_methods = tuple(
+        dict.fromkeys(
+            [METHOD_PER_GSE_RMA, *(record.method for _, _, record in selected)]
+        )
+    )
+    ikem_sources = prepare_ikem_evaluation_sources(
+        layout,
+        prepared_root,
+        output_root / "ikem_preprocessing",
+        methods=required_ikem_methods,
+        force=args.rebuild_ikem_preprocessing,
+        batch_size=args.batch_size,
+    )
+    for method, prepared_ikem in ikem_sources.items():
+        provenance = prepared_ikem.provenance
+        qualification = (
+            "ERROR: transductive preprocessing"
+            if provenance["transductive_across_egfr_folds"]
+            else "frozen pretraining reference; inductive per sample"
+        )
+        if provenance["transductive_across_egfr_folds"]:
+            raise RuntimeError(
+                f"Refusing eGFR evaluation with transductive preprocessing: {method}."
+            )
+        print(f"  {method}: {qualification}")
+
     embeddings = []
     for model_id, label, record in selected:
         print(f"Encoding all supervised samples with {model_id} on {device}...")
@@ -307,6 +347,7 @@ def main() -> None:
                 prepared_root,
                 device=device,
                 batch_size=args.batch_size,
+                source=ikem_sources[record.method].source,
             )
         )
 
@@ -319,7 +360,10 @@ def main() -> None:
 
     winner_input_dim = int(embeddings[0].record.input_dim)
     expression, expression_samples = aligned_ikem_matrix(
-        layout, prepared_root, winner_input_dim
+        layout,
+        prepared_root,
+        winner_input_dim,
+        source=ikem_sources[METHOD_PER_GSE_RMA].source,
     )
     egfr = load_egfr_wide(layout, expression_samples["sample_id"])
     stratify_column = None if args.stratify_column.lower() == "none" else args.stratify_column
@@ -385,6 +429,33 @@ def main() -> None:
         "Its ordinary CV score is used to lock a future deployment model; the unbiased "
         "performance estimate below comes from nested outer folds."
     )
+
+    fixed_encoder_summary = summary.loc[
+        summary["model_id"].astype(str).str.startswith("candidate_")
+    ].copy()
+    print("\n" + LINE)
+    print("ALL FIXED MOLECULAR ENCODERS: OUTER-CV eGFR PERFORMANCE")
+    print(LINE)
+    print(
+        "Each row fixes one molecular group winner before eGFR CV. Comparing these six "
+        "rows is an additional experiment; choosing the minimum and reporting that same "
+        "minimum as final performance would be optimistic, so the nested result remains "
+        "the unbiased choose-one-of-six estimate.\n"
+    )
+    fixed_columns = [
+        "model_label",
+        "mean_rmse",
+        "pooled_rmse",
+        "mean_delta_vs_time",
+        "lcb_delta_vs_time",
+        "positive_folds_vs_time",
+    ]
+    print(
+        fixed_encoder_summary[fixed_columns].to_string(
+            index=False, float_format=lambda value: f"{value:.6g}"
+        )
+    )
+    print(f"\nSaved: {benchmark_root / 'all_fixed_encoder_cv_summary.csv'}")
 
     print("\n" + LINE)
     print("NESTED-CV eGFR MIXED-MODEL SUMMARY")

@@ -115,7 +115,7 @@ def test_sweep_bundle_preserves_current_split_when_split_is_not_a_grid_axis(tmp_
     assert request["split_file"] == "../split.csv"
 
 
-def test_recommended_comparison_sweep_has_900_architecture_preprocessing_runs(tmp_path: Path) -> None:
+def test_recommended_comparison_sweep_has_1440_architecture_preprocessing_runs(tmp_path: Path) -> None:
     import pandas as pd
 
     from archcon.batch import recommended_comparison_grid_json
@@ -135,6 +135,9 @@ def test_recommended_comparison_sweep_has_900_architecture_preprocessing_runs(tm
             "seed": [42, 42, 42],
         }
     )
+    preserved_result = tmp_path / "comparison" / "results" / "run_0181" / "best.pt"
+    preserved_result.parent.mkdir(parents=True)
+    preserved_result.write_bytes(b"existing checkpoint")
     bundle = generate_sweep_bundle(
         base_request=base,
         grid_text=recommended_comparison_grid_json(),
@@ -142,14 +145,28 @@ def test_recommended_comparison_sweep_has_900_architecture_preprocessing_runs(tm
         sweep_name="comparison",
         split_frame=split,
     )
-    assert bundle["count"] == 900
+    assert bundle["count"] == 1440
+    assert preserved_result.read_bytes() == b"existing checkpoint"
     root = Path(bundle["root"])
     manifest = pd.read_csv(root / "manifest.csv")
     assert (manifest["branch"] == "stadniuk_mlp").sum() == 540
     assert (manifest["branch"] == "resnet_ln").sum() == 360
+    assert (manifest["branch"] == "stadniuk_mlp_no_dropout").sum() == 540
     stadniuk = manifest.loc[manifest["branch"] == "stadniuk_mlp"]
     assert set(stadniuk["stadniuk_batch_norm"].astype(str).str.lower()) == {"true", "false"}
-    assert set(manifest["method"]) == {"Stadniuk rescaling", "Per-dataset RMA", "Global RMA"}
+    assert set(manifest["method"]) == {
+        "Per-dataset standardization",
+        "Per-dataset RMA",
+        "Global RMA",
+    }
+    assert set(manifest["loss_name"]) == {
+        "MSE / L2 reconstruction (thesis baseline)",
+        "Masked denoising reconstruction · masked MSE",
+    }
+    assert set(manifest.loc[manifest["branch"] == "stadniuk_mlp", "dropout"]) == {0.1}
+    assert set(
+        manifest.loc[manifest["branch"] == "stadniuk_mlp_no_dropout", "dropout"]
+    ) == {0.0}
     assert set(manifest["latent_dim"]) == {3, 8, 16}
     assert set(manifest["hidden_widths"]) == {
         "[256]",
@@ -174,7 +191,12 @@ def test_recommended_comparison_sweep_has_900_architecture_preprocessing_runs(tm
     assert "ncpus=1" in run_script
     assert 'export OMP_NUM_THREADS="${NCPUS:-1}"' in run_script
     jobs = sorted((root / "jobs").glob("run_*.py"))
-    assert len(jobs) == 900
+    assert len(jobs) == 1440
+    # The original 900-slot ordering is stable for unaffected RMA runs.
+    assert manifest.iloc[180]["method"] == "Per-dataset RMA"  # run_0181
+    assert manifest.iloc[360]["method"] == "Global RMA"  # run_0361
+    assert manifest.iloc[660]["method"] == "Per-dataset RMA"  # run_0661
+    assert manifest.iloc[780]["method"] == "Global RMA"  # run_0781
     first_job = jobs[0].read_text(encoding="utf-8")
     assert "Seed: 42" in first_job
     assert "LambdaLR" in first_job

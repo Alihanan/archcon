@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import numpy as np
@@ -7,7 +8,7 @@ import pytest
 from archcon.data.defaults import project_data_layout
 from archcon.data.geo_rma import METHOD_GLOBAL_RMA, METHOD_PER_GSE_RMA
 from archcon.data.training_sources import (
-    METHOD_STADNIUK_RESCALED,
+    METHOD_PER_DATASET_STANDARDIZED,
     assert_probe_alignment,
     create_shared_preprocessing_split,
     load_ikem_source,
@@ -65,11 +66,41 @@ def _write_geo_rma_store(root: Path, samples: list[str], probes: list[str]) -> N
 def _write_simple_store(root: Path, samples: list[str], probes: list[str], offset: float) -> None:
     root.mkdir(parents=True)
     matrix = np.arange(len(samples) * len(probes), dtype=np.float32).reshape(len(samples), len(probes))
-    np.save(root / "expression.npy", matrix + offset)
+    values = matrix + offset
+    np.save(root / "expression.npy", values)
+    np.save(root / "raw_original.npy", values)
+    np.save(root / "rma_per_gse.npy", values)
+    np.save(root / "rma_global.npy", values)
     pd.DataFrame({"GSM": samples, "row_index_python": range(len(samples))}).to_csv(
         root / "sample_index.csv", index=False
     )
     pd.DataFrame({"probe_id": probes}).to_csv(root / "probe_index.csv", index=False)
+    (root / "preprocessing_provenance.json").write_text(
+        json.dumps(
+            {
+                "format": 2,
+                "source": "GSE290167",
+                "methods": {
+                    "raw_original": {
+                        "uses_egfr": False,
+                        "uses_egfr_cv_fold": False,
+                        "transductive_across_egfr_folds": False,
+                    },
+                    "rma_per_gse": {
+                        "uses_egfr": False,
+                        "uses_egfr_cv_fold": False,
+                        "transductive_across_egfr_folds": False,
+                    },
+                    "rma_global": {
+                        "uses_egfr": False,
+                        "uses_egfr_cv_fold": False,
+                        "transductive_across_egfr_folds": False,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def _layout(tmp_path: Path):
@@ -96,6 +127,29 @@ def _layout(tmp_path: Path):
     return project_data_layout(tmp_path), samples, probes
 
 
+@pytest.mark.parametrize(
+    ("method", "native_method"),
+    [
+        (METHOD_PER_DATASET_STANDARDIZED, "raw_original"),
+        (METHOD_PER_GSE_RMA, "rma_per_gse"),
+        (METHOD_GLOBAL_RMA, "rma_global"),
+    ],
+)
+def test_ikem_method_source_rejects_transductive_provenance(
+    tmp_path: Path,
+    method: str,
+    native_method: str,
+) -> None:
+    layout, _, _ = _layout(tmp_path)
+    provenance_path = tmp_path / "IKEM_NUMPY_STORE" / "preprocessing_provenance.json"
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["methods"][native_method]["transductive_across_egfr_folds"] = True
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="non-transductive"):
+        load_ikem_source(layout, method=method)
+
+
 def test_shared_split_is_sampled_once_and_maps_by_gsm(tmp_path: Path) -> None:
     layout, samples, _ = _layout(tmp_path)
     first = create_shared_preprocessing_split(layout, seed=42, train_fraction=0.75)
@@ -108,11 +162,11 @@ def test_shared_split_is_sampled_once_and_maps_by_gsm(tmp_path: Path) -> None:
     assert (first["split"] == "test").sum() >= 1
 
     rma = load_pretraining_source(layout, METHOD_PER_GSE_RMA)
-    stadniuk = load_pretraining_source(layout, METHOD_STADNIUK_RESCALED)
+    standardized = load_pretraining_source(layout, METHOD_PER_DATASET_STANDARDIZED)
     rma_train, rma_val, rma_test = split_rows_for_source(first, rma, include_test=True)
-    stad_train, stad_val, stad_test = split_rows_for_source(first, stadniuk, include_test=True)
+    stad_train, stad_val, stad_test = split_rows_for_source(first, standardized, include_test=True)
     rma_ids = set(rma.sample_index.iloc[rma_train]["sample_key"])
-    stad_ids = set(stadniuk.sample_index.iloc[stad_train]["sample_key"])
+    stad_ids = set(standardized.sample_index.iloc[stad_train]["sample_key"])
     assert rma_ids == stad_ids
     assert len(rma_val) == len(stad_val)
     assert len(rma_test) == len(stad_test)
@@ -120,7 +174,7 @@ def test_shared_split_is_sampled_once_and_maps_by_gsm(tmp_path: Path) -> None:
 
 def test_all_three_training_preprocessings_and_ikem_are_memory_mapped(tmp_path: Path) -> None:
     layout, _, _ = _layout(tmp_path)
-    for method in (METHOD_STADNIUK_RESCALED, METHOD_PER_GSE_RMA, METHOD_GLOBAL_RMA):
+    for method in (METHOD_PER_DATASET_STANDARDIZED, METHOD_PER_GSE_RMA, METHOD_GLOBAL_RMA):
         source = load_training_source(layout, method)
         assert isinstance(source.matrix, np.memmap)
         assert source.matrix.shape == (8, 5)
@@ -146,7 +200,7 @@ def test_comparison_pretraining_offers_all_three_preprocessings() -> None:
     from archcon.data.training_sources import TRAINING_PREPROCESSING_OPTIONS
 
     assert TRAINING_PREPROCESSING_OPTIONS == [
-        METHOD_STADNIUK_RESCALED,
+        METHOD_PER_DATASET_STANDARDIZED,
         METHOD_PER_GSE_RMA,
         METHOD_GLOBAL_RMA,
     ]
@@ -188,7 +242,13 @@ def test_prepared_assets_align_extra_supervised_probes_and_freeze_rows(tmp_path:
     values = np.arange(
         len(supervised_samples) * len(extra_probes), dtype=np.float32
     ).reshape(len(supervised_samples), len(extra_probes))
-    np.save(layout.ikem_store / "expression.npy", values)
+    for filename in (
+        "expression.npy",
+        "raw_original.npy",
+        "rma_per_gse.npy",
+        "rma_global.npy",
+    ):
+        np.save(layout.ikem_store / filename, values)
     pd.DataFrame({"probe_id": extra_probes}).to_csv(
         layout.ikem_store / "probe_index.csv", index=False
     )
@@ -200,28 +260,39 @@ def test_prepared_assets_align_extra_supervised_probes_and_freeze_rows(tmp_path:
         layout,
         split,
         tmp_path / "prepared",
-        methods=(METHOD_STADNIUK_RESCALED, METHOD_PER_GSE_RMA, METHOD_GLOBAL_RMA),
+        methods=(METHOD_PER_DATASET_STANDARDIZED, METHOD_PER_GSE_RMA, METHOD_GLOBAL_RMA),
     )
 
-    supplemental = np.load(prepared / "supervised_no_egfr_common.npy", mmap_mode="r")
-    assert supplemental.shape == (3, len(probes))
+    metadata = json.loads((prepared / "prepared.json").read_text())
+    assert metadata["format"] == 4
     # IKEM1 has eGFR, so frozen supplemental rows are IKEM2..4; the extra probe is dropped.
-    np.testing.assert_array_equal(supplemental, values[1:, 1:])
+    for method, filename in metadata["supplemental_matrices"].items():
+        supplemental = np.load(prepared / filename, mmap_mode="r")
+        assert supplemental.shape == (3, len(probes)), method
+        np.testing.assert_array_equal(supplemental, values[1:, 1:])
 
     train, validation, test = load_prepared_split_rows(prepared)
     all_rows = np.sort(np.concatenate([train, validation, test]))
     np.testing.assert_array_equal(all_rows, np.arange(len(samples) + 3))
 
-    for method in (METHOD_STADNIUK_RESCALED, METHOD_PER_GSE_RMA, METHOD_GLOBAL_RMA):
+    for method in (METHOD_PER_DATASET_STANDARDIZED, METHOD_PER_GSE_RMA):
         source = load_prepared_pretraining_source(layout, method, prepared)
         assert source.matrix.shape == (len(samples) + 3, len(probes))
         assert source.probe_ids == tuple(probes)
         assert source.sample_index["row_index_python"].tolist() == list(range(len(samples) + 3))
         # Fetch the three supplemental logical rows through the prepared read-only stack.
-        np.testing.assert_array_equal(
-            source.matrix[np.arange(len(samples), len(samples) + 3), :],
-            values[1:, 1:],
-        )
+        observed = source.matrix[np.arange(len(samples), len(samples) + 3), :]
+        if method == METHOD_PER_DATASET_STANDARDIZED:
+            train_rows, _, _ = load_prepared_split_rows(prepared)
+            train_supervised = train_rows[train_rows >= len(samples)] - len(samples)
+            expected_center = values[1:, 1:][train_supervised].mean(axis=0)
+            expected_scale = values[1:, 1:][train_supervised].std(axis=0)
+            expected_scale = np.where(expected_scale > 1e-6, expected_scale, 1.0)
+            np.testing.assert_allclose(
+                observed, (values[1:, 1:] - expected_center) / expected_scale
+            )
+        else:
+            np.testing.assert_array_equal(observed, values[1:, 1:])
 
 
 def test_prepared_assets_freeze_different_geo_probe_orders(tmp_path: Path) -> None:
@@ -233,34 +304,35 @@ def test_prepared_assets_freeze_different_geo_probe_orders(tmp_path: Path) -> No
         layout,
         split,
         tmp_path / "prepared_reordered_geo",
-        methods=(METHOD_STADNIUK_RESCALED, METHOD_PER_GSE_RMA, METHOD_GLOBAL_RMA),
+        methods=(METHOD_PER_DATASET_STANDARDIZED, METHOD_PER_GSE_RMA, METHOD_GLOBAL_RMA),
     )
 
-    # Native Stadniuk columns are reversed, but the prepared logical matrix must
-    # expose the canonical per-GSE-RMA probe order.
+    # Every synthetic GSE has one sample, so per-dataset standardization maps
+    # every GEO probe to zero without borrowing information from another split.
     source = load_prepared_pretraining_source(
-        layout, METHOD_STADNIUK_RESCALED, prepared
+        layout, METHOD_PER_DATASET_STANDARDIZED, prepared
     )
     assert source.probe_ids == tuple(probes)
     gsm0_row = int(
         source.sample_index.index[source.sample_index["sample_key"].eq("GEO:GSM0")][0]
     )
-    # GSM0 is native Stadniuk row 7; native columns are probe_4..probe_0.
-    expected = np.asarray([139, 138, 137, 136, 135], dtype=np.float32)
+    expected = np.zeros(len(probes), dtype=np.float32)
     np.testing.assert_array_equal(source.matrix[[gsm0_row], :][0], expected)
 
     metadata = __import__("json").loads((prepared / "prepared.json").read_text())
-    assert metadata["format"] == 2
+    assert metadata["format"] == 4
     assert set(metadata["method_geo_columns"]) == {
-        METHOD_STADNIUK_RESCALED,
+        METHOD_PER_DATASET_STANDARDIZED,
         METHOD_PER_GSE_RMA,
         METHOD_GLOBAL_RMA,
     }
-    assert (prepared / "geo_columns_stadniuk.npy").is_file()
+    assert (prepared / "geo_columns_standardized.npy").is_file()
     np.testing.assert_array_equal(
-        np.load(prepared / "geo_columns_stadniuk.npy"),
-        np.asarray([4, 3, 2, 1, 0], dtype=np.int64),
+        np.load(prepared / "geo_columns_standardized.npy"),
+        np.asarray([0, 1, 2, 3, 4], dtype=np.int64),
     )
+    assert metadata["standardization"]["uses_egfr"] is False
+    assert metadata["standardization"]["uses_egfr_cv_fold"] is False
 
 
 def test_formal_sweep_bundle_embeds_frozen_prepared_plan(tmp_path: Path) -> None:

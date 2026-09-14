@@ -128,7 +128,7 @@ def test_prepared_global_loader_refuses_missing_provenance(tmp_path: Path) -> No
     ).to_csv(prepared / "sample_index.csv", index=False)
     (prepared / "prepared.json").write_text(
         """{
-          "format": 2,
+          "format": 3,
           "n_samples": 3,
           "n_probes": 3,
           "sample_index": "sample_index.csv",

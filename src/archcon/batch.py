@@ -35,7 +35,7 @@ from .data.pretraining import (
     LOSS_MSE,
 )
 from .data.training_sources import (
-    METHOD_STADNIUK_RESCALED,
+    METHOD_PER_DATASET_STANDARDIZED,
     TRAINING_PREPROCESSING_OPTIONS,
     create_shared_preprocessing_split,
     load_prepared_pretraining_source,
@@ -45,7 +45,6 @@ from .data.training_sources import (
     split_rows_for_source,
 )
 from .data.training import (
-    CHECKPOINT_RESUME,
     TrainingConfig,
     pytorch_model_code,
     train_autoencoder_stream,
@@ -99,7 +98,7 @@ RECOMMENDED_COMPARISON_SWEEP = {
             },
             "grid": {
                 "method": [
-                    "Stadniuk rescaling",
+                    METHOD_PER_DATASET_STANDARDIZED,
                     "Per-dataset RMA",
                     "Global RMA",
                 ],
@@ -142,7 +141,7 @@ RECOMMENDED_COMPARISON_SWEEP = {
             },
             "grid": {
                 "method": [
-                    "Stadniuk rescaling",
+                    METHOD_PER_DATASET_STANDARDIZED,
                     "Per-dataset RMA",
                     "Global RMA",
                 ],
@@ -159,12 +158,59 @@ RECOMMENDED_COMPARISON_SWEEP = {
                 "residual_expansion": [2, 4],
             },
         },
+        {
+            # Appended after the original 900 slots so existing per-dataset/global
+            # RMA checkpoints retain their run indices. This branch adds the
+            # requested zero-dropout Stadniuk-MLP comparison.
+            "name": "stadniuk_mlp_no_dropout",
+            "fixed": {
+                "architecture_family": "Stadniuk MLP",
+                "activation": "ReLU",
+                "dropout": 0.0,
+                "weight_decay": 0.0,
+                "residual_blocks": 0,
+                "residual_expansion": 1,
+                "learning_rate": 0.001,
+                "lr_schedule": "Cosine annealing (deterministic)",
+                "optimizer": "Adam",
+                "batch_size": 64,
+                "epochs": 1000,
+                "lr_decay_epochs": 500,
+                "convergence_tolerance": 1e-5,
+                "convergence_window": 5,
+                "early_stopping_patience": 0,
+                "gradient_clip": 1.0,
+                "seed": 42,
+                "device": "CPU",
+                "precision": "Float32",
+                "compile_model": False,
+                "deterministic": True,
+            },
+            "grid": {
+                "method": [
+                    METHOD_PER_DATASET_STANDARDIZED,
+                    "Per-dataset RMA",
+                    "Global RMA",
+                ],
+                "hidden_widths": [
+                    [256],
+                    [256, 64],
+                    [256, 128, 64],
+                    [256, 192, 128, 64],
+                    [256, 224, 192, 128, 64],
+                ],
+                "latent_dim": [3, 8, 16],
+                "loss_name": ["mse", "masked"],
+                "l2_lambda": [0.0, 1e-5, 1e-4],
+                "stadniuk_batch_norm": [False, True],
+            },
+        },
     ]
 }
 
 
 def recommended_comparison_grid_json() -> str:
-    """Return the 900-run three-preprocessing Stadniuk-vs-ResNet comparison grid."""
+    """Return the 1,440-run three-preprocessing architecture comparison grid."""
     return json.dumps(RECOMMENDED_COMPARISON_SWEEP, indent=2, ensure_ascii=False)
 
 
@@ -183,8 +229,12 @@ def preprocessing_policy(method: str) -> str:
             "legacy-named Global RMA arm; train-reference quantile normalization fitted only "
             "on frozen GEO training rows from probe-set PM medians; not exact CEL-level RMA"
         )
-    if method == METHOD_STADNIUK_RESCALED:
-        return "thesis-inspired Stadniuk rescaling comparison on the shared split"
+    if method == METHOD_PER_DATASET_STANDARDIZED:
+        return (
+            "per-probe standardization within each source dataset; public datasets stay "
+            "inside one frozen split, and IKEM parameters use only outcome-blind IKEM "
+            "pretraining-train rows"
+        )
     return "unspecified preprocessing policy"
 
 def training_config_dict(config: TrainingConfig) -> dict[str, Any]:
@@ -295,7 +345,7 @@ def run_training_request(
         training_source = load_prepared_pretraining_source(layout, method, prepared_source)
         train_rows, validation_rows, test_rows = load_prepared_split_rows(prepared_source)
     else:
-        # Legacy single-run compatibility only. Generated 0.5.8 sweeps always
+        # Legacy single-run compatibility only. Generated 0.5.15 sweeps always
         # contain prepared_dir and never execute this branch.
         training_source = load_pretraining_source(layout, method)
         split_file = request.get("split_file")
@@ -699,12 +749,12 @@ def generated_job_python(
         "    layout = project_data_layout(data_dir)",
         "    method = str(RUN_REQUEST['method'])",
         "",
-        "    # 0.5.8 batch policy: preprocessing identities, 42,917-probe alignment,",
+        "    # 0.5.15 batch policy: preprocessing identities, 42,917-probe alignment,",
         "    # supervised eligibility, and final split rows were frozen once when",
         "    # the sweep was generated. A job only mmaps those prepared artifacts.",
         "    prepared_rel = RUN_REQUEST.get('prepared_dir')",
         "    if not prepared_rel:",
-        "        raise RuntimeError('Sweep has no frozen prepared_dir; regenerate it with ArchCon 0.5.8.')",
+        "        raise RuntimeError('Sweep has no frozen prepared_dir; regenerate it with ArchCon 0.5.15.')",
         "    prepared_dir = (Path(__file__).resolve().parent / str(prepared_rel)).resolve()",
         "    training_source = load_prepared_pretraining_source(layout, method, prepared_dir)",
         "    train_rows, validation_rows, test_rows = load_prepared_split_rows(prepared_dir)",
@@ -898,7 +948,7 @@ def generate_sweep_bundle(
     ncpus: int = 1,
     memory: str = "10gb",
     scratch: str = "4gb",
-    walltime: str = "13:00:00",
+    walltime: str = "24:00:00",
     ngpus: int = 0,
     gpu_memory: str = "12gb",
     split_frame: pd.DataFrame | None = None,
@@ -913,7 +963,23 @@ def generate_sweep_bundle(
 
     root = Path(destination_root).expanduser().resolve() / _safe_name(sweep_name)
     if root.exists():
-        shutil.rmtree(root)
+        # Regenerating a sweep must never erase completed checkpoints or
+        # downstream analyses. Replace only files owned by the generator.
+        for name in (
+            "configs",
+            "jobs",
+            "prepared",
+            "split.csv",
+            "manifest.csv",
+            "run_array.pbs.sh",
+            "submit.sh",
+            "README.txt",
+        ):
+            target = root / name
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            else:
+                target.unlink(missing_ok=True)
     configs_dir = root / "configs"
     jobs_dir = root / "jobs"
     configs_dir.mkdir(parents=True, exist_ok=True)
@@ -948,7 +1014,7 @@ def generate_sweep_bundle(
             for _, overrides in variants:
                 if "method" in overrides:
                     method_values.add(str(overrides["method"]))
-            prepared_root = prepare_pretraining_assets(
+            prepare_pretraining_assets(
                 resolved_layout,
                 split_frame,
                 root / "prepared",
@@ -1065,7 +1131,7 @@ optimizer/scheduler, L2 penalty and all TrainingConfig values. The `prepared/` d
 only source of batch split/mapping decisions: train_rows.npy, validation_rows.npy, test_rows.npy,
 method-specific GEO row maps, and the already probe-aligned supervised-no-eGFR matrix are written
 once during sweep generation. Jobs only read those files; they never reclassify outcomes, align
-probes, remap samples, or resplit data. Outcome-bearing samples are excluded. The three GEO preprocessing arms are Stadniuk rescaling, independent per-study RMA,
+probes, remap samples, or resplit data. Outcome-bearing samples are excluded. The three GEO preprocessing arms are per-dataset standardization, independent per-study RMA,
 and the legacy-named Global RMA arm, which requires a train-reference matrix tied to this
 sweep's frozen split. `submit.sh` randomly orders unfinished runs and omits result folders that
 already contain a `.pt` checkpoint. Each array element stages only its generated job, frozen

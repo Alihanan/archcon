@@ -2,15 +2,19 @@
 
 ArchCon is a local Python/Gradio research application for rebuilding, inspecting, and modelling the gene-expression pipeline developed around **Modern Alternatives to Archetypal Analysis of Gene Expression Data**.
 
-**Current scope (0.5.13):** a beginner-readable molecular pipeline with a large public **unsupervised dataset**, a smaller kidney-donor **supervised dataset**, reproducible outcome-blind pretraining splits, configurable reconstruction-only autoencoders, non-blocking visual exploration, and a leakage-safe molecular/clinical eGFR benchmark.
+**Current scope (0.5.15):** a beginner-readable molecular pipeline with a large public **unsupervised dataset**, a smaller kidney-donor **supervised dataset**, reproducible outcome-blind pretraining splits, configurable reconstruction-only autoencoders, non-blocking visual exploration, and a molecular/clinical eGFR benchmark with explicit preprocessing provenance.
 
-**0.5.13 memory and MetaCentrum update:** `archcon-evaluate-egfr` scans checkpoints on PyTorch's metadata device, retains no model/optimizer tensors in its checkpoint index, memory-maps and evaluates only one checkpoint at a time, and streams R fit results directly to CSV. Newly generated sweep launchers stage the selected matrix, prepared mappings, Python job, results, caches, and checkpoints under node-local `SCRATCHDIR`; after the 12-hour training budget stops, complete `.pt` files are copied atomically to persistent storage. Submission randomizes unfinished run indices and skips result folders that already contain a checkpoint. The existing persistent virtual environment is used read-only. Standalone reference launchers live under `scripts/metacentrum/`; executable scripts are not placed in the repository root.
+**0.5.15 standardization/grid update:** per-dataset per-probe standardization replaces the former Stadniuk range-rescaling preprocessing arm. Public GEO datasets are kept wholly inside one frozen molecular partition; outcome-blind IKEM standardization parameters are fitted only from IKEM rows assigned to the molecular-pretraining train partition and are reused unchanged for eGFR-bearing rows. The recommended grid retains MSE and masked-MSE objectives, tests Stadniuk MLP dropout 0.1 and 0, contains 1,440 runs, and uses a 23-hour training timeout inside a 24-hour PBS allocation.
 
-**0.5.8 frozen-input update:** the complete molecular training universe is prepared **once when the sweep is generated**. ArchCon aligns the supervised 42,921-probe store to the exact 42,917 canonical GEO probe IDs/order, freezes method-specific GEO row **and probe-column** mappings (so Stadniuk/RMA stores may have different native order), materializes only supervised samples already classified as having no eGFR, freezes one canonical logical sample order, and saves final `train_rows.npy`, `validation_rows.npy`, and `test_rows.npy`. Generated `run_XXXX.py` jobs only memory-map these prepared arrays; they do **not** reclassify outcomes, compare/reorder probes, remap samples, or recompute a split. Version 0.5.13 retains these frozen inputs while moving active job data and checkpoint writes into node-local scratch.
+**0.5.14 downstream-preprocessing update:** the eGFR evaluator no longer sends one common IKEM expression matrix into all six encoders. Global-reference encoders receive IKEM rows independently mapped with the target and probe effects fitted on frozen molecular-pretraining GEO training rows. Per-dataset-RMA encoders use an IKEM-specific target and probe effects fitted only on frozen outcome-free molecular-pretraining TRAIN samples; every eGFR CEL is then transformed independently. Version 0.5.15 adds the analogous frozen IKEM train-reference standardization. No eGFR value, eGFR-bearing sample, or eGFR CV-fold assignment fits any of these transformations. The evaluator rejects provenance marked transductive. It also reports outer-CV RMSE for every fixed preprocessing×architecture group winner in `all_fixed_encoder_cv_summary.csv`, while retaining nested CV as the unbiased estimate of the choose-one-of-six rule.
+
+**0.5.13 memory and MetaCentrum update:** `archcon-evaluate-egfr` scans checkpoints on PyTorch's metadata device, retains no model/optimizer tensors in its checkpoint index, memory-maps and evaluates only one checkpoint at a time, and streams R fit results directly to CSV. Newly generated sweep launchers stage the selected matrix, prepared mappings, Python job, results, caches, and checkpoints under node-local `SCRATCHDIR`; after the 12-hour training budget stops, complete `.pt` files are copied atomically to persistent storage. Submission randomizes unfinished run indices and skips result folders that already contain a checkpoint. The existing persistent virtual environment is used read-only. Standalone reference launchers are flat files under `scripts/`, all named `metacentrum_*`; executable scripts are not placed in the repository root.
+
+**0.5.8 frozen-input update:** the complete molecular training universe is prepared **once when the sweep is generated**. ArchCon aligns the supervised 42,921-probe store to the exact 42,917 canonical GEO probe IDs/order, freezes method-specific GEO row **and probe-column** mappings (so Stadniuk/RMA stores may have different native order), materializes only supervised samples already classified as having no eGFR, freezes one canonical logical sample order, and saves final `train_rows.npy`, `validation_rows.npy`, and `test_rows.npy`. Generated `run_XXXX.py` jobs only memory-map these prepared arrays; they do **not** reclassify outcomes, compare/reorder probes, remap samples, or recompute a split. Version 0.5.14 retains these frozen inputs while moving active job data and checkpoint writes into node-local scratch.
 
 **0.5.12 train-reference correction:** `archcon-rebuild-global-normalization` fits a quantile reference using only the frozen GEO training rows, maps every GEO row independently to that reference, and atomically replaces `rma_global.npy`. Global-arm batch jobs refuse matrices without provenance matching their frozen split. Since `raw_original.npy` is already probe-set PM-median summarized, this leakage-safe replacement is not exact CEL-level RMA.
 
-**0.5.9 downstream update:** `archcon-evaluate-egfr` selects encoders by clean validation MSE, freezes them, aligns every supervised expression row to the prepared 42,917-probe order, and exports exact latent arrays plus sample/donor metadata. It then compares a time-only mixed model, the winning z, the best validation-selected alternative architecture, and a fold-fitted PCA baseline under repeated donor-grouped CV. The fitted formulas contain molecular features only; KDRI may stratify folds but never enters the model. The optional source-tree compatibility wrapper is kept under `scripts/evaluate_molecular_egfr.py`.
+**0.5.9 downstream update:** `archcon-evaluate-egfr` selects encoders by clean validation MSE, freezes them, aligns every supervised expression row to the prepared 42,917-probe order, and exports exact latent arrays plus sample/donor metadata. It then compares a time-only mixed model, the winning z, the best validation-selected alternative architecture, and a fold-fitted PCA baseline under repeated donor-grouped CV. The fitted formulas contain molecular features only; KDRI may stratify folds but never enters the model. Evaluation is exposed through the installed command; no duplicate source-tree wrapper is retained.
 
 **0.5.10 clinical-baseline update:** the same command now also fits KDRI, donor-age, cold-ischemia, and combined-clinical trajectory baselines, plus matched clinical+winner-z and clinical+PCA models. Clinical imputation and standardization are fitted independently inside every training fold. The new incremental summary directly tests whether z improves RMSE beyond KDRI or the full clinical baseline.
 
@@ -24,7 +28,7 @@ ArchCon is a local Python/Gradio research application for rebuilding, inspecting
    kidney-donor molecular samples; visibly separate eGFR / no-eGFR groups
         ↓
 03 Preprocessing
-   Stadniuk representation / per-study RMA / global RMA
+   per-dataset standardization / per-study RMA / global RMA
         ↓
 04 Matrix
    samples × 42,917 probes
@@ -46,7 +50,7 @@ Stage 06 now focuses the architecture experiment on two interpretable MLP famili
 - **Stadniuk MLP:** dense ReLU autoencoder, default `256 → 64`, with the final no-normalization form as the faithful preset. The sweep also tests the earlier/experimental BatchNorm variant.
 - **ResNet-LN:** dense MLP with LayerNorm same-width residual FFN blocks, configurable hidden depth, residual blocks per stage, and FFN expansion.
 
-The MetaCentrum comparison remains a **900-run CPU grid**. For each of three GEO preprocessing arms — **Stadniuk rescaling**, **per-study RMA**, and the legacy-named **global RMA** arm — it evaluates 180 Stadniuk-MLP and 120 ResNet-LN configurations. Public GEO is split by whole connected GSE components at approximately 90/5/5. The supervised kidney-donor dataset is shown separately in the web UI: only molecular samples with **no eGFR** are added to pretraining, and those samples are independently assigned to ~90/5/5 using the same seed. Samples with any eGFR are reserved for downstream evaluation and never enter reconstruction training. The global arm requires a reference fitted only from its frozen GEO training rows.
+The MetaCentrum comparison is a **1,440-run CPU grid**. For each of three GEO preprocessing arms — **per-dataset standardization**, **per-study RMA**, and the legacy-named **global RMA** arm — it evaluates 360 Stadniuk-MLP configurations (180 each at dropout 0.1 and 0) and 120 ResNet-LN configurations. Both MSE and masked-MSE objectives are tested. Public GEO is split by whole connected GSE components at approximately 90/5/5. Only kidney-donor molecular samples with **no eGFR** are added to pretraining and independently assigned to ~90/5/5. Samples with any eGFR are reserved for downstream evaluation and never enter reconstruction training. The global arm requires a reference fitted only from its frozen GEO training rows.
 
 Training uses memory-mapped NumPy matrices, optional one-batch background prefetch, CUDA pinned transfers, mixed precision, optional `torch.compile`, configurable validation cadence, live loss/MSE/R² plots, and asynchronous validation latent PCA. Model/training controls are locked during an active run. Checkpoints save the architecture, optimizer/scheduler state, preprocessing choice, and exact train/validation indices.
 
@@ -61,7 +65,7 @@ so clinical information is explained by the same archetypal mixture instead of m
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.9+
 - modern web browser
 - optional: R + Bioconductor `affy` for raw CEL → RMA
 - optional: PyArrow for the multi-GB GEO Parquet inspector
@@ -419,7 +423,8 @@ archcon-evaluate-egfr \
 Default comparisons are:
 
 - `time_only`: `eGFR ~ time + (1 | patient)`;
-- `winner_z`: `eGFR ~ time + z1 + ... + zd + (1 | patient)`;
+- every one of the six fixed preprocessing×architecture winner embeddings;
+- `winner_z`: the encoder selected inside each outer fold, `eGFR ~ time + z1 + ... + zd + (1 | patient)`;
 - the best validation-selected alternative architecture, when available;
 - PCA with the winner's latent dimension, fitted anew inside each molecular training fold.
 - separate `KDRI_8 × time`, donor-age × time, and cold-ischemia × time baselines;
@@ -429,9 +434,7 @@ Default comparisons are:
 Time is categorical (`7d`, `3m`, `6m`, `12m`). The default is 5 repeats × 5 folds,
 grouped by donor so sibling kidneys cannot cross train/test. z standardization, PCA, clinical
 median imputation, and clinical standardization are training-fold only. Test patients receive population-level predictions (`re.form = NA`) because
-their patient random intercepts are unseen. No eGFR value participates in encoder selection or z
-construction. Use `--preprocessing-winners` to add the validation winner from every preprocessing
-arm, `--no-clinical` to reproduce the molecular-only comparison, or `--embeddings-only` to stop after exporting z.
+their patient random intercepts are unseen. The six group winners are fixed by molecular reconstruction before eGFR modelling. Inner eGFR folds select among those six and outer folds evaluate that selection. The separate fixed-encoder table reports each encoder's ordinary outer-CV RMSE; selecting the smallest of those six and quoting that same minimum as final performance would be optimistic, so the nested result remains primary. Use `--no-clinical` to reproduce the molecular-only comparison, `--embeddings-only` to stop after exporting z, or `--rebuild-ikem-preprocessing` to invalidate and rebuild the cached method-matched IKEM matrices.
 
 Outputs are written under `sweeps/archcon-pretrain-058/downstream/molecular_egfr/`:
 
@@ -444,6 +447,9 @@ embeddings/
 ├── best_non_stadniuk_z.npy  # when available
 └── metadata.json
 mixed_models/
+├── all_fixed_encoder_cv_summary.csv
+├── all_fixed_encoder_fold_metrics.csv
+├── all_fixed_encoder_oof_predictions.csv
 ├── fold_metrics.csv
 ├── fold_metrics_with_deltas.csv
 ├── oof_predictions.csv

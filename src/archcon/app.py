@@ -3386,7 +3386,7 @@ Click a step. Each page answers one simple question; the selected step stays **o
                     value=METHOD_PER_GSE_RMA,
                     label="Training preprocessing",
                     info=(
-                        "The comparison sweep evaluates Stadniuk rescaling, per-study RMA, and the legacy-named "
+                        "The comparison sweep evaluates per-dataset standardization, per-study RMA, and the legacy-named "
                         "Global RMA arm on the same GSE-disjoint 90/5/5 identities. Global preprocessing must "
                         "carry provenance proving that its reference was fitted only on frozen GEO training rows."
                     ),
@@ -3731,15 +3731,15 @@ Click a step. Each page answers one simple question; the selected step stays **o
                         "script. Every generated `jobs/run_XXXX.py` contains the exact PyTorch model "
                         "definition, loss, L2 penalty, optimizer, scheduler and all configuration "
                         "values; its `main()` loads the selected GEO preprocessing and outcome-blind supervised rows. "
-                        "The expanded default grid has 900 runs and uses one shared molecular 90/5/5 split. "
+                        "The expanded default grid has 1,440 runs and uses one shared molecular 90/5/5 split. "
                         "Every job loads test row identities only to report their count; it never evaluates them.",
                         elem_classes=["reading-width"],
                     )
                     gr.Markdown(
-                        "The grid contains **540 Stadniuk MLP** runs (180 model configurations × 3 preprocessings) and "
+                        "The grid contains **1,080 Stadniuk MLP** runs (dropout 0.1 and 0; 180 model configurations × 3 preprocessings each) and "
                         "**360 ResNet-LN** runs (120 model configurations × 3 preprocessings). It varies five hidden-depth profiles, "
                         "latent dimensions 3/8/16, MSE/masked MSE, plus architecture-specific L2/BatchNorm or residual-block/expansion axes. "
-                        "The preprocessing axis is Stadniuk rescaling / per-study RMA / global RMA. Seed 42, batch size 64, starting LR 1e-3 "
+                        "The preprocessing axis is per-dataset standardization / per-study RMA / global RMA. Seed 42, batch size 64, starting LR 1e-3 "
                         "and one-way cosine decay are fixed. Molecular test rows and all samples with eGFR remain blinded during the sweep. "
                         "The legacy-named global arm must be rebuilt against this frozen split before its jobs run; "
                         "held-out GEO arrays cannot contribute to its reference.",
@@ -3748,7 +3748,7 @@ Click a step. Each page answers one simple question; the selected step stays **o
                     sweep_grid_json = gr.Code(
                         value=recommended_comparison_grid_json(),
                         language="json",
-                        label="Architecture + preprocessing hyperparameter grid · JSON · 900 runs",
+                        label="Architecture + preprocessing hyperparameter grid · JSON · 1,440 runs",
                         interactive=True,
                         lines=28,
                         max_lines=80,
@@ -3771,7 +3771,7 @@ Click a step. Each page answers one simple question; the selected step stays **o
                         pbs_ncpus = gr.Number(value=1, precision=0, minimum=1, label="PBS CPUs")
                         pbs_memory = gr.Textbox(value="10gb", label="PBS RAM")
                         pbs_scratch = gr.Textbox(value="4gb", label="PBS scratch_local")
-                        pbs_walltime = gr.Textbox(value="13:00:00", label="PBS walltime")
+                        pbs_walltime = gr.Textbox(value="24:00:00", label="PBS walltime")
                         pbs_ngpus = gr.Number(value=0, precision=0, minimum=0, label="PBS GPUs")
                         pbs_gpu_memory = gr.Textbox(value="12gb", label="Minimum GPU memory")
                     generate_sweep_button = gr.Button(

@@ -252,6 +252,6 @@ def test_latent_stage_contains_metacentrum_sweep_export() -> None:
         for component in components
         if component["type"] == "button"
     }
-    assert "Architecture + preprocessing hyperparameter grid · JSON · 900 runs" in labels
+    assert "Architecture + preprocessing hyperparameter grid · JSON · 1,440 runs" in labels
     assert "Generated run_array.pbs.sh preview" in labels
     assert "Generate Python jobs + JSON + PBS array" in button_values

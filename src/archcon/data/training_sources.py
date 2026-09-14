@@ -1,12 +1,12 @@
 """Molecular pretraining/evaluation sources shared by web and headless runs.
 
-Version 0.5.8 keeps one frozen molecular 90/5/5 split across the comparison: public GEO
+Version 0.5.15 keeps one frozen molecular 90/5/5 split across the comparison: public GEO
 rows are assigned by connected source-GSE component, while supervised-dataset
 rows with no eGFR are independently assigned at the same target fractions and
-virtually appended.  Outcome-bearing supervised rows are never exposed to the
-autoencoder.  GEO itself is compared in three representations: Stadniuk
-rescaling, per-study RMA, and a legacy-named ``Global RMA`` arm rebuilt as
-train-reference quantile normalization from the available probe-set PM medians.
+virtually appended. Outcome-bearing supervised rows are never exposed to the
+autoencoder. GEO itself is compared in three representations: per-dataset
+standardization, per-study RMA, and a legacy-named ``Global RMA`` arm rebuilt
+from a frozen train-only CEL/RMA reference.
 """
 
 from __future__ import annotations
@@ -33,12 +33,16 @@ from .loading import normalize_sample_id
 from .supervised import classify_supervised_samples, split_outcome_blind_samples
 
 
-METHOD_STADNIUK_RESCALED = "Stadniuk rescaling"
+METHOD_PER_DATASET_STANDARDIZED = "Per-dataset standardization"
+# Source-compatibility alias for code importing the former constant.  Its value
+# deliberately resolves to the replacement method; old checkpoint strings are
+# not silently accepted as the new preprocessing.
+METHOD_STADNIUK_RESCALED = METHOD_PER_DATASET_STANDARDIZED
 # Comparison arms used by Stage 05 and the exported sweep.  Keep the distinction
 # explicit: the legacy Global RMA label is retained for existing sweep configs,
 # while prepared jobs require leakage-safe train-reference provenance.
 TRAINING_PREPROCESSING_OPTIONS = [
-    METHOD_STADNIUK_RESCALED,
+    METHOD_PER_DATASET_STANDARDIZED,
     METHOD_PER_GSE_RMA,
     METHOD_GLOBAL_RMA,
 ]
@@ -123,6 +127,12 @@ class PreparedStackedExpressionMatrix:
         primary_rows: np.ndarray,
         primary_columns: np.ndarray,
         supplemental: np.ndarray,
+        *,
+        primary_group_codes: np.ndarray | None = None,
+        primary_centers: np.ndarray | None = None,
+        primary_scales: np.ndarray | None = None,
+        supplemental_center: np.ndarray | None = None,
+        supplemental_scale: np.ndarray | None = None,
     ):
         if primary.ndim != 2 or supplemental.ndim != 2:
             raise ValueError("Prepared expression matrices must be two-dimensional.")
@@ -130,6 +140,11 @@ class PreparedStackedExpressionMatrix:
         self.primary_rows = np.asarray(primary_rows, dtype=np.int64)
         self.primary_columns = np.asarray(primary_columns, dtype=np.int64)
         self.supplemental = supplemental
+        self.primary_group_codes = primary_group_codes
+        self.primary_centers = primary_centers
+        self.primary_scales = primary_scales
+        self.supplemental_center = supplemental_center
+        self.supplemental_scale = supplemental_scale
         if np.any(self.primary_rows < 0) or np.any(self.primary_rows >= int(primary.shape[0])):
             raise ValueError("Prepared GEO row mapping contains out-of-range rows.")
         if np.any(self.primary_columns < 0) or np.any(
@@ -142,6 +157,29 @@ class PreparedStackedExpressionMatrix:
             raise ValueError(
                 "Prepared supervised matrix must already use the canonical frozen probe count."
             )
+        standardization_items = (
+            primary_group_codes,
+            primary_centers,
+            primary_scales,
+            supplemental_center,
+            supplemental_scale,
+        )
+        if any(item is not None for item in standardization_items):
+            if any(item is None for item in standardization_items):
+                raise ValueError("Prepared standardization metadata is incomplete.")
+            if len(primary_group_codes) != len(self.primary_rows):
+                raise ValueError("Prepared standardization group map has the wrong row count.")
+            if primary_centers.shape != primary_scales.shape:
+                raise ValueError("Prepared standardization centers/scales differ in shape.")
+            if int(primary_centers.shape[1]) != len(self.primary_columns):
+                raise ValueError("Prepared standardization has the wrong probe count.")
+            if np.any(primary_group_codes < 0) or np.any(
+                primary_group_codes >= int(primary_centers.shape[0])
+            ):
+                raise ValueError("Prepared standardization contains an invalid group code.")
+            if supplemental_center.shape != (len(self.primary_columns),) or \
+               supplemental_scale.shape != (len(self.primary_columns),):
+                raise ValueError("Prepared supervised standardization has the wrong probe count.")
         self.shape = (len(self.primary_rows) + int(supplemental.shape[0]), len(self.primary_columns))
         self.ndim = 2
         self.size = int(self.shape[0] * self.shape[1])
@@ -159,14 +197,31 @@ class PreparedStackedExpressionMatrix:
         if np.any(geo_mask):
             source_rows = self.primary_rows[logical[geo_mask]]
             source_columns = self.primary_columns[target_columns]
-            result[geo_mask] = np.asarray(
+            values = np.asarray(
                 self.primary[np.ix_(source_rows, source_columns)], dtype=np.float32
             )
+            if self.primary_group_codes is not None:
+                groups = np.asarray(
+                    self.primary_group_codes[logical[geo_mask]], dtype=np.int64
+                )
+                centers = np.asarray(
+                    self.primary_centers[np.ix_(groups, target_columns)], dtype=np.float32
+                )
+                scales = np.asarray(
+                    self.primary_scales[np.ix_(groups, target_columns)], dtype=np.float32
+                )
+                values = (values - centers) / scales
+            result[geo_mask] = values
         if np.any(~geo_mask):
             supplemental_rows = logical[~geo_mask] - len(self.primary_rows)
-            result[~geo_mask] = np.asarray(
+            values = np.asarray(
                 self.supplemental[np.ix_(supplemental_rows, target_columns)], dtype=np.float32
             )
+            if self.supplemental_center is not None:
+                center = np.asarray(self.supplemental_center[target_columns], dtype=np.float32)
+                scale = np.asarray(self.supplemental_scale[target_columns], dtype=np.float32)
+                values = (values - center) / scale
+            result[~geo_mask] = values
         return result
 
 
@@ -237,8 +292,13 @@ def _normalize_sample_index(frame: pd.DataFrame, n_rows: int) -> pd.DataFrame:
     return result.sort_values("row_index_python").reset_index(drop=True)
 
 
-def _load_simple_numpy_store(root: Path, label: str) -> ExpressionMatrixSource:
-    expression_path = root / "expression.npy"
+def _load_simple_numpy_store(
+    root: Path,
+    label: str,
+    *,
+    matrix_filename: str = "expression.npy",
+) -> ExpressionMatrixSource:
+    expression_path = root / matrix_filename
     sample_path = root / "sample_index.csv"
     if not expression_path.is_file() or not sample_path.is_file():
         raise FileNotFoundError(
@@ -262,8 +322,21 @@ def _load_simple_numpy_store(root: Path, label: str) -> ExpressionMatrixSource:
 def load_training_source(layout: ProjectDataLayout, method: str) -> ExpressionMatrixSource:
     """Load one of the three GEO preprocessing matrices used by the comparison grid."""
     method = str(method)
-    if method == METHOD_STADNIUK_RESCALED:
-        return _load_simple_numpy_store(layout.geo_stadniuk_store, method)
+    if method == METHOD_PER_DATASET_STANDARDIZED:
+        # The replacement arm starts from the unmodified historical GEO matrix.
+        # Dataset-specific standardization parameters are frozen later, after
+        # the shared train/validation/test identities are known.
+        store = load_geo_expression_store(layout.geo_rma_store)
+        matrix, _, _ = store.matrix_rows(METHOD_RAW, SCOPE_AGGREGATE, None)
+        sample_index = _normalize_sample_index(store.sample_index, matrix.shape[0])
+        probe_ids = _load_probe_ids(store.root / "probe_index.csv", matrix.shape[1])
+        return ExpressionMatrixSource(
+            label=method,
+            matrix=matrix,
+            sample_index=sample_index,
+            probe_ids=probe_ids,
+            root=store.root,
+        )
     if method not in {METHOD_RAW, METHOD_PER_GSE_RMA, METHOD_GLOBAL_RMA}:
         raise ValueError(f"Unknown training preprocessing: {method}")
 
@@ -289,7 +362,23 @@ def _source_with_sample_keys(source: ExpressionMatrixSource, prefix: str, role: 
     return frame
 
 
-def load_ikem_source(layout: ProjectDataLayout) -> ExpressionMatrixSource | None:
+_IKEM_METHOD_MATRIX = {
+    METHOD_PER_DATASET_STANDARDIZED: "raw_original.npy",
+    METHOD_PER_GSE_RMA: "rma_per_gse.npy",
+    METHOD_GLOBAL_RMA: "rma_global.npy",
+}
+
+_IKEM_METHOD_PROVENANCE = {
+    METHOD_PER_DATASET_STANDARDIZED: "raw_original",
+    METHOD_PER_GSE_RMA: "rma_per_gse",
+    METHOD_GLOBAL_RMA: "rma_global",
+}
+
+
+def load_ikem_source(
+    layout: ProjectDataLayout,
+    method: str | None = None,
+) -> ExpressionMatrixSource | None:
     """Load the supervised kidney-donor molecular store when available.
 
     Prefer the compact internal ``IKEM_NUMPY_STORE`` used for repeated cluster runs. For
@@ -297,7 +386,58 @@ def load_ikem_source(layout: ProjectDataLayout) -> ExpressionMatrixSource | None
     ``expression_matrix.csv`` understood by ArchCon's existing data loader.
     """
     if layout.ikem_store.is_dir():
-        return _load_simple_numpy_store(layout.ikem_store, "Supervised dataset")
+        if method is not None:
+            method = str(method)
+            try:
+                filename = _IKEM_METHOD_MATRIX[method]
+            except KeyError as exc:
+                raise ValueError(f"Unknown IKEM preprocessing method: {method}") from exc
+            provenance_path = layout.ikem_store / "preprocessing_provenance.json"
+            if not provenance_path.is_file():
+                raise RuntimeError(
+                    "Method-specific IKEM CEL matrices have no provenance. Run the "
+                    "GSE290167 CEL/RMA rebuild before generating or evaluating a sweep."
+                )
+            provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+            if (
+                int(provenance.get("format", -1)) != 2
+                or provenance.get("source") != "GSE290167"
+            ):
+                raise RuntimeError(
+                    f"Unsupported method-specific IKEM provenance: {provenance_path}"
+                )
+            methods_info = provenance.get("methods", {})
+            native_method = _IKEM_METHOD_PROVENANCE[method]
+            method_info = (
+                methods_info.get(native_method, {})
+                if isinstance(methods_info, dict)
+                else {}
+            )
+            if (
+                not isinstance(method_info, dict)
+                or method_info.get("transductive_across_egfr_folds") is not False
+                or method_info.get("uses_egfr") is not False
+                or method_info.get("uses_egfr_cv_fold") is not False
+            ):
+                raise RuntimeError(
+                    f"IKEM {method} is not certified as an outcome-free, "
+                    "non-transductive transform. Rebuild it from GSE290167 CELs."
+                )
+            return _load_simple_numpy_store(
+                layout.ikem_store,
+                f"IKEM GSE290167 · {method}",
+                matrix_filename=filename,
+            )
+        default_filename = (
+            "expression.npy"
+            if (layout.ikem_store / "expression.npy").is_file()
+            else "rma_per_gse.npy"
+        )
+        return _load_simple_numpy_store(
+            layout.ikem_store,
+            "Supervised dataset",
+            matrix_filename=default_filename,
+        )
     if not layout.expression_matrix.is_file():
         return None
 
@@ -353,9 +493,52 @@ def _probe_alignment_indices(
     return np.asarray([lookup[probe] for probe in target.probe_ids], dtype=np.int64)
 
 
+def _fit_feature_standardizer(
+    matrix: object,
+    rows: np.ndarray,
+    columns: np.ndarray,
+    *,
+    batch_size: int = 16,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fit a finite population mean/SD without materializing the full matrix."""
+
+    rows = np.asarray(rows, dtype=np.int64)
+    columns = np.asarray(columns, dtype=np.int64)
+    if len(rows) == 0:
+        raise ValueError("Cannot fit a standardizer without training rows.")
+    total = np.zeros(len(columns), dtype=np.float64)
+    total2 = np.zeros(len(columns), dtype=np.float64)
+    count = 0
+    for start in range(0, len(rows), max(1, int(batch_size))):
+        block_rows = rows[start : start + max(1, int(batch_size))]
+        values = np.asarray(matrix[np.ix_(block_rows, columns)], dtype=np.float64)
+        if not np.isfinite(values).all():
+            raise ValueError("Per-dataset standardization encountered non-finite values.")
+        total += values.sum(axis=0)
+        total2 += np.square(values).sum(axis=0)
+        count += int(values.shape[0])
+    center = total / count
+    variance = np.maximum(total2 / count - np.square(center), 0.0)
+    scale = np.sqrt(variance)
+    # Constant and numerically near-constant probes remain finite and map to 0.
+    scale = np.where(scale > 1e-6, scale, 1.0)
+    return center.astype(np.float32), scale.astype(np.float32)
+
+
+def _standardization_dataset_labels(geo_split: pd.DataFrame) -> list[str]:
+    """Return one stable source-dataset label for every frozen GEO sample."""
+
+    for column in ("GSE", "canonical_GSE", "source_GSE", "split_group"):
+        if column in geo_split.columns and geo_split[column].notna().all():
+            return geo_split[column].astype(str).tolist()
+    raise ValueError(
+        "Per-dataset standardization requires GSE/source-study metadata in the frozen split."
+    )
+
+
 def _method_file_stem(method: str) -> str:
     mapping = {
-        METHOD_STADNIUK_RESCALED: "stadniuk",
+        METHOD_PER_DATASET_STANDARDIZED: "standardized",
         METHOD_PER_GSE_RMA: "per_gse_rma",
         METHOD_GLOBAL_RMA: "global_rma",
         METHOD_RAW: "raw",
@@ -386,9 +569,10 @@ def _validate_global_reference_for_prepared_sweep(
             "archcon-rebuild-global-normalization --data-dir ... --sweep-root ... --replace."
         )
     provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    accepted_methods = {METHOD_ID, "cel_level_train_reference_rma"}
     if (
         int(provenance.get("format", -1)) != PROVENANCE_FORMAT
-        or provenance.get("method") != METHOD_ID
+        or provenance.get("method") not in accepted_methods
     ):
         raise RuntimeError(f"Unsupported global-normalization provenance: {provenance_path}")
     split_path = prepared_root / "sample_index.csv"
@@ -409,8 +593,11 @@ def load_pretraining_source(
 ) -> ExpressionMatrixSource:
     """Load GEO plus outcome-blind supervised samples for molecular pretraining.
 
-    The supervised cohort keeps its existing RMA expression values. Samples that
-    have any eGFR follow-up are never appended here.
+    The supervised cohort uses the CEL-derived representation matching the GEO
+    arm: raw PM for standardization, frozen IKEM-train-reference RMA for
+    per-GSE RMA, and frozen GEO-train-reference RMA for Global RMA. Samples
+    with any eGFR follow-up are never appended here, and none contributes to a
+    fitted preprocessing parameter.
     """
 
     geo = load_training_source(layout, method)
@@ -425,7 +612,7 @@ def load_pretraining_source(
             root=geo.root,
         )
 
-    supervised = load_ikem_source(layout)
+    supervised = load_ikem_source(layout, method=method)
     if supervised is None:
         return ExpressionMatrixSource(
             label=geo.label,
@@ -566,6 +753,7 @@ def prepare_pretraining_assets(
     # Generated jobs never infer either mapping.
     method_rows: dict[str, str] = {}
     method_columns: dict[str, str] = {}
+    method_rows_arrays: dict[str, np.ndarray] = {}
     for method, source in sources.items():
         keys = _source_with_sample_keys(source, "GEO", "unsupervised data · GEO")[
             "sample_key"
@@ -589,58 +777,173 @@ def prepare_pretraining_assets(
         np.save(root / column_filename, method_columns_arrays[method], allow_pickle=False)
         method_rows[method] = row_filename
         method_columns[method] = column_filename
+        method_rows_arrays[method] = rows
 
-    # Freeze and materialize only the supervised rows that are already present
-    # in the frozen split.  No outcome classification occurs in a generated job.
-    supplemental_filename = "supervised_no_egfr_common.npy"
-    supplemental_path = root / supplemental_filename
-    if supervised_keys:
-        supervised = load_ikem_source(layout)
-        if supervised is None:
-            raise FileNotFoundError(
-                "Frozen split contains supervised samples, but no supervised expression store exists."
+    # Materialize one outcome-blind supervised matrix per preprocessing arm.
+    # Sharing the historical IKEM cohort-RMA matrix across all three arms was
+    # inconsistent: GEO raw-standardization and GEO train-reference RMA must be
+    # paired with the corresponding CEL-derived IKEM representations.
+    supplemental_files: dict[str, str] = {}
+    supplemental_paths: dict[str, Path] = {}
+    for method in methods:
+        filename = f"supervised_no_egfr_{_method_file_stem(method)}.npy"
+        path = root / filename
+        supplemental_files[method] = filename
+        supplemental_paths[method] = path
+        if supervised_keys:
+            supervised = load_ikem_source(layout, method=method)
+            if supervised is None:
+                raise FileNotFoundError(
+                    "Frozen split contains supervised samples, but no supervised "
+                    "expression store exists."
+                )
+            probe_columns = _probe_alignment_indices(reference, supervised)
+            supervised_ids = supervised.sample_index[
+                supervised.sample_id_column
+            ].map(normalize_sample_id)
+            if supervised_ids.duplicated().any():
+                raise ValueError(
+                    f"IKEM {method} store contains duplicate sample identities."
+                )
+            sample_lookup = dict(
+                strict_zip(
+                    [f"SUPERVISED:{value}" for value in supervised_ids],
+                    supervised.sample_index["row_index_python"].astype(np.int64),
+                )
             )
-        probe_columns = _probe_alignment_indices(reference, supervised)
-        supervised_ids = supervised.sample_index[supervised.sample_id_column].map(
-            normalize_sample_id
-        )
-        if supervised_ids.duplicated().any():
-            raise ValueError("Supervised expression store contains duplicate sample identities.")
-        sample_lookup = dict(
-            strict_zip(
-                [f"SUPERVISED:{value}" for value in supervised_ids],
-                supervised.sample_index["row_index_python"].astype(np.int64),
+            missing = [key for key in supervised_keys if key not in sample_lookup]
+            if missing:
+                raise ValueError(
+                    f"Frozen split contains {len(missing):,} supervised samples absent "
+                    f"from the IKEM {method} store; examples: {missing[:5]}."
+                )
+            source_rows = np.asarray(
+                [sample_lookup[key] for key in supervised_keys], dtype=np.int64
             )
-        )
-        missing = [key for key in supervised_keys if key not in sample_lookup]
-        if missing:
-            raise ValueError(
-                f"Frozen split contains {len(missing):,} supervised samples absent from the "
-                f"expression store; examples: {missing[:5]}."
-            )
-        source_rows = np.asarray([sample_lookup[key] for key in supervised_keys], dtype=np.int64)
-        output = np.lib.format.open_memmap(
-            supplemental_path,
-            mode="w+",
-            dtype=np.float32,
-            shape=(len(source_rows), reference.n_probes),
-        )
-        block = 16
-        for start in range(0, len(source_rows), block):
-            stop = min(start + block, len(source_rows))
-            output[start:stop] = np.asarray(
-                supervised.matrix[np.ix_(source_rows[start:stop], probe_columns)],
+            output = np.lib.format.open_memmap(
+                path,
+                mode="w+",
                 dtype=np.float32,
+                shape=(len(source_rows), reference.n_probes),
             )
-        output.flush()
-        del output
-    else:
-        np.lib.format.open_memmap(
-            supplemental_path,
-            mode="w+",
-            dtype=np.float32,
-            shape=(0, reference.n_probes),
-        ).flush()
+            block = 16
+            for start in range(0, len(source_rows), block):
+                stop = min(start + block, len(source_rows))
+                output[start:stop] = np.asarray(
+                    supervised.matrix[np.ix_(source_rows[start:stop], probe_columns)],
+                    dtype=np.float32,
+                )
+            output.flush()
+            del output
+        else:
+            np.lib.format.open_memmap(
+                path,
+                mode="w+",
+                dtype=np.float32,
+                shape=(0, reference.n_probes),
+            ).flush()
+
+    # Freeze the replacement for the former range-rescaling arm. Public GEO
+    # samples are standardized inside their own source dataset. The connected-
+    # GSE split guarantees that a dataset belongs to exactly one molecular
+    # partition. For IKEM, parameters are fitted only on the outcome-blind
+    # supervised rows assigned to the molecular-pretraining TRAIN partition;
+    # the same frozen parameters are later applied to eGFR-bearing IKEM rows.
+    method_extra_files: dict[str, dict[str, str]] = {}
+    standardization_metadata: dict[str, object] | None = None
+    if METHOD_PER_DATASET_STANDARDIZED in sources:
+        dataset_labels = _standardization_dataset_labels(geo_split)
+        geo_partitions = geo_split["split"].astype(str).str.lower().tolist()
+        group_order = list(dict.fromkeys(dataset_labels))
+        group_lookup = {label: index for index, label in enumerate(group_order)}
+        group_codes = np.asarray(
+            [group_lookup[label] for label in dataset_labels], dtype=np.int32
+        )
+        group_rows = method_rows_arrays[METHOD_PER_DATASET_STANDARDIZED]
+        group_columns = method_columns_arrays[METHOD_PER_DATASET_STANDARDIZED]
+        standardization_source = sources[METHOD_PER_DATASET_STANDARDIZED]
+        centers = np.empty((len(group_order), reference.n_probes), dtype=np.float32)
+        scales = np.empty_like(centers)
+        group_records: list[dict[str, object]] = []
+        for label, code in group_lookup.items():
+            positions = np.flatnonzero(group_codes == code)
+            partitions = sorted({geo_partitions[index] for index in positions})
+            if len(partitions) != 1:
+                raise ValueError(
+                    f"Dataset {label!r} crosses frozen molecular partitions: {partitions}."
+                )
+            center, scale = _fit_feature_standardizer(
+                standardization_source.matrix,
+                group_rows[positions],
+                group_columns,
+            )
+            centers[code] = center
+            scales[code] = scale
+            group_records.append(
+                {
+                    "group_code": int(code),
+                    "dataset": label,
+                    "split": partitions[0],
+                    "n_samples": int(len(positions)),
+                }
+            )
+
+        supplemental_matrix = np.load(
+            supplemental_paths[METHOD_PER_DATASET_STANDARDIZED],
+            mmap_mode="r",
+            allow_pickle=False,
+        )
+        supervised_train_positions = np.asarray(
+            [
+                index
+                for index, key in enumerate(supervised_keys)
+                if split_lookup[key] == "train"
+            ],
+            dtype=np.int64,
+        )
+        if len(supervised_train_positions) == 0:
+            raise ValueError(
+                "Per-dataset standardization requires at least one outcome-blind IKEM "
+                "sample in the frozen molecular-pretraining training partition."
+            )
+        supplemental_center, supplemental_scale = _fit_feature_standardizer(
+            supplemental_matrix,
+            supervised_train_positions,
+            np.arange(reference.n_probes, dtype=np.int64),
+        )
+
+        extra_names = {
+            "primary_group_codes": "standardization_geo_group_codes.npy",
+            "primary_centers": "standardization_geo_centers.npy",
+            "primary_scales": "standardization_geo_scales.npy",
+            "supplemental_center": "standardization_ikem_train_center.npy",
+            "supplemental_scale": "standardization_ikem_train_scale.npy",
+            "groups": "standardization_geo_groups.csv",
+        }
+        np.save(root / extra_names["primary_group_codes"], group_codes, allow_pickle=False)
+        np.save(root / extra_names["primary_centers"], centers, allow_pickle=False)
+        np.save(root / extra_names["primary_scales"], scales, allow_pickle=False)
+        np.save(
+            root / extra_names["supplemental_center"], supplemental_center, allow_pickle=False
+        )
+        np.save(
+            root / extra_names["supplemental_scale"], supplemental_scale, allow_pickle=False
+        )
+        pd.DataFrame(group_records).to_csv(root / extra_names["groups"], index=False)
+        method_extra_files[METHOD_PER_DATASET_STANDARDIZED] = extra_names
+        standardization_metadata = {
+            "formula": "(x - per_probe_mean) / max(per_probe_population_sd, 1e-6)",
+            "geo_fit_scope": (
+                "each complete source dataset; each dataset occurs in one frozen split only"
+            ),
+            "ikem_fit_scope": (
+                "outcome-blind IKEM molecular-pretraining train rows only"
+            ),
+            "n_geo_datasets": int(len(group_order)),
+            "n_ikem_reference_rows": int(len(supervised_train_positions)),
+            "uses_egfr": False,
+            "uses_egfr_cv_fold": False,
+        }
 
     roles = ["unsupervised data · GEO"] * len(geo_keys) + [
         "supervised dataset · no eGFR"
@@ -680,7 +983,7 @@ def prepare_pretraining_assets(
         ).to_csv(root / "probe_index.csv", index=False)
 
     metadata = {
-        "format": 2,
+        "format": 4,
         "n_samples": int(len(sample_index)),
         "n_geo": int(len(geo_keys)),
         "n_supervised_no_egfr": int(len(supervised_keys)),
@@ -689,14 +992,17 @@ def prepare_pretraining_assets(
         "validation_rows": "validation_rows.npy",
         "test_rows": "test_rows.npy",
         "sample_index": "sample_index.csv",
-        "supplemental_matrix": supplemental_filename,
+        "supplemental_matrices": supplemental_files,
         "canonical_method": reference_method,
         "method_geo_rows": method_rows,
         "method_geo_columns": method_columns,
+        "method_extra_files": method_extra_files,
+        "standardization": standardization_metadata,
         "policy": (
             "All sample identities, GEO row mappings, GEO probe-column mappings, supervised "
-            "eligibility/alignment, and 90/5/5 logical row indices were frozen once during "
-            "sweep generation. Generated jobs only read these files."
+            "eligibility/alignment, 90/5/5 logical row indices, and standardization "
+            "parameters were frozen once during sweep generation. Generated jobs only read "
+            "these files."
         ),
     }
     (root / "prepared.json").write_text(
@@ -713,9 +1019,10 @@ def _load_prepared_metadata(prepared_root: str | Path) -> tuple[Path, dict[str, 
             f"Prepared pretraining metadata not found: {path}. Regenerate the sweep before submitting."
         )
     metadata = json.loads(path.read_text(encoding="utf-8"))
-    if int(metadata.get("format", -1)) != 2:
+    if int(metadata.get("format", -1)) != 4:
         raise ValueError(
-            "Unsupported prepared-pretraining format. Regenerate the sweep with ArchCon 0.5.8."
+            "Unsupported prepared-pretraining format. Regenerate the sweep after "
+            "installing the GSE290167 CEL-derived IKEM matrices."
         )
     return root, metadata
 
@@ -742,15 +1049,41 @@ def load_prepared_pretraining_source(
     primary_columns = np.load(
         root / str(method_columns[method]), mmap_mode="r", allow_pickle=False
     )
+    supplemental_matrices = metadata.get("supplemental_matrices", {})
+    if not isinstance(supplemental_matrices, dict) or method not in supplemental_matrices:
+        raise ValueError(f"Prepared sweep has no method-matched IKEM matrix for {method}.")
     supplemental = np.load(
-        root / str(metadata["supplemental_matrix"]), mmap_mode="r", allow_pickle=False
+        root / str(supplemental_matrices[method]), mmap_mode="r", allow_pickle=False
     )
     sample_index = _normalize_sample_index(
         pd.read_csv(root / str(metadata["sample_index"])),
         len(primary_rows) + int(supplemental.shape[0]),
     )
+    matrix_kwargs: dict[str, np.ndarray] = {}
+    if method == METHOD_PER_DATASET_STANDARDIZED:
+        all_extras = metadata.get("method_extra_files", {})
+        extras = all_extras.get(method, {}) if isinstance(all_extras, dict) else {}
+        required_extras = {
+            "primary_group_codes",
+            "primary_centers",
+            "primary_scales",
+            "supplemental_center",
+            "supplemental_scale",
+        }
+        if not isinstance(extras, dict) or not required_extras.issubset(extras):
+            raise ValueError(
+                "Prepared sweep lacks frozen per-dataset standardization parameters."
+            )
+        matrix_kwargs = {
+            name: np.load(root / str(extras[name]), mmap_mode="r", allow_pickle=False)
+            for name in required_extras
+        }
     matrix = PreparedStackedExpressionMatrix(
-        geo.matrix, primary_rows, primary_columns, supplemental
+        geo.matrix,
+        primary_rows,
+        primary_columns,
+        supplemental,
+        **matrix_kwargs,
     )
     if int(matrix.shape[1]) != int(metadata["n_probes"]):
         raise ValueError("Prepared probe count no longer matches the selected GEO matrix.")

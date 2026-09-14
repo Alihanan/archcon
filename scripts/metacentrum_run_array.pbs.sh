@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
+# Flat source-tree reference launcher for MetaCentrum.
 #PBS -N archcon-pretrain-058
 #PBS -l select=1:ncpus=1:mem=10gb:scratch_local=4gb
-#PBS -l walltime=13:00:00
+#PBS -l walltime=24:00:00
 #PBS -j oe
 
 set -euo pipefail
@@ -14,7 +15,7 @@ PROJECT_DIR="${ARCHCON_PROJECT_DIR:-/storage/praha1/home/anuarali/DP/ARCHCON}"
 PERSISTENT_DATA_DIR="${ARCHCON_DATA_DIR:-$PROJECT_DIR/data}"
 PYTHON_BIN="${ARCHCON_PYTHON:-$PROJECT_DIR/.venv/bin/python}"
 PERSISTENT_RESULT_ROOT="${ARCHCON_RESULT_ROOT:-$ARCHCON_SWEEP_DIR/results}"
-TRAIN_TIMEOUT="${ARCHCON_TRAIN_TIMEOUT:-12h}"
+TRAIN_TIMEOUT="${ARCHCON_TRAIN_TIMEOUT:-23h}"
 TIMEOUT_KILL_AFTER="${ARCHCON_TIMEOUT_KILL_AFTER:-5m}"
 
 # submit.sh creates a compact task list containing only runs without an
@@ -144,13 +145,14 @@ method = sys.argv[2]
 
 rows = metadata.get("method_geo_rows", {})
 columns = metadata.get("method_geo_columns", {})
-if method not in rows or method not in columns:
+supplemental = metadata.get("supplemental_matrices", {})
+if method not in rows or method not in columns or method not in supplemental:
     raise SystemExit(f"No frozen prepared mapping exists for {method!r}.")
 
 names = [
     "prepared.json",
     str(metadata["sample_index"]),
-    str(metadata["supplemental_matrix"]),
+    str(supplemental[method]),
     str(metadata["train_rows"]),
     str(metadata["validation_rows"]),
     str(metadata["test_rows"]),
@@ -158,6 +160,10 @@ names = [
     str(columns[method]),
     "probe_index.csv",
 ]
+extras = metadata.get("method_extra_files", {}).get(method, {})
+if not isinstance(extras, dict):
+    raise SystemExit(f"Invalid prepared extra-file mapping for {method!r}.")
+names.extend(str(name) for name in extras.values())
 
 seen = set()
 for name in names:
@@ -179,17 +185,7 @@ for relative in "${PREPARED_FILES[@]}"; do
 done
 
 case "$METHOD" in
-    "Stadniuk rescaling")
-        SOURCE_STORE="$PERSISTENT_DATA_DIR/GEO_STADNIUK_STORE"
-        STAGE_STORE="$STAGE_DATA/GEO_STADNIUK_STORE"
-        mkdir -p "$STAGE_STORE"
-        copy_required "$SOURCE_STORE/expression.npy" "$STAGE_STORE/expression.npy"
-        copy_required "$SOURCE_STORE/sample_index.csv" "$STAGE_STORE/sample_index.csv"
-        copy_optional "$SOURCE_STORE/probe_index.csv" "$STAGE_STORE/probe_index.csv"
-        STAGED_MATRIX="$STAGE_STORE/expression.npy"
-        ;;
-
-    "Per-dataset RMA"|"Global RMA")
+    "Per-dataset standardization"|"Per-dataset RMA"|"Global RMA")
         SOURCE_STORE="$PERSISTENT_DATA_DIR/GEO_NUMPY_STORE"
         STAGE_STORE="$STAGE_DATA/GEO_NUMPY_STORE"
         mkdir -p "$STAGE_STORE"
@@ -204,7 +200,9 @@ case "$METHOD" in
             copy_required "$SOURCE_STORE/$name" "$STAGE_STORE/$name"
         done
 
-        if [[ "$METHOD" == "Per-dataset RMA" ]]; then
+        if [[ "$METHOD" == "Per-dataset standardization" ]]; then
+            SELECTED_ARRAY="raw_original.npy"
+        elif [[ "$METHOD" == "Per-dataset RMA" ]]; then
             SELECTED_ARRAY="rma_per_gse.npy"
         else
             SELECTED_ARRAY="rma_global.npy"
@@ -291,7 +289,7 @@ echo "Python job (scratch): $STAGE_JOB"
 echo "Training data (scratch): $STAGE_DATA"
 echo "Result directory during training (scratch): $STAGE_RUN_DIR"
 echo "Persistent checkpoint destination after training: $PERSISTENT_RUN_DIR"
-echo "Training timeout: $TRAIN_TIMEOUT; PBS walltime: 13 hours"
+echo "Training timeout: $TRAIN_TIMEOUT; PBS walltime: 24 hours"
 du -sh "$STAGE_PREPARED" "$STAGED_MATRIX" 2>/dev/null || true
 
 cd "$STAGE_ROOT"
@@ -313,7 +311,8 @@ elif [[ $TRAIN_STATUS -ne 0 ]]; then
 fi
 
 # This is the first creation/write in the persistent result directory. Copy
-# every complete checkpoint only after Python has stopped, using a same-filesystem
+# every complete checkpoint (including latest.pt and best.pt) only after Python
+# has stopped, using a same-filesystem
 # temporary name so readers never observe a partial .pt file.
 shopt -s nullglob
 CHECKPOINTS=("$STAGE_RUN_DIR"/*.pt)
@@ -387,4 +386,3 @@ if [[ $TRAIN_STATUS -eq 0 || $TRAIN_STATUS -eq 124 || $TRAIN_STATUS -eq 137 ]]; 
     exit 0
 fi
 exit "$TRAIN_STATUS"
-

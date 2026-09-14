@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Flat source-tree reference submission helper for MetaCentrum.
 
 set -euo pipefail
 
@@ -86,4 +87,3 @@ echo "Submitted $submitted runs; skipped $skipped runs whose result folders cont
 echo "The pending run indices were randomized before submission."
 echo "PBS job: $JOB_ID"
 echo "Run-index map (keep until the array finishes): $TASK_LIST"
-

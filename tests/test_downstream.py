@@ -5,12 +5,12 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 
-import archcon.data.downstream as downstream
-
+from archcon.data import downstream
 from archcon.data.downstream import (
     EmbeddingResult,
     ValidationCheckpoint,
     egfr_long,
+    finalize_nested_selection,
     prepare_mixed_model_design,
     prepare_nested_mixed_model_design,
     repeated_donor_folds,
@@ -67,7 +67,7 @@ def test_checkpoint_scan_retains_metadata_not_tensor_payload(tmp_path, monkeypat
     checkpoint_path.touch()
     payload = {
         "input_dim": 42_917,
-        "method": "Stadniuk rescaling",
+        "method": "Per-dataset standardization",
         "config": {
             "hidden_widths": [8],
             "latent_dim": 2,
@@ -155,7 +155,7 @@ def test_checkpoint_comparison_keeps_other_architecture_when_resnet_wins() -> No
 def test_molecular_selection_is_separate_per_preprocessing_and_architecture() -> None:
     records = []
     run = 0
-    for method in ("Stadniuk rescaling", "Per-dataset RMA", "Global RMA"):
+    for method in ("Per-dataset standardization", "Per-dataset RMA", "Global RMA"):
         for architecture in ("Stadniuk MLP", "ResNet-LN"):
             first = _record(f"run_{run:04d}", architecture, 0.1, method)
             second = _record(f"run_{run + 1:04d}", architecture, 0.2, method)
@@ -391,3 +391,95 @@ def test_summary_uses_matched_fold_deltas(tmp_path: Path) -> None:
     ]
     assert beyond_full["mean_gain"] == 1.0
     assert (tmp_path / "clinical_incremental_summary.csv").is_file()
+
+
+def test_final_nested_outputs_retain_every_fixed_encoder_cv_result(tmp_path: Path) -> None:
+    samples = pd.DataFrame({"sample_id": ["p1"]})
+    embeddings = [
+        EmbeddingResult(
+            f"candidate_{index}",
+            f"Candidate {index}",
+            _record(f"run_{index:04d}", "Stadniuk MLP", 0.1, f"method_{index}"),
+            np.empty((1, 2), dtype=np.float32),
+            samples,
+            0.0,
+        )
+        for index in range(2)
+    ]
+    metric_rows = []
+    prediction_rows = []
+    for fold in range(2):
+        for inner_fold in range(2):
+            for index in range(2):
+                metric_rows.append(
+                    {
+                        "fit_id": f"inner_{fold}_{inner_fold}_{index}",
+                        "stage": "inner_selection",
+                        "model_id": f"candidate_{index}",
+                        "model_label": f"Candidate {index}",
+                        "candidate_id": f"candidate_{index}",
+                        "repeat": 0,
+                        "fold": fold,
+                        "inner_fold": inner_fold,
+                        "rmse": 1.0 + index,
+                        "mae": 1.0 + index,
+                    }
+                )
+        for model_id, label, rmse in (
+            ("time_only", "Time only", 3.0),
+            ("candidate_0", "Candidate 0", 1.0 + fold),
+            ("candidate_1", "Candidate 1", 2.0 + fold),
+        ):
+            fit_id = f"outer_{fold}_{model_id}"
+            metric_rows.append(
+                {
+                    "fit_id": fit_id,
+                    "stage": "outer_evaluation",
+                    "model_id": model_id,
+                    "model_label": label,
+                    "candidate_id": model_id if model_id.startswith("candidate_") else "",
+                    "repeat": 0,
+                    "fold": fold,
+                    "inner_fold": -1,
+                    "rmse": rmse,
+                    "mae": rmse,
+                }
+            )
+            prediction_rows.append(
+                {
+                    "fit_id": fit_id,
+                    "stage": "outer_evaluation",
+                    "model_id": model_id,
+                    "model_label": label,
+                    "candidate_id": model_id if model_id.startswith("candidate_") else "",
+                    "repeat": 0,
+                    "fold": fold,
+                    "inner_fold": -1,
+                    "patient": f"p{fold}",
+                    "donor": f"d{fold}",
+                    "time": "3m",
+                    "egfr": rmse,
+                    "prediction": 0.0,
+                }
+            )
+    raw_metrics = tmp_path / "raw_metrics.csv"
+    raw_predictions = tmp_path / "raw_predictions.csv"
+    pd.DataFrame(metric_rows).to_csv(raw_metrics, index=False)
+    pd.DataFrame(prediction_rows).to_csv(raw_predictions, index=False)
+
+    metrics_path, predictions_path, _, ranking = finalize_nested_selection(
+        raw_metrics, raw_predictions, embeddings, tmp_path
+    )
+    final_metrics = pd.read_csv(metrics_path)
+    assert {"candidate_0", "candidate_1", "winner_z", "time_only"}.issubset(
+        set(final_metrics["model_id"])
+    )
+    assert len(ranking) == 2
+    assert (tmp_path / "all_fixed_encoder_fold_metrics.csv").is_file()
+    summary, _, _ = summarize_mixed_model_results(metrics_path, predictions_path, tmp_path)
+    assert set(
+        summary.loc[
+            summary["model_id"].astype(str).str.startswith("candidate_"), "model_id"
+        ]
+    ) == {"candidate_0", "candidate_1"}
+    assert (tmp_path / "all_fixed_encoder_cv_summary.csv").is_file()

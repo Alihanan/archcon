@@ -1,11 +1,11 @@
-# ArchCon 0.5.12 on MetaCentrum
+# ArchCon 0.5.15 on MetaCentrum
 
 > **0.5.8 frozen-input fix.** The supervised store may contain 42,921 probes while the GEO experiment uses 42,917, and the Stadniuk-rescaled GEO store may contain the same 42,917 probes in a different native column order. ArchCon now resolves **all** of those mappings exactly once during sweep generation by probe ID, freezes method-specific GEO row and column arrays, writes the outcome-blind supervised subset into one canonical 42,917-probe space, and freezes final train/validation/test logical row arrays. Generated jobs only read those prepared artifacts. Persistent `latest.pt`/`best.pt` checkpointing from 0.5.6 is unchanged.
 
 
 This release uses one fixed **molecular ~90/5/5 train/validation/test split** across all preprocessing/model combinations. GEO rows are grouped by connected GSE component. Supervised-dataset rows without eGFR are independently assigned using the same target fractions. Every sample with eGFR is kept outside molecular pretraining and reserved for downstream evaluation.
 
-The default CPU sweep contains **900 runs**: for each of three preprocessing arms there are 180 Stadniuk-MLP and 120 ResNet-LN configurations. Every PBS subjob uses one CPU and executes its own readable `jobs/run_XXXX.py`. Per-study RMA is normalized inside each study. The legacy-named global-RMA arm requires a reference fitted only on the frozen GEO training rows; jobs refuse an unmarked all-sample matrix.
+The default CPU sweep contains **1,440 runs**: for each of three preprocessing arms there are 360 Stadniuk-MLP configurations (180 at dropout 0.1 and 180 at dropout 0) and 120 ResNet-LN configurations. Both MSE and masked-MSE objectives are tested. Every PBS subjob uses one CPU and executes its own readable `jobs/run_XXXX.py`. The former Stadniuk rescaling arm is replaced by per-dataset standardization. The legacy-named global-RMA arm requires a reference fitted only on the frozen GEO training rows.
 
 ## 1. Data already on MetaCentrum
 
@@ -21,7 +21,7 @@ Keep the transferred data here:
 /storage/praha1/home/anuarali/DP/ARCHCON/data/GEO_NUMPY_STORE/
 ```
 
-The sweep reads `GEO_STADNIUK_STORE/expression.npy`, `GEO_NUMPY_STORE/rma_per_gse.npy`, the corrected `GEO_NUMPY_STORE/rma_global.npy`, and `IKEM_NUMPY_STORE/expression.npy`. After generating the sweep, run `archcon-rebuild-global-normalization --data-dir DATA --sweep-root SWEEP --replace`. It uses only frozen GEO training rows to fit a shared quantile reference. `raw_original.npy` is probe-set-level PM-median data, so the replacement is leakage-safe train-reference normalization, not exact CEL-level RMA.
+The sweep reads `GEO_NUMPY_STORE/raw_original.npy`, `GEO_NUMPY_STORE/rma_per_gse.npy`, the corrected `GEO_NUMPY_STORE/rma_global.npy`, and `IKEM_NUMPY_STORE/expression.npy`. Sweep generation freezes per-dataset standardization parameters and all sample/probe mappings. After generating the sweep, run `archcon-rebuild-global-normalization --data-dir DATA --sweep-root SWEEP --replace` unless the exact CEL rebuild has already installed a matching train-reference global matrix.
 
 Install ArchCon 0.5.12 first, then rebuild and replace the contaminated matrix:
 
@@ -143,10 +143,10 @@ The generated directory contains:
 archcon-pretrain/
 ├── jobs/
 │   ├── run_0001.py
-│   └── ... run_0900.py
+│   └── ... run_1440.py
 ├── configs/
 │   ├── run_0001.json
-│   └── ... run_0900.json
+│   └── ... run_1440.json
 ├── split.csv
 ├── prepared/
 │   ├── prepared.json
@@ -210,7 +210,7 @@ cd /storage/praha1/home/anuarali/DP/ARCHCON/sweep
 qstat -t
 ```
 
-`submit.sh` uses `qsub -J 1-900`.
+`submit.sh` creates a randomized list of unfinished indices and submits that list as an array.
 
 ## Persistent epoch checkpoints
 
@@ -226,13 +226,13 @@ Whenever validation improves it also updates:
 results/run_XXXX/best.pt
 ```
 
-Only temporary Torch/compilation caches use `SCRATCHDIR`. If PBS kills a job at walltime, the previous completed epoch remains valid on `praha1`. Resubmit the same array index; `run_array.pbs.sh` detects `latest.pt` and resumes optimizer, scheduler, history, and epoch state automatically.
+The Python job, selected data matrix, prepared inputs, Torch caches, and `.pt` checkpoints all remain under `SCRATCHDIR` while training. The launcher stops Python after 23 hours inside a 24-hour PBS allocation, then atomically copies complete checkpoints and small provenance files to `praha1`.
 
 ## 8. Expanded grid
 
-For **each preprocessing arm** (`Stadniuk rescaling`, `Per-dataset RMA`, `Global RMA`):
+For **each preprocessing arm** (`Per-dataset standardization`, `Per-dataset RMA`, `Global RMA`):
 
-Stadniuk MLP: 180 model configurations.
+Stadniuk MLP: 360 model configurations (180 at dropout 0.1 and 180 at dropout 0).
 
 ```text
 hidden widths       5: 256 / 256→64 / 256→128→64 / 256→192→128→64 / 256→224→192→128→64
@@ -253,9 +253,9 @@ FFN expansion       2: 2x / 4x
 LayerNorm           fixed on
 ```
 
-Per preprocessing: **300**. Across three preprocessings: **900** jobs total.
+Per preprocessing: **480**. Across three preprocessings: **1,440** jobs total.
 
-The model-selection rule remains: train only on molecular train rows, monitor/rank on molecular validation rows, and leave molecular test rows untouched. All supervised-dataset samples with eGFR remain outside pretraining. The global reference is fitted only on frozen GEO training rows and its provenance must match the sweep.
+The autoencoders train only on molecular train rows and select checkpoints on molecular validation rows. The downstream group-selection stage pools the former molecular validation+test rows within each preprocessing×architecture group before nested donor-grouped eGFR CV. All supervised samples with eGFR remain outside pretraining. The global and IKEM-standardization references are frozen without eGFR outcomes, and their provenance must match the sweep.
 
 ## 9. Frozen z and clinical-baseline eGFR evaluation
 

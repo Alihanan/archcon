@@ -28,6 +28,7 @@ from .loading import normalize_sample_id
 from .supervised import EGFR_COLUMNS, classify_supervised_samples
 from .training import TrainingConfig, build_autoencoder
 from .training_sources import (
+    ExpressionMatrixSource,
     load_ikem_source,
     load_prepared_pretraining_source,
     load_prepared_split_rows,
@@ -120,7 +121,7 @@ def load_checkpoint(path: str | Path) -> dict:
     """Memory-map one trusted ArchCon checkpoint on CPU without modifying it."""
 
     try:
-        import torch
+        __import__("torch")
     except ImportError as exc:  # pragma: no cover - depends on optional extra
         raise RuntimeError(
             "PyTorch is required for checkpoint evaluation; install archcon[training]."
@@ -578,10 +579,12 @@ def canonical_ikem_columns(
     layout: ProjectDataLayout,
     prepared_root: str | Path,
     input_dim: int,
+    *,
+    source: ExpressionMatrixSource | None = None,
 ) -> tuple[object, np.ndarray, pd.DataFrame]:
     """Return the supervised source and its mapping into checkpoint feature order."""
 
-    source = load_ikem_source(layout)
+    source = load_ikem_source(layout) if source is None else source
     if source is None:
         raise FileNotFoundError("No supervised expression store was found.")
     target_ids = _prepared_probe_ids(prepared_root, input_dim)
@@ -627,10 +630,13 @@ def aligned_ikem_matrix(
     input_dim: int,
     *,
     rows: Iterable[int] | None = None,
+    source: ExpressionMatrixSource | None = None,
 ) -> tuple[np.ndarray, pd.DataFrame]:
     """Materialize only the small supervised cohort in canonical probe order."""
 
-    source, columns, samples = canonical_ikem_columns(layout, prepared_root, input_dim)
+    source, columns, samples = canonical_ikem_columns(
+        layout, prepared_root, input_dim, source=source
+    )
     row_values = (
         np.arange(source.n_samples, dtype=np.int64)
         if rows is None
@@ -649,6 +655,7 @@ def extract_checkpoint_embedding(
     *,
     device: str = "cpu",
     batch_size: int = 32,
+    source: ExpressionMatrixSource | None = None,
 ) -> EmbeddingResult:
     """Freeze one selected encoder and apply it to all supervised samples."""
 
@@ -660,7 +667,9 @@ def extract_checkpoint_embedding(
     input_dim = _record_input_dim(record)
     if input_dim < 1:
         raise ValueError(f"Checkpoint {record.path} has invalid input_dim.")
-    source, columns, samples = canonical_ikem_columns(layout, prepared_root, input_dim)
+    source, columns, samples = canonical_ikem_columns(
+        layout, prepared_root, input_dim, source=source
+    )
     model, loaded_input_dim = _model_from_record(record, device)
     if loaded_input_dim != input_dim:
         raise ValueError(f"Checkpoint metadata changed while reading {record.path}.")
@@ -1622,7 +1631,6 @@ def finalize_nested_selection(
 
     outer = metrics.loc[metrics["stage"].eq("outer_evaluation")].copy()
     outer_predictions = predictions.loc[predictions["stage"].eq("outer_evaluation")].copy()
-    keys = ["repeat", "fold"]
     deployment_ranking = (
         outer.loc[outer["model_id"].isin(candidate_ids)]
         .groupby(["model_id", "model_label"], as_index=False)
@@ -1644,6 +1652,16 @@ def finalize_nested_selection(
 
     final_metrics: list[pd.DataFrame] = []
     final_predictions: list[pd.DataFrame] = []
+    # Keep the fixed outer-CV results for every molecular group winner.  These
+    # answer the complementary question "how does each of the six encoders
+    # perform if it is fixed in advance?" without replacing the nested-CV
+    # estimate of the data-driven choose-one-of-six rule.
+    fixed_candidate_metrics = outer.loc[outer["model_id"].isin(candidate_ids)].copy()
+    fixed_candidate_predictions = outer_predictions.loc[
+        outer_predictions["model_id"].isin(candidate_ids)
+    ].copy()
+    final_metrics.append(fixed_candidate_metrics)
+    final_predictions.append(fixed_candidate_predictions)
     baseline_ids = {
         "time_only",
         "clinical_age",
@@ -1740,6 +1758,10 @@ def finalize_nested_selection(
     inner_scores.to_csv(root / "nested_inner_candidate_scores.csv", index=False)
     selections.to_csv(root / "nested_outer_selections.csv", index=False)
     deployment_ranking.to_csv(root / "candidate_cv_ranking.csv", index=False)
+    fixed_candidate_metrics.to_csv(root / "all_fixed_encoder_fold_metrics.csv", index=False)
+    fixed_candidate_predictions.to_csv(
+        root / "all_fixed_encoder_oof_predictions.csv", index=False
+    )
     final_metrics_path = root / "fold_metrics.csv"
     final_predictions_path = root / "oof_predictions.csv"
     final_metric_frame.to_csv(final_metrics_path, index=False)
@@ -1872,6 +1894,9 @@ def summarize_mixed_model_results(
     root = Path(output_root).expanduser().resolve()
     merged.to_csv(root / "fold_metrics_with_deltas.csv", index=False)
     summary.to_csv(root / "summary.csv", index=False)
+    summary.loc[summary["model_id"].astype(str).str.startswith("candidate_")].to_csv(
+        root / "all_fixed_encoder_cv_summary.csv", index=False
+    )
     pairwise.to_csv(root / "winner_pairwise_summary.csv", index=False)
     clinical_incremental.to_csv(root / "clinical_incremental_summary.csv", index=False)
     return summary, pairwise, clinical_incremental
