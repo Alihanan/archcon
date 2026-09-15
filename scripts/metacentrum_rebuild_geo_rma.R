@@ -1,8 +1,14 @@
 #!/usr/bin/env Rscript
 
-# One-command, interruption-safe entry point for rebuilding the CEL-derived
-# ArchCon GEO and IKEM matrices. Heavy stage implementations live beside this
-# driver so the project root stays clean.
+# One command runs the complete CEL pipeline. Each stage leaves checkpoints,
+# so calling the same command again resumes instead of starting over:
+#
+#   1. download GEO CEL archives
+#   2. build one RMA matrix per GEO dataset
+#   2B. fit IKEM per-dataset RMA from every row without measured eGFR
+#   3. build the combined GEO TRAIN + IKEM no-eGFR TRAIN global reference
+#   4. apply the frozen combined reference to every IKEM CEL; measured-eGFR
+#      rows are transform-only
 
 args <- commandArgs(trailingOnly = TRUE)
 
@@ -13,7 +19,10 @@ usage <- function(status = 0L) {
       "  Rscript metacentrum_rebuild_geo_rma.R --work-root DIR --frozen-split CSV ",
       "[--numpy-store DIR] [--ikem-store DIR] [--keep-raw true|false]\n\n",
       "DIR must initially contain download_summary.csv and ",
-      "gsm_to_gse_mapping.csv. common_probes.pkl must be in its parent.\n"
+      "gsm_to_gse_mapping.csv. common_probes.pkl must be in its parent.\n\n",
+      "PASS 3 acceleration is controlled by the wrapper environment:\n",
+      "  ARCHCON_RMA_MODE=stream|ram\n",
+      "  ARCHCON_RMA_CPUS=1|N\n"
     )
   )
   quit(status = status)
@@ -70,6 +79,100 @@ if (length(missing_inputs) > 0L) {
   stop("Missing input file(s): ", paste(missing_inputs, collapse = ", "))
 }
 
+# Work out which GEO series the frozen sweep actually requires. The old
+# completion marker only compared the number of raw and RMA files; that could
+# incorrectly accept 463 paired datasets when the frozen split requires 464.
+expected_frozen_gses <- function(split_path, mapping_path) {
+  split <- utils::read.csv(
+    split_path,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+  mapping <- utils::read.csv(
+    mapping_path,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+
+  if ("source_kind" %in% names(split)) {
+    split <- split[
+      tolower(trimws(as.character(split$source_kind))) == "geo",
+      ,
+      drop = FALSE
+    ]
+  }
+
+  id_column <- intersect(
+    c("GSM", "sample_id", "Sample_ID", "sample", "id"),
+    names(split)
+  )
+  if (length(id_column) == 0L) {
+    stop("Frozen split has no GSM/sample identifier column.", call. = FALSE)
+  }
+  if (!all(c("GSM", "GSE") %in% names(mapping))) {
+    stop("GSM mapping must contain GSM and GSE columns.", call. = FALSE)
+  }
+
+  frozen_gsm <- toupper(trimws(as.character(split[[id_column[[1L]]]])))
+  frozen_gsm <- unique(frozen_gsm[grepl("^GSM[0-9]+$", frozen_gsm)])
+  mapping_gsm <- toupper(trimws(as.character(mapping$GSM)))
+  mapping_gse <- toupper(trimws(as.character(mapping$GSE)))
+  position <- match(frozen_gsm, mapping_gsm)
+
+  if (anyNA(position)) {
+    missing <- frozen_gsm[is.na(position)]
+    stop(
+      "Frozen GEO samples are missing from the GSM-to-GSE mapping: ",
+      length(missing), " (first: ", paste(head(missing, 10L), collapse = ", "), ").",
+      call. = FALSE
+    )
+  }
+
+  expected <- mapping_gse[position]
+  invalid <- !grepl("^GSE[0-9]+$", expected)
+  if (any(invalid)) {
+    stop(
+      "Frozen GEO samples map to invalid/empty GSE accessions: ",
+      paste(head(frozen_gsm[invalid], 10L), collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  sort(unique(expected))
+}
+
+paired_gse_status <- function(work_root, expected_gses) {
+  output_root <- file.path(work_root, "GEO_RMA")
+  raw_names <- sub(
+    "_raw_pm_median_common\\.rds$",
+    "",
+    list.files(output_root, pattern = "^GSE[0-9]+_raw_pm_median_common\\.rds$")
+  )
+  rma_names <- sub(
+    "_rma_common\\.rds$",
+    "",
+    list.files(output_root, pattern = "^GSE[0-9]+_rma_common\\.rds$")
+  )
+
+  raw_names <- sort(unique(toupper(raw_names)))
+  rma_names <- sort(unique(toupper(rma_names)))
+  paired <- intersect(raw_names, rma_names)
+
+  list(
+    complete = setequal(raw_names, expected_gses) &&
+      setequal(rma_names, expected_gses),
+    paired = paired,
+    missing_raw = setdiff(expected_gses, raw_names),
+    missing_rma = setdiff(expected_gses, rma_names),
+    unexpected_raw = setdiff(raw_names, expected_gses),
+    unexpected_rma = setdiff(rma_names, expected_gses)
+  )
+}
+
+format_gse_list <- function(values) {
+  if (length(values) == 0L) "none" else paste(values, collapse = ", ")
+}
+
 lock_dir <- file.path(work_root, ".rebuild_geo_rma.lock")
 lock_pid_path <- file.path(lock_dir, "pid")
 if (dir.exists(lock_dir)) {
@@ -97,6 +200,7 @@ Sys.setenv(
   ARCHCON_FROZEN_SPLIT = frozen_split,
   ARCHCON_COMMON_PROBES = file.path(dirname(work_root), "common_probes.pkl"),
   ARCHCON_GSM_MAPPING = file.path(work_root, "gsm_to_gse_mapping.csv"),
+  ARCHCON_IKEM_SCRIPT = required_stages[[4L]],
   ARCHCON_GEO_RAW_DIR = Sys.getenv(
     "ARCHCON_GEO_RAW_DIR",
     unset = file.path(work_root, "GEO_RAW")
@@ -106,9 +210,25 @@ Sys.setenv(
 message("Work root:       ", normalizePath(work_root))
 message("Frozen split:    ", frozen_split)
 message("Script directory: ", script_dir)
-message("Resume policy:   atomic files plus per-GSE/per-block checkpoints")
+message("Resume behavior: completed datasets and blocks are skipped")
 
 per_gse_marker <- file.path(work_root, "GEO_RMA", "PER_GSE_RMA_COMPLETE.txt")
+expected_gses <- expected_frozen_gses(
+  frozen_split,
+  file.path(work_root, "gsm_to_gse_mapping.csv")
+)
+per_gse_status <- paired_gse_status(work_root, expected_gses)
+
+if (file.exists(per_gse_marker) && !per_gse_status$complete) {
+  message(
+    "The old per-GSE completion marker is stale and will be removed.\n",
+    "Frozen split requires ", length(expected_gses), " GSEs; paired outputs: ",
+    length(per_gse_status$paired), ".\n",
+    "Missing raw checkpoints: ", format_gse_list(per_gse_status$missing_raw), "\n",
+    "Missing RMA checkpoints: ", format_gse_list(per_gse_status$missing_rma)
+  )
+  unlink(per_gse_marker, force = TRUE)
+}
 
 if (!file.exists(per_gse_marker)) {
   # Stage 1's historical CSV marker is repaired from actual disk state. This
@@ -142,29 +262,46 @@ if (!file.exists(per_gse_marker)) {
   message("\n=== Stage 2/4: exact per-GSE RMA ===")
   local(source(required_stages[[2L]], local = TRUE, chdir = FALSE))
 
-  rma_files <- list.files(
-    file.path(work_root, "GEO_RMA"),
-    pattern = "^GSE[0-9]+_rma_common\\.rds$"
-  )
-  raw_files <- list.files(
-    file.path(work_root, "GEO_RMA"),
-    pattern = "^GSE[0-9]+_raw_pm_median_common\\.rds$"
-  )
-  if (length(rma_files) == 0L || length(rma_files) != length(raw_files)) {
-    stop("Per-GSE stage did not produce a complete paired RDS collection.")
+  per_gse_status <- paired_gse_status(work_root, expected_gses)
+  if (!per_gse_status$complete) {
+    stop(
+      "Per-GSE stage is not complete for the frozen split.\n",
+      "Required GSEs: ", length(expected_gses),
+      "; paired outputs: ", length(per_gse_status$paired), ".\n",
+      "Missing raw checkpoints: ", format_gse_list(per_gse_status$missing_raw), "\n",
+      "Missing RMA checkpoints: ", format_gse_list(per_gse_status$missing_rma), "\n",
+      "Unexpected raw checkpoints: ", format_gse_list(per_gse_status$unexpected_raw), "\n",
+      "Unexpected RMA checkpoints: ", format_gse_list(per_gse_status$unexpected_rma),
+      call. = FALSE
+    )
   }
   writeLines(
-    paste(Sys.time(), "paired_GSEs=", length(rma_files)),
+    paste(Sys.time(), "paired_GSEs=", length(per_gse_status$paired)),
     per_gse_marker
   )
 } else {
   message("Per-GSE RMA marker found; stages 1 and 2 are already complete.")
 }
 
-message("\n=== Stage 3/4: exact train-reference RMA and HDF5 store ===")
+message(
+  "\n=== Stage 3/4: GEO TRAIN + IKEM no-measured-eGFR reference ==="
+)
 local(source(required_stages[[3L]], local = TRUE, chdir = FALSE))
 
+old_ikem_mode <- Sys.getenv("ARCHCON_IKEM_MODE", unset = NA_character_)
+Sys.setenv(ARCHCON_IKEM_MODE = "finalize")
 local(source(required_stages[[4L]], local = TRUE, chdir = FALSE))
+if (is.na(old_ikem_mode)) {
+  Sys.unsetenv("ARCHCON_IKEM_MODE")
+} else {
+  Sys.setenv(ARCHCON_IKEM_MODE = old_ikem_mode)
+}
+
+ikem_reference_samples <- utils::read.csv(
+  file.path(work_root, "IKEM_MATRIX_STORE", "ikem_rma_reference_samples.csv"),
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
 
 write_npy_float32 <- function(h5_path, dataset, output_path, n_rows, n_cols) {
   part_path <- paste0(output_path, ".part")
@@ -274,7 +411,10 @@ if (!is.null(numpy_store)) {
     data.frame(
       method = "CEL-level train-reference RMA",
       frozen_split = frozen_split,
-      train_samples = sum(built_samples$pretraining_split == "train"),
+      geo_train_samples = sum(built_samples$pretraining_split == "train"),
+      ikem_no_egfr_train_samples = nrow(ikem_reference_samples),
+      train_samples = sum(built_samples$pretraining_split == "train") +
+        nrow(ikem_reference_samples),
       validation_samples = sum(built_samples$pretraining_split == "validation"),
       test_samples = sum(built_samples$pretraining_split == "test"),
       created_utc = format(Sys.time(), tz = "UTC", usetz = TRUE),
@@ -283,7 +423,7 @@ if (!is.null(numpy_store)) {
     file.path(numpy_store, "rma_global_train_reference_provenance.csv"),
     row.names = FALSE
   )
-  message("Installed scratch NumPy matrix: ", file.path(numpy_store, "rma_global.npy"))
+  message("Installed GEO NumPy matrix: ", file.path(numpy_store, "rma_global.npy"))
 }
 
 if (!is.null(ikem_store)) {
@@ -317,7 +457,7 @@ if (!is.null(ikem_store)) {
       toupper(trimws(as.character(target_samples[[sample_columns[[1L]]]]))),
       toupper(trimws(as.character(built_samples$sample_id)))
     )) {
-      stop("Existing IKEM store sample order differs from GSE290167.")
+      stop("Existing IKEM output store has a different canonical sample order.")
     }
   }
   if (file.exists(target_probe_path)) {
@@ -343,6 +483,11 @@ if (!is.null(ikem_store)) {
   utils::write.csv(built_samples, target_sample_path, row.names = FALSE, na = "")
   utils::write.csv(built_probes, target_probe_path, row.names = FALSE, na = "")
   file.copy(
+    file.path(work_root, "IKEM_MATRIX_STORE", "ikem_cel_correspondence.csv"),
+    file.path(ikem_store, "ikem_cel_correspondence.csv"),
+    overwrite = TRUE
+  )
+  file.copy(
     file.path(work_root, "IKEM_MATRIX_STORE", "ikem_gse290167_correspondence.csv"),
     file.path(ikem_store, "ikem_gse290167_correspondence.csv"),
     overwrite = TRUE
@@ -352,6 +497,15 @@ if (!is.null(ikem_store)) {
     file.path(ikem_store, "ikem_rma_reference_samples.csv"),
     overwrite = TRUE
   )
+  for (name in c(
+    "IKEM_LOCAL_RMA_COMPLETE.txt",
+    "IKEM_CEL_PREPROCESSING_COMPLETE.txt"
+  )) {
+    source_path <- file.path(work_root, "IKEM_MATRIX_STORE", name)
+    if (file.exists(source_path)) {
+      file.copy(source_path, file.path(ikem_store, name), overwrite = TRUE)
+    }
+  }
 
   ikem_h5 <- file.path(
     work_root,
@@ -360,7 +514,6 @@ if (!is.null(ikem_store)) {
   )
   for (method in c(
     "raw_original",
-    "rma_cohort_legacy",
     "rma_per_gse",
     "rma_global"
   )) {

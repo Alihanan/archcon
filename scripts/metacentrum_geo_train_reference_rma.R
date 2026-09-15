@@ -1,13 +1,13 @@
 #!/usr/bin/env Rscript
 
 # =============================================================================
-# ArchCon GEO aggregation + disk-backed global RMA
+# ArchCon GEO matrices and leakage-free train-reference RMA
 # =============================================================================
 #
-# Assumptions
-# -----------
-# Run this script from:
-#   thesis_code/data/GEO_DWNLD
+# Normal use
+# ----------
+# Run metacentrum_rebuild_geo_rma.pbs.sh. Its driver enters the persistent
+# rebuild directory and supplies the frozen sweep split automatically.
 #
 # Existing inputs:
 #   GEO_RMA/GSE*_raw_pm_median_common.rds
@@ -37,8 +37,9 @@
 #
 #   /expression/rma_global
 #       Leakage-safe train-reference RMA. The quantile target and probe effects
-#       are fitted only on the frozen pretraining TRAIN samples. Validation and
-#       test arrays are transformed one at a time with those frozen parameters.
+#       are fitted on every molecular-pretraining TRAIN array: GEO TRAIN plus
+#       IKEM samples with no measured eGFR. GEO validation/test and every IKEM
+#       sample with measured eGFR never fit them.
 #
 # All three matrices have identical orientation/order:
 #   rows    = samples (GSM)
@@ -48,42 +49,41 @@
 # row interval. gse_index.csv stores both R-style 1-based and Python-style
 # 0-based half-open row ranges.
 #
-# Why HDF5?
-# ---------
-# It is a dense-array format that can be sliced directly from Python with h5py.
-# The final store is written with native=TRUE so matrix dimensions are portable
-# to C/Python order. No duplicate per-GSE matrix files are needed: Python can
-# slice the corresponding contiguous row interval.
+# What the three passes do
+# ------------------------
+#   PASS 1 learns one quantile-normalization target from GEO TRAIN plus IKEM
+#          no-eGFR TRAIN arrays.
+#   PASS 2 applies that frozen target to every GEO array and also caches the
+#          normalized IKEM no-measured-eGFR TRAIN arrays needed to fit probe
+#          effects.
+#   PASS 3 learns probe effects from the combined TRAIN columns, saves those
+#          effects, and produces the final GEO sample-by-probe-set matrix.
 #
-# Global RMA implementation
-# -------------------------
-# A conventional in-memory AffyBatch containing ~13k PrimeView arrays can
-# require tens of GB of RAM. To avoid that, global RMA is decomposed into the
-# same mathematical stages but executed in streaming/disk-backed form:
+# The reusable PASS 1 target and PASS 3 probe effects are exactly what Phase 4
+# later applies to every IKEM array. Only the outcome-free IKEM rows participate
+# in fitting; every measured-eGFR row is transform-only.
 #
-#   PASS 1:
-#     CEL -> PM values -> RMA background correction
-#         -> sorted values
-#         -> accumulate ONE global quantile target
+# Why files are written in blocks
+# ------------------------------
+# The complete probe-level matrix is much too large for ordinary RAM. HDF5 lets
+# the script read and write a small block at a time. Every finished block has a
+# checkpoint, so rerunning after Ctrl+C or a wall-time kill resumes safely.
 #
-#   PASS 2:
-#     CEL -> PM values -> RMA background correction
-#         -> quantile-normalize each array to the global target
-#         -> retain PM rows belonging to the 42,917 common probe sets
-#         -> write normalized probe-level values to persistent working HDF5
+# PASS 3 compute modes
+# --------------------
+# The PBS wrapper exposes two simple environment variables:
 #
-#   PASS 3:
-#     read probe-set blocks from persistent working HDF5
-#         -> preprocessCore::subColSummarizeMedianpolishLog()
-#         -> write final sample x probe-set global-RMA matrix
+#   ARCHCON_RMA_MODE=stream   Read one PASS 3 block from HDF5 at a time.
+#                             This is the default and uses modest RAM.
+#   ARCHCON_RMA_MODE=ram      Read the complete normalized probe-level matrix
+#                             into RAM once, then reuse it for every block.
+#   ARCHCON_RMA_CPUS=N        Summarize independent probe sets on N local
+#                             workers. Workers receive only one small probe-set
+#                             task at a time. HDF5 access and checkpoints always
+#                             stay in the parent process.
 #
-# The decomposition is validated on a small GSE against your already-computed
-# affy::rma() result before the full global run starts.
-#
-# Resume behavior
-# ---------------
-# Progress is checkpointed at GSE/block level. Ctrl+C or a crash is safe:
-# rerun the same script and completed stages are skipped/reused.
+# RAM mode accelerates the long 336-block PASS 3 calculation. PASS 1 and PASS 2
+# remain disk-checkpointed so a wall-time stop never discards earlier work.
 #
 # IMPORTANT:
 # preprocessCore previously caused pthread_create() errors on this machine.
@@ -118,6 +118,43 @@ WORK_DIR <- ".GLOBAL_RMA_WORK"
 PROGRESS_DIR <- file.path(WORK_DIR, "progress")
 EXTRACT_DIR <- file.path(WORK_DIR, "extract")
 WORK_H5 <- file.path(WORK_DIR, "train_reference_rma_probe_level.h5")
+TARGET_RDS <- file.path(WORK_DIR, "train_reference_quantile_target.rds")
+PARAMETER_H5 <- file.path(WORK_DIR, "train_reference_rma_parameters.h5")
+PARAMETER_H5_PART <- paste0(PARAMETER_H5, ".part")
+PARAMETER_SIGNATURE <- file.path(
+  WORK_DIR,
+  "train_reference_rma_parameter_signature.rds"
+)
+PARAMETER_COMPLETE <- file.path(
+  WORK_DIR,
+  "TRAIN_REFERENCE_PARAMETERS_COMPLETE.txt"
+)
+PARAMETER_PROGRESS <- file.path(
+  PROGRESS_DIR,
+  "train_reference_parameters_done_block.txt"
+)
+
+# Stage 2B prepares leakage-free IKEM-local RMA and a compact cache containing
+# background-corrected PM values for the frozen no-eGFR IKEM TRAIN samples.
+IKEM_PREP_SCRIPT <- Sys.getenv("ARCHCON_IKEM_SCRIPT", unset = "")
+IKEM_WORK_DIR <- ".IKEM_CEL_WORK"
+IKEM_GLOBAL_TRAIN_BG_H5 <- file.path(
+  IKEM_WORK_DIR,
+  "ikem_global_train_background_corrected_pm.h5"
+)
+IKEM_GLOBAL_TRAIN_CONTRIBUTION <- file.path(
+  IKEM_WORK_DIR,
+  "ikem_global_train_reference_contribution.rds"
+)
+IKEM_GLOBAL_TRAIN_READY <- file.path(
+  IKEM_WORK_DIR,
+  "IKEM_GLOBAL_TRAIN_REFERENCE_READY.txt"
+)
+IKEM_REFERENCE_CSV <- file.path(
+  "IKEM_MATRIX_STORE",
+  "ikem_rma_reference_samples.csv"
+)
+IKEM_BACKGROUND_DATASET <- "background_corrected_all_pm"
 
 # A small already-computed GSE used to verify that the streaming decomposition
 # reproduces the existing per-GSE RMA result before running globally.
@@ -127,6 +164,44 @@ VALIDATION_MAX_ABS_TOL <- 1e-5
 # Number of common probe sets summarized together in PASS 3.
 # Increase if RAM allows; decrease if memory pressure occurs.
 SUMMARY_PROBESET_BLOCK_SIZE <- 128L
+
+# PASS 3 can either stream blocks from HDF5 or cache the complete probe-level
+# matrix in RAM. "disk" and "hdf5" are accepted as aliases for "stream".
+RMA_COMPUTE_MODE <- tolower(trimws(Sys.getenv(
+  "ARCHCON_RMA_MODE",
+  unset = "stream"
+)))
+if (RMA_COMPUTE_MODE %in% c("disk", "hdf5", "streaming")) {
+  RMA_COMPUTE_MODE <- "stream"
+}
+if (!(RMA_COMPUTE_MODE %in% c("stream", "ram"))) {
+  stop(
+    "ARCHCON_RMA_MODE must be 'stream' or 'ram'; received: ",
+    RMA_COMPUTE_MODE,
+    call. = FALSE
+  )
+}
+
+RMA_WORKERS <- suppressWarnings(as.integer(Sys.getenv(
+  "ARCHCON_RMA_CPUS",
+  unset = "1"
+)))
+if (length(RMA_WORKERS) != 1L || is.na(RMA_WORKERS) || RMA_WORKERS < 1L) {
+  stop("ARCHCON_RMA_CPUS must be a positive integer.", call. = FALSE)
+}
+# RAM is filled a few sample columns at a time. This avoids a second full-size
+# temporary allocation while converting the float32 HDF5 data to R doubles.
+RAM_LOAD_ARRAY_BATCH_SIZE <- suppressWarnings(as.integer(Sys.getenv(
+  "ARCHCON_RMA_RAM_LOAD_BATCH",
+  unset = "16"
+)))
+if (
+  length(RAM_LOAD_ARRAY_BATCH_SIZE) != 1L ||
+  is.na(RAM_LOAD_ARRAY_BATCH_SIZE) ||
+  RAM_LOAD_ARRAY_BATCH_SIZE < 1L
+) {
+  stop("ARCHCON_RMA_RAM_LOAD_BATCH must be a positive integer.", call. = FALSE)
+}
 
 # Number of arrays normalized and written to the probe-level HDF5 at once.
 # This keeps RAM moderate while avoiding millions of one-column HDF5 chunks.
@@ -288,7 +363,12 @@ append_unique_line <- function(path, value) {
   existing <- if (file.exists(path)) readLines(path, warn = FALSE) else character()
 
   if (!(value %in% existing)) {
-    writeLines(c(existing, value), path)
+    tmp <- paste0(path, ".part")
+    unlink(tmp, force = TRUE)
+    writeLines(c(existing, value), tmp)
+    if (!file.rename(tmp, path)) {
+      stop("Could not save progress marker: ", path, call. = FALSE)
+    }
   }
 }
 
@@ -333,6 +413,156 @@ atomic_write_csv <- function(x, path) {
   if (!file.rename(tmp, path)) {
     stop("Could not atomically rename ", tmp, " -> ", path, call. = FALSE)
   }
+}
+
+atomic_write_lines <- function(x, path) {
+  tmp <- paste0(path, ".part")
+  unlink(tmp, force = TRUE)
+  writeLines(x, tmp)
+
+  if (file.exists(path)) {
+    unlink(path, force = TRUE)
+  }
+
+  if (!file.rename(tmp, path)) {
+    stop("Could not atomically rename ", tmp, " -> ", path, call. = FALSE)
+  }
+}
+
+gib <- function(bytes) {
+  as.double(bytes) / 1024^3
+}
+
+round_up_to <- function(value, multiple) {
+  ceiling(value / multiple) * multiple
+}
+
+phase3_lapply <- function(items, fun, cluster = NULL) {
+  if (length(items) == 0L) {
+    return(list())
+  }
+
+  if (is.null(cluster)) {
+    return(lapply(items, fun))
+  }
+
+  # Workers receive one ordinary R task at a time. They never open HDF5 files.
+  # The parent receives their results and performs every write/checkpoint.
+  parallel::parLapplyLB(
+    cluster,
+    items,
+    fun
+  )
+}
+
+summarize_probe_task <- function(task) {
+  log_block <- log2(task$normalized_values)
+
+  if (any(!is.finite(log_block))) {
+    stop(
+      "PASS 3 found a non-positive or non-finite normalized value in probe set ",
+      task$probe_name, ".",
+      call. = FALSE
+    )
+  }
+
+  train_fit <- stats::medpolish(
+    log_block[, task$train_rows, drop = FALSE],
+    trace.iter = FALSE
+  )
+  frozen_probe_effect <- as.numeric(train_fit$row)
+  sample_summary <- apply(
+    sweep(log_block, 1L, frozen_probe_effect, FUN = "-"),
+    2L,
+    stats::median
+  )
+
+  fitted_train <- as.numeric(train_fit$overall + train_fit$col)
+  max_train_delta <- max(abs(sample_summary[task$train_rows] - fitted_train))
+  if (!is.finite(max_train_delta) || max_train_delta > 1e-7) {
+    stop(
+      "Frozen median-polish check failed for probe set ",
+      task$probe_name,
+      ": max delta=", max_train_delta,
+      call. = FALSE
+    )
+  }
+
+  list(
+    local_probe = task$local_probe,
+    local_rows = task$local_rows,
+    probe_effect = frozen_probe_effect,
+    sample_summary = as.numeric(sample_summary)
+  )
+}
+
+# Keep the worker closure deliberately tiny. In RAM mode the surrounding
+# script environment eventually contains a ~41 GiB matrix; a PSOCK worker must
+# never serialize or receive that environment.
+environment(summarize_probe_task) <- baseenv()
+
+load_probe_matrix_into_ram <- function(path, dataset, n_pm, n_samples, batch_size) {
+  payload_gib <- gib(as.double(n_pm) * as.double(n_samples) * 8.0)
+
+  message(
+    "[", timestamp(), "] RAM mode: allocating ",
+    sprintf("%.2f GiB", payload_gib),
+    " for the R double-precision probe-level matrix."
+  )
+
+  value <- tryCatch(
+    matrix(NA_real_, nrow = n_pm, ncol = n_samples),
+    error = function(e) {
+      stop(
+        "RAM mode could not allocate its ", sprintf("%.2f GiB", payload_gib),
+        " matrix: ", conditionMessage(e),
+        ". Resubmit with more memory or use ARCHCON_RMA_MODE=stream.",
+        call. = FALSE
+      )
+    }
+  )
+
+  starts <- seq.int(1L, n_samples, by = batch_size)
+  for (batch_number in seq_along(starts)) {
+    first_sample <- starts[[batch_number]]
+    last_sample <- min(n_samples, first_sample + batch_size - 1L)
+    sample_columns <- first_sample:last_sample
+
+    block <- rhdf5::h5read(
+      path,
+      dataset,
+      index = list(seq_len(n_pm), sample_columns),
+      drop = FALSE,
+      native = FALSE
+    )
+
+    expected <- c(n_pm, length(sample_columns))
+    if (!identical(dim(block), expected) || any(!is.finite(block))) {
+      stop(
+        "RAM loading received an invalid HDF5 block for samples ",
+        first_sample, "-", last_sample, ".",
+        call. = FALSE
+      )
+    }
+
+    value[, sample_columns] <- block
+    rm(block)
+
+    if (
+      batch_number == 1L ||
+      batch_number %% 25L == 0L ||
+      batch_number == length(starts)
+    ) {
+      message(
+        "[", timestamp(), "] RAM load: samples ", last_sample, "/", n_samples,
+        "."
+      )
+    }
+  }
+
+  rhdf5::H5close()
+  gc()
+  value
 }
 
 h5_native_dataset_dims <- function(file, dataset) {
@@ -484,6 +714,88 @@ h5_write_native_block_checked <- function(value, file, dataset, start) {
     )
   }
 
+  invisible(TRUE)
+}
+
+create_parameter_h5 <- function(path, n_values) {
+  unlink(path, force = TRUE)
+  rhdf5::h5createFile(path)
+  rhdf5::h5createDataset(
+    path,
+    "probe_effect_common_pm",
+    dims = as.integer(n_values),
+    H5type = "H5T_IEEE_F64LE",
+    chunk = as.integer(min(8192L, n_values)),
+    level = H5_COMPRESSION_LEVEL,
+    fillValue = NaN,
+    native = TRUE
+  )
+}
+
+read_parameter_h5 <- function(path) {
+  if (!file.exists(path)) {
+    stop("Frozen probe-effect file does not exist: ", path, call. = FALSE)
+  }
+  objects <- rhdf5::h5ls(path, recursive = TRUE)
+  if (!any(objects$group == "/" & objects$name == "probe_effect_common_pm")) {
+    stop(
+      "Frozen probe-effect file lacks /probe_effect_common_pm: ",
+      path,
+      call. = FALSE
+    )
+  }
+  as.numeric(rhdf5::h5read(path, "probe_effect_common_pm", native = TRUE))
+}
+
+validate_parameter_h5 <- function(path, expected_values) {
+  values <- read_parameter_h5(path)
+  if (length(values) != expected_values) {
+    stop(
+      "Frozen probe-effect file contains ", length(values),
+      " values; expected ", expected_values, ".",
+      call. = FALSE
+    )
+  }
+  bad <- which(!is.finite(values))
+  if (length(bad) > 0L) {
+    stop(
+      "Frozen probe-effect file is incomplete: ", length(bad),
+      " value(s) are missing or non-finite. First position: ", bad[[1L]],
+      ". Rerun this script to resume the backfill.",
+      call. = FALSE
+    )
+  }
+  invisible(TRUE)
+}
+
+write_parameter_block_checked <- function(path, rows, values) {
+  rows <- as.integer(rows)
+  values <- as.numeric(values)
+  if (length(rows) != length(values) || any(!is.finite(values))) {
+    stop("Refusing to write an invalid frozen probe-effect block.", call. = FALSE)
+  }
+
+  rhdf5::h5write(
+    values,
+    path,
+    "probe_effect_common_pm",
+    index = list(rows),
+    native = TRUE
+  )
+  observed <- as.numeric(rhdf5::h5read(
+    path,
+    "probe_effect_common_pm",
+    index = list(rows),
+    native = TRUE
+  ))
+  error <- max(abs(observed - values))
+  if (length(observed) != length(values) || !is.finite(error) || error > 1e-12) {
+    stop(
+      "Frozen probe-effect block failed its HDF5 read-back check; max error=",
+      format(error, digits = 8L),
+      call. = FALSE
+    )
+  }
   invisible(TRUE)
 }
 
@@ -851,6 +1163,7 @@ if (anyDuplicated(sample_index$GSM)) {
 }
 
 # Freeze the exact GEO train/validation/test membership used by the sweep.
+# IKEM membership is independently gated from egfr_data.xlsx.
 # The file is copied from SWEEP_ROOT/prepared/sample_index.csv by the PBS
 # wrapper.  Only GEO rows participate here; supervised/IKEM rows are ignored.
 if (!file.exists(FROZEN_SPLIT_CSV)) {
@@ -894,8 +1207,54 @@ if (length(split_id_column) == 0L) {
 split_ids <- toupper(trimws(as.character(frozen_split[[split_id_column[[1L]]]])))
 split_labels <- tolower(trimws(as.character(frozen_split$split)))
 
+# Older prepared files may not have source_kind. In that case, the GSM prefix
+# is the unambiguous way to retain only GEO rows and ignore IKEM/supervised rows.
+geo_id <- grepl("^GSM[0-9]+$", split_ids)
+split_ids <- split_ids[geo_id]
+split_labels <- split_labels[geo_id]
+
 if (anyDuplicated(split_ids)) {
   stop("Frozen GEO split contains duplicate sample identifiers.", call. = FALSE)
+}
+
+# The processed GEO collection and the frozen sweep must describe exactly the
+# same arrays. Checking both directions prevents a seemingly successful build
+# from silently omitting a downloaded/processed sample.
+missing_from_processed <- setdiff(split_ids, sample_index$GSM)
+unexpected_processed <- setdiff(sample_index$GSM, split_ids)
+if (length(missing_from_processed) > 0L || length(unexpected_processed) > 0L) {
+  missing_gse <- stadniuk_mapping$GSE[
+    match(missing_from_processed, stadniuk_mapping$GSM)
+  ]
+  missing_gse <- missing_gse[!is.na(missing_gse) & nzchar(missing_gse)]
+  missing_gse_summary <- if (length(missing_gse) > 0L) {
+    counts <- sort(table(missing_gse), decreasing = TRUE)
+    paste(
+      paste0(names(counts), "=", as.integer(counts)),
+      collapse = ", "
+    )
+  } else {
+    "not available from GSM mapping"
+  }
+
+  stop(
+    "Processed GEO samples do not exactly match the frozen sweep split.\n",
+    "Missing from processed matrices: ", length(missing_from_processed),
+    if (length(missing_from_processed) > 0L) {
+      paste0(" (first: ", paste(head(missing_from_processed, 10L), collapse = ", "), ")")
+    } else {
+      ""
+    },
+    "\nUnexpected processed samples: ", length(unexpected_processed),
+    if (length(unexpected_processed) > 0L) {
+      paste0(" (first: ", paste(head(unexpected_processed, 10L), collapse = ", "), ")")
+    } else {
+      ""
+    },
+    "\nAffected mapped GSEs: ", missing_gse_summary,
+    "\nRepair the incomplete GSE checkpoint(s), then rerun. Phase 4 will not start.",
+    call. = FALSE
+  )
 }
 
 split_pos <- match(sample_index$GSM, split_ids)
@@ -921,6 +1280,28 @@ if (length(unexpected_splits) > 0L) {
     call. = FALSE
   )
 }
+
+# Per-GSE RMA is safe for molecular validation only when an entire study stays
+# in one frozen split. Refuse to continue if a GSE crosses a split boundary.
+gse_split_count <- vapply(
+  split(sample_index$pretraining_split, sample_index$GSE),
+  function(labels) length(unique(labels)),
+  integer(1)
+)
+mixed_split_gse <- names(gse_split_count)[gse_split_count != 1L]
+if (length(mixed_split_gse) > 0L) {
+  stop(
+    "The frozen molecular split is not study-disjoint. These GSEs occur in ",
+    "more than one of train/validation/test: ",
+    paste(head(mixed_split_gse, 20L), collapse = ", "),
+    ". Per-GSE RMA would then cross a split boundary.",
+    call. = FALSE
+  )
+}
+message(
+  "[", timestamp(), "] verified study-disjoint molecular split across ",
+  length(gse_split_count), " GSEs."
+)
 
 train_rows_r <- which(sample_index$pretraining_split == "train")
 if (length(train_rows_r) == 0L) {
@@ -1893,21 +2274,209 @@ message(
   "."
 )
 
+# Prepare IKEM before fitting the global reference. This computes the
+# per-dataset IKEM RMA from the frozen no-eGFR TRAIN subset and creates the
+# small TRAIN-only background-corrected PM cache used below. The child process
+# uses the same R executable, package library, working directory, and split.
+if (!nzchar(IKEM_PREP_SCRIPT) || !file.exists(IKEM_PREP_SCRIPT)) {
+  stop(
+    "ARCHCON_IKEM_SCRIPT does not point to metacentrum_ikem_cel.R: ",
+    IKEM_PREP_SCRIPT,
+    call. = FALSE
+  )
+}
+
+message(
+  "[", timestamp(),
+  "] preparing IKEM no-eGFR TRAIN arrays before combined global RMA..."
+)
+old_ikem_mode <- Sys.getenv("ARCHCON_IKEM_MODE", unset = NA_character_)
+Sys.setenv(ARCHCON_IKEM_MODE = "prepare")
+ikem_prepare_status <- system2(
+  file.path(R.home("bin"), "Rscript"),
+  c("--vanilla", shQuote(IKEM_PREP_SCRIPT))
+)
+if (is.na(old_ikem_mode)) {
+  Sys.unsetenv("ARCHCON_IKEM_MODE")
+} else {
+  Sys.setenv(ARCHCON_IKEM_MODE = old_ikem_mode)
+}
+if (!identical(as.integer(ikem_prepare_status), 0L)) {
+  stop(
+    "IKEM train/local-RMA preparation failed with status ",
+    ikem_prepare_status,
+    ". Stage 3 has not fitted a combined reference.",
+    call. = FALSE
+  )
+}
+
+required_ikem_reference <- c(
+  IKEM_GLOBAL_TRAIN_BG_H5,
+  IKEM_GLOBAL_TRAIN_CONTRIBUTION,
+  IKEM_GLOBAL_TRAIN_READY,
+  IKEM_REFERENCE_CSV
+)
+missing_ikem_reference <- required_ikem_reference[
+  !file.exists(required_ikem_reference)
+]
+if (length(missing_ikem_reference) > 0L) {
+  stop(
+    "IKEM preparation did not create: ",
+    paste(missing_ikem_reference, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+ikem_contribution <- readRDS(IKEM_GLOBAL_TRAIN_CONTRIBUTION)
+required_contribution_fields <- c(
+  "format_version", "input_signature", "frozen_split_md5", "template_md5",
+  "target_sum", "n_samples", "sample_ids", "GSM",
+  "background_cache", "background_dataset"
+)
+missing_contribution_fields <- setdiff(
+  required_contribution_fields,
+  names(ikem_contribution)
+)
+if (length(missing_contribution_fields) > 0L) {
+  stop(
+    "IKEM global-training contribution is incomplete (missing: ",
+    paste(missing_contribution_fields, collapse = ", "), ").",
+    call. = FALSE
+  )
+}
+
+ikem_reference <- utils::read.csv(
+  IKEM_REFERENCE_CSV,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+ikem_train_count <- as.integer(ikem_contribution$n_samples)
+ikem_contribution_valid <- identical(
+  as.integer(ikem_contribution$format_version), 1L
+) && identical(
+  as.character(ikem_contribution$frozen_split_md5),
+  as.character(unname(tools::md5sum(FROZEN_SPLIT_CSV)))
+) && identical(
+  as.character(ikem_contribution$template_md5),
+  as.character(unname(tools::md5sum(template_info_path)))
+) && identical(
+  as.character(ikem_contribution$background_cache),
+  basename(IKEM_GLOBAL_TRAIN_BG_H5)
+) && identical(
+  as.character(ikem_contribution$background_dataset),
+  IKEM_BACKGROUND_DATASET
+) && length(ikem_contribution$target_sum) == template_info$n_all_pm &&
+  all(is.finite(ikem_contribution$target_sum)) &&
+  length(ikem_contribution$sample_ids) == ikem_train_count &&
+  length(ikem_contribution$GSM) == ikem_train_count &&
+  nrow(ikem_reference) == ikem_train_count &&
+  identical(
+    as.character(ikem_contribution$sample_ids),
+    as.character(ikem_reference$sample_id)
+  ) && identical(
+    as.character(ikem_contribution$GSM),
+    as.character(ikem_reference$GSM)
+  )
+if (!ikem_contribution_valid || ikem_train_count < 2L) {
+  stop(
+    "IKEM global-training cache does not match the current split/template.",
+    call. = FALSE
+  )
+}
+
+ikem_cache_spot <- rhdf5::h5read(
+  IKEM_GLOBAL_TRAIN_BG_H5,
+  IKEM_BACKGROUND_DATASET,
+  index = list(
+    unique(c(1L, template_info$n_all_pm)),
+    unique(c(1L, ikem_train_count))
+  ),
+  native = FALSE
+)
+if (any(!is.finite(ikem_cache_spot)) || any(ikem_cache_spot <= 0)) {
+  stop("IKEM TRAIN background-corrected PM cache failed validation.", call. = FALSE)
+}
+
+combined_work_sample_count <- nrow(sample_index) + ikem_train_count
+combined_train_rows_r <- c(
+  train_rows_r,
+  nrow(sample_index) + seq_len(ikem_train_count)
+)
+message(
+  "[", timestamp(), "] combined reference fit: ",
+  length(train_rows_r), " GEO TRAIN + ", ikem_train_count,
+  " IKEM no-eGFR TRAIN = ", length(combined_train_rows_r), " arrays."
+)
+
+# Never silently reuse a GEO-only global target/work matrix from pipeline v1.
+# The compact contract makes every resume conditional on the same split,
+# template, and exact ordered IKEM training rows.
+GLOBAL_CONTRACT <- file.path(WORK_DIR, "combined_train_reference_contract.rds")
+current_global_contract <- list(
+  format_version = 3L,
+  frozen_split_md5 = unname(tools::md5sum(FROZEN_SPLIT_CSV)),
+  template_md5 = unname(tools::md5sum(template_info_path)),
+  # The contribution file is rewritten atomically on a resumed prepare call.
+  # Its semantic signature is stable even if compressed-file bytes differ.
+  ikem_input_signature = as.character(ikem_contribution$input_signature),
+  geo_train_ids = as.character(sample_index$GSM[train_rows_r]),
+  ikem_train_sample_ids = as.character(ikem_contribution$sample_ids),
+  ikem_train_gsms = as.character(ikem_contribution$GSM)
+)
+old_global_artifacts <- c(
+  TARGET_RDS,
+  file.path(WORK_DIR, "train_reference_target_sum.rds"),
+  WORK_H5,
+  PARAMETER_H5,
+  PARAMETER_H5_PART,
+  PARAMETER_SIGNATURE,
+  PARAMETER_COMPLETE,
+  PARAMETER_PROGRESS,
+  file.path(PROGRESS_DIR, "train_reference_pass1_done_gse.txt"),
+  file.path(PROGRESS_DIR, "train_reference_pass2_done_gse.txt"),
+  file.path(PROGRESS_DIR, "train_reference_pass3_done_block.txt"),
+  file.path(OUT_DIR, "GLOBAL_RMA_COMPLETE.txt")
+)
+if (file.exists(GLOBAL_CONTRACT)) {
+  saved_global_contract <- readRDS(GLOBAL_CONTRACT)
+  if (!identical(saved_global_contract, current_global_contract)) {
+    message(
+      "The ordered IKEM training set changed. Resetting only the combined ",
+      "global-RMA target, work matrix, parameters, and progress. Existing ",
+      "per-GSE RMA and GEO raw/per-GSE matrices remain reusable."
+    )
+    unlink(old_global_artifacts, force = TRUE)
+    unlink(GLOBAL_CONTRACT, force = TRUE)
+    atomic_save_rds(current_global_contract, GLOBAL_CONTRACT, compress = TRUE)
+  }
+} else {
+  incompatible <- old_global_artifacts[file.exists(old_global_artifacts)]
+  if (length(incompatible) > 0L) {
+    message(
+      "Found global-RMA outputs without a matching reference contract; ",
+      "resetting only those global artifacts. Existing per-GSE RMA remains ",
+      "reusable."
+    )
+    unlink(incompatible, force = TRUE)
+  }
+  atomic_save_rds(current_global_contract, GLOBAL_CONTRACT, compress = TRUE)
+}
+
 work_bytes_per_value <- if (WORK_H5_TYPE == "H5T_IEEE_F32LE") 4 else 8
 final_bytes_per_value <- if (FINAL_H5_TYPE == "H5T_IEEE_F32LE") 4 else 8
 
 work_uncompressed_gib <- (
-  template_info$n_common_pm *
-    nrow(sample_index) *
-    work_bytes_per_value /
+  as.double(template_info$n_common_pm) *
+    as.double(combined_work_sample_count) *
+    as.double(work_bytes_per_value) /
     1024^3
 )
 
 final_three_uncompressed_gib <- (
-  3 *
-    nrow(sample_index) *
-    length(common_probes) *
-    final_bytes_per_value /
+  3.0 *
+    as.double(nrow(sample_index)) *
+    as.double(length(common_probes)) *
+    as.double(final_bytes_per_value) /
     1024^3
 )
 
@@ -1920,6 +2489,34 @@ message(
   sprintf("%.1f GiB", final_three_uncompressed_gib),
   ". Actual HDF5 size depends on compression."
 )
+
+ram_payload_gib <- (
+  as.double(template_info$n_common_pm) *
+    as.double(combined_work_sample_count) *
+    8.0 /
+    1024^3
+)
+ram_minimum_gib <- round_up_to(
+  max(64, 1.35 * ram_payload_gib + 8 + 0.5 * RMA_WORKERS),
+  16
+)
+ram_recommended_gib <- round_up_to(
+  max(96, 2.0 * ram_payload_gib + 12 + 1.0 * RMA_WORKERS),
+  32
+)
+
+message(
+  "[", timestamp(), "] PASS 3 compute configuration: mode=", RMA_COMPUTE_MODE,
+  ", workers=", RMA_WORKERS, "."
+)
+if (RMA_COMPUTE_MODE == "ram") {
+  message(
+    "[", timestamp(), "] Full RAM matrix payload: ",
+    sprintf("%.2f GiB", ram_payload_gib),
+    ". Approximate minimum job memory: ", ram_minimum_gib,
+    " GiB; conservative request: ", ram_recommended_gib, " GiB."
+  )
+}
 
 
 # =============================================================================
@@ -2222,10 +2819,12 @@ if (RUN_GLOBAL_RMA) {
   message("TRAIN-REFERENCE GLOBAL RMA")
   message("======================================================================")
   message(
-    "Samples: ",
+    "GEO output samples: ",
     format(nrow(sample_index), big.mark = ","),
-    "; common probes: ",
-    format(length(common_probes), big.mark = ",")
+    "; fit samples: ",
+    format(length(combined_train_rows_r), big.mark = ","),
+    " (", length(train_rows_r), " GEO + ", ikem_train_count, " IKEM)",
+    "; common probes: ", format(length(common_probes), big.mark = ",")
   )
 
   # ---------------------------------------------------------------------------
@@ -2233,7 +2832,7 @@ if (RUN_GLOBAL_RMA) {
   # ---------------------------------------------------------------------------
 
   target_sum_path <- file.path(WORK_DIR, "train_reference_target_sum.rds")
-  target_path <- file.path(WORK_DIR, "train_reference_quantile_target.rds")
+  target_path <- TARGET_RDS
   pass1_done_path <- file.path(PROGRESS_DIR, "train_reference_pass1_done_gse.txt")
 
   if (!file.exists(target_path)) {
@@ -2241,10 +2840,11 @@ if (RUN_GLOBAL_RMA) {
       target_state <- readRDS(target_sum_path)
 
       if (
+        !identical(as.integer(target_state$format_version), 2L) ||
         length(target_state$sum) != template_info$n_all_pm ||
         target_state$n_samples < 0L
       ) {
-        stop("Invalid saved global-target state.", call. = FALSE)
+        stop("Invalid or obsolete saved combined-target state.", call. = FALSE)
       }
 
       if (is.null(target_state$done_gses)) {
@@ -2252,9 +2852,12 @@ if (RUN_GLOBAL_RMA) {
       }
     } else {
       target_state <- list(
+        format_version = 2L,
         sum = numeric(template_info$n_all_pm),
         n_samples = 0L,
-        done_gses = character()
+        done_gses = character(),
+        ikem_added = FALSE,
+        ikem_input_signature = as.character(ikem_contribution$input_signature)
       )
     }
 
@@ -2343,12 +2946,34 @@ if (RUN_GLOBAL_RMA) {
       )
     }
 
-    if (target_state$n_samples != length(train_rows_r)) {
+    if (isTRUE(target_state$ikem_added)) {
+      if (!identical(
+        as.character(target_state$ikem_input_signature),
+        as.character(ikem_contribution$input_signature)
+      )) {
+        stop("Saved target contains a different IKEM TRAIN contribution.", call. = FALSE)
+      }
+    } else {
+      target_state$sum <- target_state$sum + ikem_contribution$target_sum
+      target_state$n_samples <- target_state$n_samples + ikem_train_count
+      target_state$ikem_added <- TRUE
+      target_state$ikem_input_signature <- as.character(
+        ikem_contribution$input_signature
+      )
+      atomic_save_rds(target_state, target_sum_path, compress = FALSE)
+      message(
+        "[", timestamp(), "] PASS1 added ", ikem_train_count,
+        " IKEM no-eGFR TRAIN arrays; total arrays in target=",
+        target_state$n_samples, "."
+      )
+    }
+
+    if (target_state$n_samples != length(combined_train_rows_r)) {
       stop(
         "Train-reference target was built from ",
         target_state$n_samples,
         " arrays; expected ",
-        length(train_rows_r),
+        length(combined_train_rows_r),
         ".",
         call. = FALSE
       )
@@ -2377,25 +3002,64 @@ if (RUN_GLOBAL_RMA) {
   # ---------------------------------------------------------------------------
 
   pass2_done_path <- file.path(PROGRESS_DIR, "train_reference_pass2_done_gse.txt")
+  pass2_done <- read_done_lines(pass2_done_path)
+
+  # The large probe-level file may be intentionally removed after a completely
+  # successful build. It is not needed merely to validate/reuse finished Phase
+  # 3 and Phase 4 artifacts. If those artifacts are not complete, however, an
+  # absent work file means PASS 2 must be rebuilt from the beginning.
+  pass3_marker_path <- file.path(
+    PROGRESS_DIR,
+    "train_reference_pass3_done_block.txt"
+  )
+  expected_pass3_blocks <- seq_len(ceiling(
+    length(common_probes) / SUMMARY_PROBESET_BLOCK_SIZE
+  ))
+  saved_pass3_blocks <- suppressWarnings(as.integer(
+    read_done_lines(pass3_marker_path)
+  ))
+  finished_without_work_h5 <- all(c(
+    file.exists(file.path(OUT_DIR, "GLOBAL_RMA_COMPLETE.txt")),
+    file.exists(PARAMETER_H5),
+    file.exists(PARAMETER_COMPLETE),
+    file.exists(PARAMETER_SIGNATURE),
+    setequal(saved_pass3_blocks[!is.na(saved_pass3_blocks)], expected_pass3_blocks)
+  ))
 
   if (!file.exists(WORK_H5)) {
-    rhdf5::h5createFile(WORK_H5)
-
-    rhdf5::h5createDataset(
-      WORK_H5,
-      "normalized_common_pm",
-      dims = c(template_info$n_common_pm, nrow(sample_index)),
-      H5type = WORK_H5_TYPE,
-      chunk = c(
-        min(4096L, template_info$n_common_pm),
-        min(PASS2_ARRAY_BATCH_SIZE, nrow(sample_index))
-      ),
-      level = H5_COMPRESSION_LEVEL,
-      native = FALSE
-    )
+    if (finished_without_work_h5) {
+      message(
+        "[", timestamp(), "] Large probe-level work file was removed after an ",
+        "earlier successful run; completed outputs will be reused."
+      )
+      pass2_done <- c(
+        as.character(gse_index$GSE),
+        "IKEM:PRIVATE_OR_GSE290167:NO_EGFR_TRAIN"
+      )
+    } else {
+      if (length(pass2_done) > 0L) {
+        message(
+          "[", timestamp(), "] Probe-level work file is missing, so PASS 2 will ",
+          "restart. Earlier PASS 1 and per-GSE files remain reusable."
+        )
+        unlink(pass2_done_path, force = TRUE)
+        pass2_done <- character()
+      }
+      rhdf5::h5createFile(WORK_H5)
+      rhdf5::h5createDataset(
+        WORK_H5,
+        "normalized_common_pm",
+        dims = c(template_info$n_common_pm, combined_work_sample_count),
+        H5type = WORK_H5_TYPE,
+        chunk = c(
+          min(4096L, template_info$n_common_pm),
+          min(PASS2_ARRAY_BATCH_SIZE, combined_work_sample_count)
+        ),
+        level = H5_COMPRESSION_LEVEL,
+        native = FALSE
+      )
+    }
   }
-
-  pass2_done <- read_done_lines(pass2_done_path)
 
   for (i in seq_len(nrow(gse_index))) {
     gse <- gse_index$GSE[[i]]
@@ -2524,153 +3188,474 @@ if (RUN_GLOBAL_RMA) {
     )
   }
 
+  # Add the frozen IKEM no-eGFR TRAIN columns to the probe-level working
+  # matrix. They participate only in fitting the global reference; the final
+  # IKEM matrix is produced later by the transform-only Stage 4.
+  ikem_pass2_key <- "IKEM:PRIVATE_OR_GSE290167:NO_EGFR_TRAIN"
+  if (!(ikem_pass2_key %in% pass2_done)) {
+    ikem_batch_starts <- seq.int(
+      1L,
+      ikem_train_count,
+      by = PASS2_ARRAY_BATCH_SIZE
+    )
+    for (batch_start in ikem_batch_starts) {
+      batch_end <- min(
+        ikem_train_count,
+        batch_start + PASS2_ARRAY_BATCH_SIZE - 1L
+      )
+      batch <- batch_start:batch_end
+      corrected_batch <- rhdf5::h5read(
+        IKEM_GLOBAL_TRAIN_BG_H5,
+        IKEM_BACKGROUND_DATASET,
+        index = list(seq_len(template_info$n_all_pm), batch),
+        native = FALSE
+      )
+      common_batch <- matrix(
+        NA_real_,
+        nrow = template_info$n_common_pm,
+        ncol = length(batch)
+      )
+      for (k in seq_along(batch)) {
+        normalized <- preprocessCore::normalize.quantiles.use.target(
+          matrix(corrected_batch[, k], ncol = 1L),
+          target = target,
+          copy = FALSE
+        )[, 1L]
+        common_batch[, k] <- normalized[
+          template_info$common_pm_positions_grouped
+        ]
+        rm(normalized)
+      }
+      if (any(!is.finite(common_batch)) || any(common_batch <= 0)) {
+        stop(
+          "PASS2 produced invalid normalized values for IKEM TRAIN arrays.",
+          call. = FALSE
+        )
+      }
+      rhdf5::h5write(
+        common_batch,
+        WORK_H5,
+        "normalized_common_pm",
+        index = list(
+          seq_len(template_info$n_common_pm),
+          nrow(sample_index) + batch
+        ),
+        native = FALSE
+      )
+      rm(corrected_batch, common_batch)
+      gc()
+      message(
+        "[PASS2 IKEM no-eGFR TRAIN] ",
+        batch_end,
+        "/",
+        ikem_train_count,
+        " arrays."
+      )
+    }
+    append_unique_line(pass2_done_path, ikem_pass2_key)
+    pass2_done <- c(pass2_done, ikem_pass2_key)
+    message(
+      "[", timestamp(), "] PASS2 added all ", ikem_train_count,
+      " IKEM no-eGFR TRAIN arrays to the combined fit matrix."
+    )
+  }
+
   # ---------------------------------------------------------------------------
-  # PASS 3: frozen TRAIN median-polish probe effects, then independent apply
+  # PASS 3: save the TRAIN-fitted probe effects and build final expression
   # ---------------------------------------------------------------------------
 
   pass3_done_path <- file.path(PROGRESS_DIR, "train_reference_pass3_done_block.txt")
-  pass3_done <- as.integer(read_done_lines(pass3_done_path))
-  pass3_done <- pass3_done[!is.na(pass3_done)]
-
-  probe_starts <- cumsum(
-    c(1L, head(template_info$common_pm_counts, -1L))
-  )
+  probe_starts <- cumsum(c(1L, head(template_info$common_pm_counts, -1L)))
   probe_ends <- cumsum(template_info$common_pm_counts)
-
   block_starts <- seq(
     1L,
     length(common_probes),
     by = SUMMARY_PROBESET_BLOCK_SIZE
   )
+  expected_blocks <- seq_along(block_starts)
 
-  for (block_id in seq_along(block_starts)) {
-    if (block_id %in% pass3_done) {
-      next
+  read_block_progress <- function(path, label) {
+    text <- read_done_lines(path)
+    if (length(text) == 0L) return(integer())
+    values <- suppressWarnings(as.integer(text))
+    if (anyNA(values) || any(!values %in% expected_blocks)) {
+      stop(
+        label, " contains an invalid block number: ", path,
+        ". Move that progress file aside and rerun.",
+        call. = FALSE
+      )
     }
+    unique(values)
+  }
 
+  pass3_done <- read_block_progress(pass3_done_path, "PASS 3 progress")
+  parameter_done <- read_block_progress(
+    PARAMETER_PROGRESS,
+    "Frozen-parameter progress"
+  )
+
+  # The signature protects a resumed sidecar from being mixed with a different
+  # split, target, probe order or sample order. The large probe-level HDF5 is
+  # deliberately not hashed because it may be deleted after successful use.
+  current_parameter_signature <- list(
+    format_version = 2L,
+    algorithm = paste0(
+      "combined GEO TRAIN plus IKEM no-measured-eGFR quantile normalization ",
+      "and frozen median-polish probe effects"
+    ),
+    frozen_split_md5 = unname(tools::md5sum(FROZEN_SPLIT_CSV)),
+    template_md5 = unname(tools::md5sum(template_info_path)),
+    target_md5 = unname(tools::md5sum(TARGET_RDS)),
+    sample_ids = as.character(sample_index$GSM),
+    sample_splits = as.character(sample_index$pretraining_split),
+    geo_train_sample_ids = as.character(sample_index$GSM[train_rows_r]),
+    ikem_train_sample_ids = as.character(ikem_contribution$sample_ids),
+    ikem_train_gsms = as.character(ikem_contribution$GSM),
+    geo_train_sample_count = as.integer(length(train_rows_r)),
+    ikem_train_sample_count = as.integer(ikem_train_count),
+    fit_sample_count = as.integer(length(combined_train_rows_r)),
+    common_probes = as.character(common_probes),
+    n_common_pm = as.integer(template_info$n_common_pm)
+  )
+
+  parameter_state_exists <- any(file.exists(c(
+    PARAMETER_H5,
+    PARAMETER_H5_PART,
+    PARAMETER_COMPLETE,
+    PARAMETER_PROGRESS
+  )))
+  if (file.exists(PARAMETER_SIGNATURE)) {
+    saved_signature <- readRDS(PARAMETER_SIGNATURE)
+    if (!identical(saved_signature, current_parameter_signature)) {
+      stop(
+        "The saved frozen-parameter backfill belongs to different inputs. ",
+        "Move only these small files aside, then rerun: ",
+        paste(
+          c(PARAMETER_H5, PARAMETER_H5_PART, PARAMETER_COMPLETE,
+            PARAMETER_SIGNATURE, PARAMETER_PROGRESS),
+          collapse = ", "
+        ),
+        ". Keep ", WORK_H5, "; it can still be reused if it matches the current split.",
+        call. = FALSE
+      )
+    }
+  } else {
+    if (parameter_state_exists) {
+      stop(
+        "Frozen-parameter files exist without their provenance signature. ",
+        "Move the small parameter files/progress marker aside and rerun; do not remove ",
+        WORK_H5, ".",
+        call. = FALSE
+      )
+    }
+    atomic_save_rds(current_parameter_signature, PARAMETER_SIGNATURE, compress = TRUE)
+  }
+
+  if (file.exists(PARAMETER_H5) && file.exists(PARAMETER_H5_PART)) {
+    stop(
+      "Both a completed and partial frozen-parameter file exist. Keep the completed ",
+      "file and move ", PARAMETER_H5_PART, " aside before rerunning.",
+      call. = FALSE
+    )
+  }
+  if (file.exists(PARAMETER_COMPLETE) && !file.exists(PARAMETER_H5)) {
+    stop(
+      "The frozen-parameter completion marker exists, but its HDF5 file is missing. ",
+      "Move ", PARAMETER_COMPLETE, " aside and rerun.",
+      call. = FALSE
+    )
+  }
+
+  parameter_ready <- file.exists(PARAMETER_H5)
+  if (parameter_ready) {
+    validate_parameter_h5(PARAMETER_H5, template_info$n_common_pm)
+    parameter_done <- expected_blocks
+    message("[", timestamp(), "] Frozen probe effects already exist; reusing them.")
+  } else {
+    if (!file.exists(PARAMETER_H5_PART)) {
+      create_parameter_h5(PARAMETER_H5_PART, template_info$n_common_pm)
+      unlink(PARAMETER_PROGRESS, force = TRUE)
+      parameter_done <- integer()
+      message("[", timestamp(), "] Created resumable frozen probe-effect file.")
+    } else {
+      partial_values <- read_parameter_h5(PARAMETER_H5_PART)
+      if (length(partial_values) != template_info$n_common_pm) {
+        stop(
+          "Partial frozen probe-effect file has the wrong length. Move it and ",
+          PARAMETER_PROGRESS, " aside, then rerun.",
+          call. = FALSE
+        )
+      }
+      for (done_block in parameter_done) {
+        first_probe <- block_starts[[done_block]]
+        last_probe <- min(
+          first_probe + SUMMARY_PROBESET_BLOCK_SIZE - 1L,
+          length(common_probes)
+        )
+        rows <- probe_starts[[first_probe]]:probe_ends[[last_probe]]
+        if (any(!is.finite(partial_values[rows]))) {
+          stop(
+            "Frozen-parameter progress marks block ", done_block,
+            " complete, but its values are missing. Move ", PARAMETER_PROGRESS,
+            " aside and rerun; the HDF5 file can be overwritten safely.",
+            call. = FALSE
+          )
+        }
+      }
+      rm(partial_values)
+      gc()
+      message(
+        "[", timestamp(), "] Resuming frozen probe effects after ",
+        length(parameter_done), "/", length(expected_blocks), " blocks."
+      )
+    }
+  }
+
+  missing_summary_blocks <- setdiff(expected_blocks, pass3_done)
+  missing_parameter_blocks <- if (parameter_ready) {
+    integer()
+  } else {
+    setdiff(expected_blocks, parameter_done)
+  }
+  blocks_to_process <- union(missing_summary_blocks, missing_parameter_blocks)
+
+  if (length(blocks_to_process) > 0L && !file.exists(WORK_H5)) {
+    stop(
+      "PASS 3 still needs ", length(blocks_to_process),
+      " block(s), but the probe-level work file is missing: ", WORK_H5,
+      ". It must be restored before Phase 4 can be prepared.",
+      call. = FALSE
+    )
+  }
+
+  if (length(missing_summary_blocks) == 0L &&
+      length(missing_parameter_blocks) > 0L) {
+    message(
+      "[", timestamp(), "] Final global RMA is already complete. Backfilling only ",
+      "the missing frozen probe effects for Phase 4 (",
+      length(missing_parameter_blocks), " blocks)."
+    )
+  }
+
+  phase3_cluster <- NULL
+  if (length(blocks_to_process) > 0L && RMA_WORKERS > 1L) {
+    message(
+      "[", timestamp(), "] Starting ", RMA_WORKERS,
+      " local PASS 3 workers. Workers never open or write HDF5 files."
+    )
+    phase3_cluster <- tryCatch(
+      parallel::makePSOCKcluster(
+        RMA_WORKERS,
+        useXDR = FALSE
+      ),
+      error = function(e) {
+        stop(
+          "Could not start ", RMA_WORKERS, " PASS 3 workers: ",
+          conditionMessage(e),
+          call. = FALSE
+        )
+      }
+    )
+  }
+
+  ram_probe_matrix <- NULL
+  if (length(blocks_to_process) > 0L && RMA_COMPUTE_MODE == "ram") {
+    ram_probe_matrix <- load_probe_matrix_into_ram(
+      path = WORK_H5,
+      dataset = "normalized_common_pm",
+      n_pm = template_info$n_common_pm,
+      n_samples = combined_work_sample_count,
+      batch_size = RAM_LOAD_ARRAY_BATCH_SIZE
+    )
+    message(
+      "[", timestamp(), "] RAM mode is ready; all remaining PASS 3 blocks ",
+      "will reuse the in-memory matrix."
+    )
+  }
+
+  for (block_id in blocks_to_process) {
     first_probe <- block_starts[[block_id]]
     last_probe <- min(
       first_probe + SUMMARY_PROBESET_BLOCK_SIZE - 1L,
       length(common_probes)
     )
-
     probe_ids <- first_probe:last_probe
+    pm_rows <- probe_starts[[first_probe]]:probe_ends[[last_probe]]
 
-    first_pm_row <- probe_starts[[first_probe]]
-    last_pm_row <- probe_ends[[last_probe]]
-    pm_rows <- first_pm_row:last_pm_row
-
-    normalized_block <- rhdf5::h5read(
-      WORK_H5,
-      "normalized_common_pm",
-      index = list(
-        pm_rows,
-        seq_len(nrow(sample_index))
-      ),
-      native = FALSE
-    )
-
-    # Fit probe effects only on frozen pretraining TRAIN arrays.  Once those
-    # effects are fixed, each array (including validation/test) is summarized
-    # independently as median(log2(PM) - frozen_probe_effect).  Therefore no
-    # held-out array influences another array or either fitted RMA parameter.
-    summarized <- matrix(
-      NA_real_,
-      nrow = length(probe_ids),
-      ncol = nrow(sample_index)
-    )
-
-    local_start <- 1L
-    for (local_probe in seq_along(probe_ids)) {
-      n_pm <- template_info$common_pm_counts[probe_ids[[local_probe]]]
-      local_rows <- local_start:(local_start + n_pm - 1L)
-      log_block <- log2(normalized_block[local_rows, , drop = FALSE])
-
-      if (any(!is.finite(log_block))) {
-        stop(
-          "PASS3 encountered non-positive/non-finite normalized PM values in probe set ",
-          common_probes[probe_ids[[local_probe]]],
-          ".",
-          call. = FALSE
-        )
-      }
-
-      train_fit <- stats::medpolish(
-        log_block[, train_rows_r, drop = FALSE],
-        trace.iter = FALSE
+    normalized_block <- if (RMA_COMPUTE_MODE == "ram") {
+      ram_probe_matrix[pm_rows, , drop = FALSE]
+    } else {
+      rhdf5::h5read(
+        WORK_H5,
+        "normalized_common_pm",
+        index = list(pm_rows, seq_len(combined_work_sample_count)),
+        drop = FALSE,
+        native = FALSE
       )
-      frozen_probe_effect <- as.numeric(train_fit$row)
-
-      summarized[local_probe, ] <- apply(
-        sweep(log_block, 1L, frozen_probe_effect, FUN = "-"),
-        2L,
-        stats::median
-      )
-
-      # Algebraic self-check: applying the frozen effects back to training
-      # arrays must reproduce the fitted training chip expressions.
-      fitted_train <- as.numeric(train_fit$overall + train_fit$col)
-      max_train_delta <- max(
-        abs(summarized[local_probe, train_rows_r] - fitted_train)
-      )
-      if (!is.finite(max_train_delta) || max_train_delta > 1e-7) {
-        stop(
-          "Frozen median-polish self-check failed for probe set ",
-          common_probes[probe_ids[[local_probe]]],
-          ": max delta=",
-          max_train_delta,
-          call. = FALSE
-        )
-      }
-
-      local_start <- local_start + n_pm
     }
 
-    expected_dim <- c(length(probe_ids), nrow(sample_index))
-
-    if (!identical(dim(summarized), expected_dim)) {
+    expected_normalized_dim <- c(length(pm_rows), combined_work_sample_count)
+    if (!identical(dim(normalized_block), expected_normalized_dim)) {
       stop(
-        "PASS3 block ",
-        block_id,
-        " returned dimensions ",
-        paste(dim(summarized), collapse = " x "),
-        "; expected ",
-        paste(expected_dim, collapse = " x "),
-        ".",
+        "PASS 3 read block ", block_id, " with dimensions ",
+        paste(dim(normalized_block), collapse = " x "), "; expected ",
+        paste(expected_normalized_dim, collapse = " x "), ".",
         call. = FALSE
       )
     }
 
-    # HDF5 final matrix is samples x probes.
-    h5_write_native_block_checked(
-      t(summarized),
-      FINAL_H5,
-      "expression/rma_global",
-      start = c(1L, first_probe)
+    # Close any high-level HDF5 handles before dispatching worker tasks. Workers
+    # receive ordinary R matrices; the parent remains the sole HDF5 writer.
+    rhdf5::H5close()
+
+    local_probe_starts <- cumsum(c(
+      1L,
+      head(template_info$common_pm_counts[probe_ids], -1L)
+    ))
+
+    probe_tasks <- lapply(seq_along(probe_ids), function(local_probe) {
+      n_pm <- template_info$common_pm_counts[probe_ids[[local_probe]]]
+      local_start <- local_probe_starts[[local_probe]]
+      local_rows <- local_start:(local_start + n_pm - 1L)
+      list(
+        local_probe = local_probe,
+        local_rows = local_rows,
+        probe_name = common_probes[probe_ids[[local_probe]]],
+        normalized_values = normalized_block[local_rows, , drop = FALSE],
+        train_rows = combined_train_rows_r
+      )
+    })
+
+    probe_results <- phase3_lapply(
+      probe_tasks,
+      summarize_probe_task,
+      cluster = phase3_cluster
     )
 
-    append_unique_line(pass3_done_path, as.character(block_id))
+    summarized <- matrix(
+      NA_real_,
+      nrow = length(probe_ids),
+      ncol = combined_work_sample_count
+    )
+    parameter_block <- rep(NA_real_, length(pm_rows))
+
+    for (result in probe_results) {
+      summarized[result$local_probe, ] <- result$sample_summary
+      parameter_block[result$local_rows] <- result$probe_effect
+    }
+
+    expected_dim <- c(length(probe_ids), combined_work_sample_count)
+    if (!identical(dim(summarized), expected_dim) ||
+        length(parameter_block) != length(pm_rows) ||
+        any(!is.finite(parameter_block))) {
+      stop("PASS 3 produced an invalid block ", block_id, ".", call. = FALSE)
+    }
+
+    # Only GEO rows belong in GEO_MATRIX_STORE. The appended IKEM TRAIN columns
+    # are used solely to fit the shared probe effects.
+    final_block <- t(summarized[, seq_len(nrow(sample_index)), drop = FALSE])
+    if (block_id %in% pass3_done) {
+      existing_block <- rhdf5::h5read(
+        FINAL_H5,
+        "expression/rma_global",
+        index = list(seq_len(nrow(sample_index)), probe_ids),
+        native = TRUE
+      )
+      difference <- max(abs(as.numeric(existing_block) - as.numeric(final_block)))
+      tolerance <- 5e-6 * max(1, max(abs(as.numeric(final_block))))
+      if (!is.finite(difference) || difference > tolerance) {
+        stop(
+          "Existing global-RMA block ", block_id,
+          " does not match the recomputed frozen effects (max difference=",
+          format(difference, digits = 8L), "). Stop and inspect this store.",
+          call. = FALSE
+        )
+      }
+    } else {
+      h5_write_native_block_checked(
+        final_block,
+        FINAL_H5,
+        "expression/rma_global",
+        start = c(1L, first_probe)
+      )
+      append_unique_line(pass3_done_path, as.character(block_id))
+      pass3_done <- c(pass3_done, block_id)
+    }
+
+    if (!parameter_ready && !(block_id %in% parameter_done)) {
+      write_parameter_block_checked(PARAMETER_H5_PART, pm_rows, parameter_block)
+      append_unique_line(PARAMETER_PROGRESS, as.character(block_id))
+      parameter_done <- c(parameter_done, block_id)
+    }
 
     rm(
       normalized_block,
-      summarized
+      summarized,
+      final_block,
+      parameter_block,
+      probe_tasks,
+      probe_results,
+      local_probe_starts
     )
+    if (exists("existing_block", inherits = FALSE)) rm(existing_block)
     gc()
 
     message(
-      "[",
-      timestamp(),
-      "] PASS3 block ",
-      block_id,
-      "/",
-      length(block_starts),
-      " completed (probe sets ",
-      first_probe,
-      "-",
-      last_probe,
-      ")."
+      "[", timestamp(), "] PASS 3 block ", block_id, "/",
+      length(block_starts), " ready (probe sets ", first_probe, "-", last_probe, ")."
     )
   }
+
+  if (!is.null(phase3_cluster)) {
+    parallel::stopCluster(phase3_cluster)
+    phase3_cluster <- NULL
+  }
+
+  if (!is.null(ram_probe_matrix)) {
+    rm(ram_probe_matrix)
+    gc()
+  }
+
+  if (!setequal(pass3_done, expected_blocks)) {
+    stop("PASS 3 final expression matrix is still incomplete.", call. = FALSE)
+  }
+
+  if (!parameter_ready) {
+    parameter_done <- read_block_progress(
+      PARAMETER_PROGRESS,
+      "Frozen-parameter progress"
+    )
+    if (!setequal(parameter_done, expected_blocks)) {
+      stop("Frozen probe-effect backfill is still incomplete.", call. = FALSE)
+    }
+    validate_parameter_h5(PARAMETER_H5_PART, template_info$n_common_pm)
+    if (!file.rename(PARAMETER_H5_PART, PARAMETER_H5)) {
+      stop(
+        "Could not finalize frozen probe effects: ", PARAMETER_H5,
+        call. = FALSE
+      )
+    }
+    parameter_ready <- TRUE
+  }
+
+  validate_parameter_h5(PARAMETER_H5, template_info$n_common_pm)
+  parameter_marker <- sprintf(
+    paste0(
+      "%s TRAIN_REFERENCE_PARAMETERS_COMPLETE pm_effects=%d probes=%d ",
+      "geo_samples=%d geo_train_samples=%d ikem_train_samples=%d ",
+      "train_samples=%d signature_md5=%s"
+    ),
+    timestamp(),
+    template_info$n_common_pm,
+    length(common_probes),
+    nrow(sample_index),
+    length(train_rows_r),
+    ikem_train_count,
+    length(combined_train_rows_r),
+    unname(tools::md5sum(PARAMETER_SIGNATURE))
+  )
+  atomic_write_lines(parameter_marker, PARAMETER_COMPLETE)
+  message("[", timestamp(), "] Frozen Phase 4 parameters are complete: ", PARAMETER_H5)
 
   # ---------------------------------------------------------------------------
   # Final cross-checks
@@ -2724,21 +3709,29 @@ if (RUN_GLOBAL_RMA) {
     }
   }
 
-  writeLines(
-    paste(
+  atomic_write_lines(
+    sprintf(
+      paste0(
+        "%s TRAIN_REFERENCE_RMA_COMPLETE geo_samples=%d probes=%d ",
+        "geo_train_samples=%d ikem_train_samples=%d train_samples=%d ",
+        "frozen_parameters=%s"
+      ),
       timestamp(),
-      "TRAIN_REFERENCE_RMA_COMPLETE",
-      "samples=",
       nrow(sample_index),
-      "probes=",
-      length(common_probes)
+      length(common_probes),
+      length(train_rows_r),
+      ikem_train_count,
+      length(combined_train_rows_r),
+      basename(PARAMETER_H5)
     ),
     file.path(OUT_DIR, "GLOBAL_RMA_COMPLETE.txt")
   )
 
   if (
     DELETE_PROBE_LEVEL_SCRATCH_AFTER_SUCCESS &&
-    file.exists(WORK_H5)
+    file.exists(WORK_H5) &&
+    file.exists(PARAMETER_H5) &&
+    file.exists(PARAMETER_COMPLETE)
   ) {
     message(
       "[",
@@ -2782,9 +3775,9 @@ store_manifest <- data.frame(
     ),
     paste0(
       "Train-reference RMA log2 expression. Background correction is per array; ",
-      "the quantile target and median-polish probe effects are fitted only on ",
-      "the frozen pretraining train arrays. Validation/test arrays are transformed ",
-      "independently with those frozen parameters."
+      "the quantile target and median-polish probe effects are fitted on frozen ",
+      "GEO TRAIN plus IKEM no-eGFR TRAIN arrays. GEO/IKEM validation and test, ",
+      "and all eGFR arrays, are transformed with frozen parameters only."
     )
   ),
   stringsAsFactors = FALSE
@@ -2806,6 +3799,15 @@ readme <- c(
   "",
   "Main file:",
   "  geo_expression_store.h5",
+  "",
+  "Reusable frozen GEO + IKEM no-eGFR TRAIN reference:",
+  "  ../.GLOBAL_RMA_WORK/train_reference_quantile_target.rds",
+  "  ../.GLOBAL_RMA_WORK/train_reference_rma_parameters.h5",
+  paste0(
+    "  Fit arrays: ", length(train_rows_r), " GEO TRAIN + ", ikem_train_count,
+    " IKEM no-eGFR TRAIN = ", length(combined_train_rows_r), "."
+  ),
+  "  Validation/test/eGFR arrays do not fit either parameter.",
   "",
   "Expression datasets (all sample x probe):",
   "  /expression/raw_original",

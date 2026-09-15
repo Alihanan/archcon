@@ -250,6 +250,27 @@ curl_download <- function(url, partial_file) {
   )
 }
 
+geo_raw_archive_url <- function(gse) {
+  gse <- toupper(trimws(gse))
+  if (!grepl("^GSE[0-9]+$", gse)) {
+    stop("Invalid GEO series accession: ", gse, call. = FALSE)
+  }
+
+  # GEO stores each series under a three-digit bucket: for example,
+  # GSE148321 lives in GSE148nnn. The static archive URL supports ordinary
+  # byte-range resume, unlike the CGI redirect used by the older downloader.
+  bucket <- sub("[0-9]{3}$", "nnn", gse)
+  paste0(
+    "https://ftp.ncbi.nlm.nih.gov/geo/series/",
+    bucket,
+    "/",
+    gse,
+    "/suppl/",
+    gse,
+    "_RAW.tar"
+  )
+}
+
 
 # ------------------------------------------------------------
 # Main loop
@@ -287,11 +308,7 @@ for (i in seq_len(n)) {
     ".part"
   )
 
-  url <- paste0(
-    "https://www.ncbi.nlm.nih.gov/geo/download/?acc=",
-    gse,
-    "&format=file"
-  )
+  url <- geo_raw_archive_url(gse)
 
 
   # ----------------------------------------------------------
