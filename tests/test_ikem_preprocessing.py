@@ -15,6 +15,11 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _membership_sha256(namespace: str, sample_ids: list[str]) -> str:
+    values = sorted(f"{namespace.upper()}:{value.upper()}" for value in sample_ids)
+    return hashlib.sha256(("\n".join(values) + "\n").encode()).hexdigest()
+
+
 def _write_store(
     root: Path,
     raw: np.ndarray,
@@ -32,28 +37,55 @@ def _write_store(
     for name, matrix in matrices.items():
         np.save(root / f"{name}.npy", matrix.astype(np.float32))
     pd.DataFrame(
-        {"GSM": samples, "row_index_python": np.arange(len(samples), dtype=np.int64)}
+        {
+            "GSM": samples,
+            "row_index_python": np.arange(len(samples), dtype=np.int64),
+            "donor_id": [value.rsplit("_", 1)[0] for value in samples],
+            "training_role": [
+                "pretrain_train_no_egfr",
+                "pretrain_validation_no_egfr",
+            ],
+            "pretraining_split": ["train", "validation"],
+        }
     ).to_csv(root / "sample_index.csv", index=False)
     pd.DataFrame({"probe_id": probes}).to_csv(root / "probe_index.csv", index=False)
     (root / "preprocessing_provenance.json").write_text(
         json.dumps(
             {
-                "format": 2,
-                "source": "GSE290167",
+                "format": 4,
+                "source": "private IKEM CEL collection",
+                "outcome_gate_unit": "donor",
+                "split_unit": "donor",
+                "split_seed": 20260915,
+                "validation_fraction": 0.20,
+                "cohort_samples": 2,
+                "no_measured_egfr_biopsies": 2,
+                "donor_clean_pretraining_eligible_samples": 2,
+                "pretraining_train_samples": 1,
+                "pretraining_validation_samples": 1,
+                "related_no_egfr_held_out_samples": 0,
+                "held_out_measured_egfr_samples": 0,
+                "pretraining_validation_donors": [samples[1].rsplit("_", 1)[0]],
+                "ikem_train_sample_ids_sha256": _membership_sha256(
+                    "SUPERVISED", [samples[0]]
+                ),
+                "ikem_validation_sample_ids_sha256": _membership_sha256(
+                    "SUPERVISED", [samples[1]]
+                ),
                 "frozen_pretraining_split_sha256": _sha256(split_path),
                 "methods": {
                     "raw_original": {
-                        "uses_egfr": False,
+                        "uses_outcome_values_in_fit": False,
                         "uses_egfr_cv_fold": False,
                         "transductive_across_egfr_folds": False,
                     },
                     "rma_per_gse": {
-                        "uses_egfr": False,
+                        "uses_outcome_values_in_fit": False,
                         "uses_egfr_cv_fold": False,
                         "transductive_across_egfr_folds": False,
                     },
                     "rma_global": {
-                        "uses_egfr": False,
+                        "uses_outcome_values_in_fit": False,
                         "uses_egfr_cv_fold": False,
                         "transductive_across_egfr_folds": False,
                     },
@@ -76,17 +108,25 @@ def test_ikem_inputs_are_preprocessed_for_each_encoder_arm(tmp_path: Path) -> No
     prepared.mkdir()
     pd.DataFrame(
         {
-            "row_index_python": [0, 1, 2],
-            "sample_key": ["GEO:GSM1", "GEO:GSM2", "GEO:GSM3"],
-            "sample_id": ["GSM1", "GSM2", "GSM3"],
-            "split": ["train", "validation", "test"],
+            "row_index_python": [0, 1, 2, 3, 4],
+            "sample_key": [
+                "GEO:GSM1",
+                "GEO:GSM2",
+                "GEO:GSM3",
+                "SUPERVISED:D001_L",
+                "SUPERVISED:D002_L",
+            ],
+            "sample_id": ["GSM1", "GSM2", "GSM3", "D001_L", "D002_L"],
+            "source_kind": ["geo", "geo", "geo", "ikem", "ikem"],
+            "donor_id": [None, None, None, "D001", "D002"],
+            "split": ["train", "validation", "test", "train", "validation"],
         }
     ).to_csv(prepared / "sample_index.csv", index=False)
     pd.DataFrame(
         {"probe_index_python": [0, 1, 2], "probe_id": probes}
     ).to_csv(prepared / "probe_index.csv", index=False)
-    np.save(prepared / "train_rows.npy", np.asarray([0], dtype=np.int64))
-    np.save(prepared / "validation_rows.npy", np.asarray([1], dtype=np.int64))
+    np.save(prepared / "train_rows.npy", np.asarray([0, 3], dtype=np.int64))
+    np.save(prepared / "validation_rows.npy", np.asarray([1, 4], dtype=np.int64))
     np.save(prepared / "test_rows.npy", np.asarray([2], dtype=np.int64))
     for method, stem in (
         (METHOD_PER_DATASET_STANDARDIZED, "standardized"),
@@ -95,7 +135,7 @@ def test_ikem_inputs_are_preprocessed_for_each_encoder_arm(tmp_path: Path) -> No
     ):
         np.save(prepared / f"geo_columns_{stem}.npy", np.arange(3, dtype=np.int64))
         np.save(prepared / f"geo_rows_{stem}.npy", np.arange(3, dtype=np.int64))
-        np.save(prepared / f"supplemental_{stem}.npy", np.empty((0, 3), dtype=np.float32))
+        np.save(prepared / f"supplemental_{stem}.npy", raw.astype(np.float32))
     np.save(
         prepared / "standardization_ikem_train_center.npy",
         np.asarray([10.0, 10.0, 10.0], dtype=np.float32),
@@ -107,10 +147,10 @@ def test_ikem_inputs_are_preprocessed_for_each_encoder_arm(tmp_path: Path) -> No
     (prepared / "prepared.json").write_text(
         json.dumps(
             {
-                "format": 4,
-                "n_samples": 3,
+                "format": 5,
+                "n_samples": 5,
                 "n_geo": 3,
-                "n_supervised_no_egfr": 0,
+                "n_ikem_donor_clean_no_egfr": 2,
                 "n_probes": 3,
                 "train_rows": "train_rows.npy",
                 "validation_rows": "validation_rows.npy",
@@ -138,8 +178,8 @@ def test_ikem_inputs_are_preprocessed_for_each_encoder_arm(tmp_path: Path) -> No
                     }
                 },
                 "standardization": {
-                    "n_ikem_reference_rows": 7,
-                    "uses_egfr": False,
+                    "n_ikem_reference_rows": 1,
+                    "uses_outcome_values_in_fit": False,
                     "uses_egfr_cv_fold": False,
                 },
             }
@@ -147,9 +187,9 @@ def test_ikem_inputs_are_preprocessed_for_each_encoder_arm(tmp_path: Path) -> No
         encoding="utf-8",
     )
     _write_store(
-        tmp_path / "IKEM_NUMPY_STORE",
+        tmp_path / "IKEM_CEL_NUMPY_STORE",
         raw,
-        ["IKEM1", "IKEM2"],
+        ["D001_L", "D002_L"],
         probes,
         prepared / "sample_index.csv",
     )
@@ -182,19 +222,25 @@ def test_partial_per_gse_evaluation_does_not_require_global_reference(
     prepared.mkdir()
     pd.DataFrame(
         {
-            "row_index_python": [0],
-            "sample_key": ["GEO:GSM1"],
-            "sample_id": ["GSM1"],
-            "split": ["train"],
+            "row_index_python": [0, 1, 2],
+            "sample_key": [
+                "GEO:GSM1",
+                "SUPERVISED:D001_L",
+                "SUPERVISED:D002_L",
+            ],
+            "sample_id": ["GSM1", "D001_L", "D002_L"],
+            "source_kind": ["geo", "ikem", "ikem"],
+            "donor_id": [None, "D001", "D002"],
+            "split": ["train", "train", "validation"],
         }
     ).to_csv(prepared / "sample_index.csv", index=False)
     pd.DataFrame(
         {"probe_index_python": [0, 1], "probe_id": probes}
     ).to_csv(prepared / "probe_index.csv", index=False)
     _write_store(
-        tmp_path / "IKEM_NUMPY_STORE",
+        tmp_path / "IKEM_CEL_NUMPY_STORE",
         matrix - 100.0,
-        ["IKEM1", "IKEM2"],
+        ["D001_L", "D002_L"],
         probes,
         prepared / "sample_index.csv",
     )

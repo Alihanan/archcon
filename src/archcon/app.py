@@ -145,6 +145,7 @@ from .data.training_sources import (
     load_training_source,
     load_ikem_source,
     split_rows_for_source,
+    validation_partition_from_split,
     validate_pretraining_split,
 )
 from .data.supervised import (
@@ -337,7 +338,7 @@ I_{\mathrm{train}}\cap I_{\mathrm{test}}=
 I_{\mathrm{val}}\cap I_{\mathrm{test}}=\varnothing.
 $$
 
-The default is approximately **90% train / 5% validation / 5% test**. GEO is split by whole connected study components. Supervised-dataset samples without eGFR are independently split 90/5/5 and appended to the same molecular partitions. Samples with eGFR never enter this pretraining split. Validation selects checkpoints and hyperparameters; test rows remain blinded during the sweep.
+GEO keeps the frozen **10,522 train / 585 validation / 584 test** connected-study split. IKEM is gated at donor level: all biopsies from a donor with any measured eGFR are excluded, and the remaining 30 biopsies are frozen as **24 train / 6 validation**, with no IKEM molecular-test rows. Checkpoints use the predeclared 50% GEO clean-MSE + 50% donor-balanced IKEM clean-MSE validation score. GEO test remains blinded until the six preprocessing×architecture winners are frozen.
 """,
     "latent": r"""
 ### 06 · Molecular representation · autoencoder pretraining
@@ -352,7 +353,7 @@ $$
 
 The thesis pretraining stage uses a reconstruction-only autoencoder. Hidden layers are dense, the decoder mirrors the encoder, ReLU is used in the hidden layers, and no activation is applied at the latent code. In the reported ArchCon experiments the hidden widths were $256\rightarrow64$ and the latent dimension was treated separately.
 
-The comparison keeps the thesis-style **256 → 64** hidden encoder as one anchor while expanding depth and latent-size choices. All model configurations use the same combined molecular 90/5/5 assignment: GEO is grouped by connected source-GSE component, and supervised samples without eGFR are split independently by sample. Per-study RMA is performed within each source GSE. The legacy-named Global RMA arm now requires a reference fitted only on the frozen GEO training rows and applied independently to held-out rows. Because `raw_original.npy` is already summarized to probe-set PM medians, this corrected representation is train-reference quantile normalization followed by log2, not exact CEL-level RMA. Validation is tracked live and checkpoints are saved automatically. Public GEO plus supervised-dataset samples without eGFR form the molecular-only pretraining pool; samples with eGFR are not evaluated or trained on here.
+The comparison keeps the thesis-style **256 → 64** hidden encoder as one anchor while expanding depth and latent-size choices. Every model uses the same frozen identities: GEO is grouped by connected source-GSE component, while IKEM is separated by donor into 24 train and six validation biopsies. Per-study RMA is performed within each source GSE. IKEM-local RMA and standardization are fitted only on the 24 IKEM training biopsies. The exact CEL-level global arm fits one combined reference on 10,522 GEO training CELs plus those 24 IKEM training CELs and applies it unchanged to held-out rows. Validation is tracked live with the predeclared equal-domain score, and checkpoints are saved automatically. Samples from donors with any measured eGFR never enter pretraining.
 """,
     "aa": r"""
 ### 07 · Downstream outcome / archetypal design · configuration only
@@ -2001,7 +2002,7 @@ def _comparison_split_from_store_path(
     seed: int,
     train_fraction: float,
 ) -> tuple[pd.DataFrame, Path]:
-    """Build the fixed 90/5/5 split by leakage-safe source-GSE component."""
+    """Build frozen GEO study roles plus donor-separated IKEM train/validation roles."""
     store_root = Path(store_path).expanduser().resolve()
     layout = project_data_layout(store_root.parent)
     split = create_shared_preprocessing_split(
@@ -2752,6 +2753,7 @@ def _train_autoencoder_callback(
                 methods=TRAINING_PREPROCESSING_OPTIONS,
             )
         train_rows, validation_rows = split_rows_for_source(split, source)
+        validation_partition = validation_partition_from_split(split)
         matrix = source.matrix
 
         config = _training_config_from_controls(
@@ -2800,6 +2802,8 @@ def _train_autoencoder_callback(
             config,
             output_root,
             method=method,
+            validation_domains=validation_partition.domains,
+            validation_donor_ids=validation_partition.donor_ids,
             checkpoint_path=checkpoint_path or None,
             checkpoint_mode=checkpoint_mode,
         ):
@@ -3276,7 +3280,7 @@ Click a step. Each page answers one simple question; the selected step stays **o
                     elem_classes=["pipeline-stage-theory"],
                 )
                 gr.Markdown(
-                    "### ✂️ One study-level split is sampled once\nThe formal protocol is **~90% train / ~5% validation / ~5% test**, assigned by connected source-GSE component. No GSE (or related SubSeries/SuperSeries sharing a GSM) can cross partitions. Seed 42 is reused for every architecture and hyperparameter combination.",
+                    "### ✂️ One molecular split is frozen once\nGEO keeps the connected-study **10,522 / 585 / 584 train/validation/test** assignment. IKEM eligibility and its **24 / 6 train/validation** assignment are donor-level, with seed 20260915 and no IKEM test rows. The same identities are reused for every architecture and hyperparameter combination.",
                     elem_classes=["stage-subheading"],
                 )
                 with gr.Row(elem_classes=["split-controls"]):
@@ -3288,7 +3292,7 @@ Click a step. Each page answers one simple question; the selected step stays **o
                     train_fraction = gr.Number(
                         value=0.90,
                         precision=2,
-                        label="Train fraction (fixed; val/test = 0.05/0.05)",
+                        label="GEO train fraction (fixed; val/test = 0.05/0.05)",
                         interactive=False,
                     )
                 split_summary = gr.Markdown(
@@ -3387,8 +3391,8 @@ Click a step. Each page answers one simple question; the selected step stays **o
                     label="Training preprocessing",
                     info=(
                         "The comparison sweep evaluates per-dataset standardization, per-study RMA, and the legacy-named "
-                        "Global RMA arm on the same GSE-disjoint 90/5/5 identities. Global preprocessing must "
-                        "carry provenance proving that its reference was fitted only on frozen GEO training rows."
+                        "Global RMA arm on the same frozen molecular identities. The exact global preprocessing "
+                        "must prove that its reference used only 10,522 GEO and 24 IKEM training CELs."
                     ),
                 )
 
@@ -3731,7 +3735,7 @@ Click a step. Each page answers one simple question; the selected step stays **o
                         "script. Every generated `jobs/run_XXXX.py` contains the exact PyTorch model "
                         "definition, loss, L2 penalty, optimizer, scheduler and all configuration "
                         "values; its `main()` loads the selected GEO preprocessing and outcome-blind supervised rows. "
-                        "The expanded default grid has 1,440 runs and uses one shared molecular 90/5/5 split. "
+                        "The expanded default grid has 1,440 runs and uses one frozen GEO 90/5/5 plus IKEM 24/6 donor split. "
                         "Every job loads test row identities only to report their count; it never evaluates them.",
                         elem_classes=["reading-width"],
                     )
@@ -3741,8 +3745,8 @@ Click a step. Each page answers one simple question; the selected step stays **o
                         "latent dimensions 3/8/16, MSE/masked MSE, plus architecture-specific L2/BatchNorm or residual-block/expansion axes. "
                         "The preprocessing axis is per-dataset standardization / per-study RMA / global RMA. Seed 42, batch size 64, starting LR 1e-3 "
                         "and one-way cosine decay are fixed. Molecular test rows and all samples with eGFR remain blinded during the sweep. "
-                        "The legacy-named global arm must be rebuilt against this frozen split before its jobs run; "
-                        "held-out GEO arrays cannot contribute to its reference.",
+                        "The global arm must be rebuilt against this frozen split before its jobs run; "
+                        "held-out GEO and IKEM arrays cannot contribute to its reference.",
                         elem_classes=["reading-width"],
                     )
                     sweep_grid_json = gr.Code(

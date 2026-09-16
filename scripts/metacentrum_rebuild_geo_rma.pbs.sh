@@ -18,7 +18,15 @@ set -Eeuo pipefail
 SCRIPT_HOME="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 DEFAULT_PROJECT_ROOT="$(cd -- "$SCRIPT_HOME/.." && pwd -P)"
 PROJECT_ROOT="${ARCHCON_PROJECT_ROOT:-$DEFAULT_PROJECT_ROOT}"
-SWEEP_ROOT="${ARCHCON_SWEEP_ROOT:-$PROJECT_ROOT/sweeps/archcon-pretrain-0515}"
+if [[ -n "${ARCHCON_SWEEP_ROOT:-}" ]]; then
+    SWEEP_ROOT="$ARCHCON_SWEEP_ROOT"
+elif [[ -f "$PROJECT_ROOT/sweeps/archcon-pretrain-0516/prepared/sample_index.csv" ]]; then
+    SWEEP_ROOT="$PROJECT_ROOT/sweeps/archcon-pretrain-0516"
+else
+    # Bootstrap from the unchanged GEO membership in the preceding sweep. The
+    # script ignores its IKEM rows and derives the new IKEM roles independently.
+    SWEEP_ROOT="$PROJECT_ROOT/sweeps/archcon-pretrain-0515"
+fi
 PERSIST_ROOT="${ARCHCON_RMA_STATE_ROOT:-$PROJECT_ROOT/data/GEO_DWNLD_TRAIN_REFERENCE_REBUILD}"
 SOURCE_ROOT="${ARCHCON_RMA_INPUT_ROOT:-$PROJECT_ROOT/data/GEO_DWNLD}"
 SCRIPT_ROOT="${ARCHCON_RMA_SCRIPT_ROOT:-$PROJECT_ROOT/scripts}"
@@ -33,9 +41,14 @@ IKEM_PRIVATE_CEL_DIR="${ARCHCON_IKEM_PRIVATE_CEL_DIR:-$IKEM_RAW_DIR/STADNIUK_LEG
 IKEM_SAMPLE_METADATA="${ARCHCON_IKEM_SAMPLE_METADATA:-$PROJECT_ROOT/data/sample_metadata.csv}"
 IKEM_EGFR_TABLE="${ARCHCON_IKEM_EGFR_TABLE:-$PROJECT_ROOT/data/egfr_data.xlsx}"
 IKEM_CLASSIFIER_TABLE="${ARCHCON_IKEM_CLASSIFIER_TABLE:-$PROJECT_ROOT/data/Klasifikator_20_3_24_v2.xlsx}"
-IKEM_CANDIDATE="$PERSIST_ROOT/IKEM_NUMPY_CANDIDATE_V5"
+IKEM_CANDIDATE="$PERSIST_ROOT/IKEM_NUMPY_CANDIDATE_V6"
 IKEM_EXPECTED_SAMPLES="${ARCHCON_IKEM_EXPECTED_SAMPLES:-288}"
-IKEM_EXPECTED_NO_EGFR_TRAIN="${ARCHCON_IKEM_EXPECTED_NO_EGFR_TRAIN:-34}"
+IKEM_EXPECTED_NO_EGFR_TOTAL="${ARCHCON_IKEM_EXPECTED_NO_EGFR_TOTAL:-34}"
+IKEM_EXPECTED_PRETRAIN_ELIGIBLE="${ARCHCON_IKEM_EXPECTED_PRETRAIN_ELIGIBLE:-30}"
+IKEM_EXPECTED_PRETRAIN_TRAIN="${ARCHCON_IKEM_EXPECTED_PRETRAIN_TRAIN:-24}"
+IKEM_EXPECTED_PRETRAIN_VALIDATION="${ARCHCON_IKEM_EXPECTED_PRETRAIN_VALIDATION:-6}"
+IKEM_SPLIT_SEED="${ARCHCON_IKEM_SPLIT_SEED:-20260915}"
+IKEM_VALIDATION_FRACTION="${ARCHCON_IKEM_VALIDATION_FRACTION:-0.20}"
 
 if [[ -z "${SCRATCHDIR:-}" || ! -d "$SCRATCHDIR" ]]; then
     echo "ERROR: SCRATCHDIR is unset or unavailable. Run inside a PBS job." >&2
@@ -169,6 +182,55 @@ if [[ ! -f "$SWEEP_ROOT/prepared/sample_index.csv" ]]; then
     echo "ERROR: frozen split not found: $SWEEP_ROOT/prepared/sample_index.csv" >&2
     exit 2
 fi
+
+# RMA depends only on the GEO portion of the sweep split. Canonicalizing that
+# small table prevents an IKEM-only train/validation metadata change from
+# invalidating hours of otherwise identical GEO work on a later resume.
+FROZEN_GEO_SPLIT="$PERSIST_ROOT/frozen_geo_split.csv"
+"$PYTHON_BIN" - "$SWEEP_ROOT/prepared/sample_index.csv" "$FROZEN_GEO_SPLIT" <<'PY'
+import csv
+import os
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+with source.open(newline="", encoding="utf-8-sig") as handle:
+    rows = list(csv.DictReader(handle))
+
+canonical = []
+for row in rows:
+    sample_key = str(row.get("sample_key", "")).strip()
+    sample_id = str(row.get("sample_id", row.get("GSM", ""))).strip().upper()
+    if sample_key.upper().startswith("GEO:"):
+        sample_id = sample_key.split(":", 1)[1].strip().upper()
+    if not sample_id.startswith("GSM"):
+        continue
+    split = str(row.get("split", "")).strip().lower()
+    if split not in {"train", "validation", "test"}:
+        raise RuntimeError(f"Invalid GEO split for {sample_id}: {split!r}")
+    canonical.append({"sample_id": sample_id, "split": split, "source_kind": "geo"})
+
+canonical.sort(key=lambda row: (int(row["sample_id"][3:]), row["sample_id"]))
+ids = [row["sample_id"] for row in canonical]
+if not canonical or len(ids) != len(set(ids)):
+    raise RuntimeError("Canonical GEO split is empty or contains duplicate GSM IDs.")
+observed_counts = {
+    split: sum(row["split"] == split for row in canonical)
+    for split in ("train", "validation", "test")
+}
+expected_counts = {"train": 10_522, "validation": 585, "test": 584}
+if observed_counts != expected_counts:
+    raise RuntimeError(
+        f"Frozen GEO split counts changed: {observed_counts}; expected {expected_counts}."
+    )
+temporary = destination.with_suffix(".csv.part")
+with temporary.open("w", newline="", encoding="utf-8") as handle:
+    writer = csv.DictWriter(handle, fieldnames=["sample_id", "split", "source_kind"])
+    writer.writeheader()
+    writer.writerows(canonical)
+os.replace(temporary, destination)
+PY
 for required_ikem in "$IKEM_SAMPLE_METADATA" "$IKEM_EGFR_TABLE" "$IKEM_CLASSIFIER_TABLE"; do
     if [[ ! -f "$required_ikem" ]]; then
         echo "ERROR: required IKEM metadata file is missing: $required_ikem" >&2
@@ -194,7 +256,12 @@ export ARCHCON_IKEM_EGFR_TABLE="$IKEM_EGFR_TABLE"
 export ARCHCON_IKEM_CLASSIFIER_TABLE="$IKEM_CLASSIFIER_TABLE"
 export ARCHCON_IKEM_LEGACY_STORE="$IKEM_LEGACY_STORE"
 export ARCHCON_IKEM_EXPECTED_SAMPLES="$IKEM_EXPECTED_SAMPLES"
-export ARCHCON_IKEM_EXPECTED_NO_EGFR_TRAIN="$IKEM_EXPECTED_NO_EGFR_TRAIN"
+export ARCHCON_IKEM_EXPECTED_NO_EGFR_TOTAL="$IKEM_EXPECTED_NO_EGFR_TOTAL"
+export ARCHCON_IKEM_EXPECTED_PRETRAIN_ELIGIBLE="$IKEM_EXPECTED_PRETRAIN_ELIGIBLE"
+export ARCHCON_IKEM_EXPECTED_PRETRAIN_TRAIN="$IKEM_EXPECTED_PRETRAIN_TRAIN"
+export ARCHCON_IKEM_EXPECTED_PRETRAIN_VALIDATION="$IKEM_EXPECTED_PRETRAIN_VALIDATION"
+export ARCHCON_IKEM_SPLIT_SEED="$IKEM_SPLIT_SEED"
+export ARCHCON_IKEM_VALIDATION_FRACTION="$IKEM_VALIDATION_FRACTION"
 
 echo "Script execution root: $RUN_SCRIPTS"
 echo "Persistent work root:  $PERSIST_ROOT"
@@ -204,6 +271,7 @@ echo "Public CEL fallback:   $ARCHCON_IKEM_RAW_DIR"
 echo "IKEM outcome table:    $ARCHCON_IKEM_EGFR_TABLE"
 echo "IKEM output store:     $IKEM_OUTPUT_STORE"
 echo "Frozen split:          $SWEEP_ROOT/prepared/sample_index.csv"
+echo "Canonical GEO split:   $FROZEN_GEO_SPLIT"
 echo "R library:             $R_LIBS"
 echo "R temporary directory: $TMPDIR"
 echo "PASS 3 input mode:      $ARCHCON_RMA_MODE"
@@ -211,7 +279,7 @@ echo "PASS 3 worker count:    $ARCHCON_RMA_CPUS / $ALLOCATED_CPUS allocated CPU(
 
 "$RSCRIPT_BIN" --vanilla "$RUN_SCRIPTS/metacentrum_rebuild_geo_rma.R" \
     --work-root "$PERSIST_ROOT" \
-    --frozen-split "$SWEEP_ROOT/prepared/sample_index.csv" \
+    --frozen-split "$FROZEN_GEO_SPLIT" \
     --numpy-store "$GEO_NUMPY_STORE" \
     --ikem-store "$IKEM_CANDIDATE" \
     --keep-raw true
@@ -249,9 +317,24 @@ split_path = Path(sys.argv[5]).resolve()
 private_cel_dir = Path(sys.argv[6]).resolve()
 egfr_table = Path(sys.argv[7]).resolve()
 expected_samples = int(os.environ.get("ARCHCON_IKEM_EXPECTED_SAMPLES", "288"))
-expected_train = int(
-    os.environ.get("ARCHCON_IKEM_EXPECTED_NO_EGFR_TRAIN", "34")
+expected_no_egfr_total = int(
+    os.environ.get("ARCHCON_IKEM_EXPECTED_NO_EGFR_TOTAL", "34")
 )
+expected_eligible = int(
+    os.environ.get("ARCHCON_IKEM_EXPECTED_PRETRAIN_ELIGIBLE", "30")
+)
+expected_train = int(
+    os.environ.get("ARCHCON_IKEM_EXPECTED_PRETRAIN_TRAIN", "24")
+)
+expected_validation = int(
+    os.environ.get("ARCHCON_IKEM_EXPECTED_PRETRAIN_VALIDATION", "6")
+)
+expected_geo_train = 10_522
+expected_validation_donors = {"D076", "D097", "D184", "D204"}
+expected_validation_samples = {
+    "D076_L", "D076_P", "D097_L", "D097_P", "D184_P", "D204_L"
+}
+expected_related_samples = {"D006_L", "D037_P", "D106_P", "D118_L"}
 
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -321,22 +404,75 @@ if len(sample_rows) != expected_samples:
 sample_ids = [normalize_id(row["sample_id"]) for row in sample_rows]
 if len(sample_ids) != len(set(sample_ids)):
     raise RuntimeError("IKEM candidate sample IDs are not unique.")
-train_rows = [row for row in sample_rows if row.get("training_role") == "train_no_measured_egfr"]
-held_rows = [row for row in sample_rows if row.get("training_role") == "held_out_measured_egfr"]
-crossing_donors = sorted(
-    {
-        row.get("donor_id", "")
-        for row in sample_rows
-        if row.get("donor_crosses_outcome_gate", "").strip().lower()
-        in {"true", "t", "1", "yes"}
-    }
-    - {""}
-)
-if len(train_rows) != expected_train or len(train_rows) + len(held_rows) != expected_samples:
+train_rows = [
+    row for row in sample_rows
+    if row.get("training_role") == "pretrain_train_no_egfr"
+]
+validation_rows = [
+    row for row in sample_rows
+    if row.get("training_role") == "pretrain_validation_no_egfr"
+]
+related_rows = [
+    row for row in sample_rows
+    if row.get("training_role") == "held_out_related_to_measured_egfr"
+]
+held_rows = [
+    row for row in sample_rows
+    if row.get("training_role") == "held_out_measured_egfr"
+]
+if (
+    len(train_rows) != expected_train
+    or len(validation_rows) != expected_validation
+    or len(train_rows) + len(validation_rows) != expected_eligible
+    or len(train_rows) + len(validation_rows) + len(related_rows) + len(held_rows)
+    != expected_samples
+    or len(train_rows) + len(validation_rows) + len(related_rows)
+    != expected_no_egfr_total
+):
     raise RuntimeError(
-        "IKEM outcome gate is inconsistent: "
-        f"train={len(train_rows)}, held_out={len(held_rows)}, expected train={expected_train}."
+        "IKEM donor-level outcome gate/split is inconsistent: "
+        f"train={len(train_rows)}, validation={len(validation_rows)}, "
+        f"related-held-out={len(related_rows)}, measured-held-out={len(held_rows)}."
     )
+
+def donor_set(rows: list[dict[str, str]]) -> set[str]:
+    return {row.get("donor_id", "").strip().upper() for row in rows} - {""}
+
+train_donors = donor_set(train_rows)
+validation_donors = donor_set(validation_rows)
+outcome_donors = donor_set([*related_rows, *held_rows])
+if (
+    train_donors & validation_donors
+    or train_donors & outcome_donors
+    or validation_donors & outcome_donors
+):
+    raise RuntimeError("IKEM donors overlap across train, validation, and eGFR-held-out roles.")
+if validation_donors != expected_validation_donors:
+    raise RuntimeError(
+        "Frozen IKEM validation donors changed: "
+        f"observed={sorted(validation_donors)}, "
+        f"expected={sorted(expected_validation_donors)}."
+    )
+validation_samples = {normalize_id(row["sample_id"]) for row in validation_rows}
+if validation_samples != expected_validation_samples:
+    raise RuntimeError(
+        "Frozen IKEM validation biopsies changed: "
+        f"observed={sorted(validation_samples)}, "
+        f"expected={sorted(expected_validation_samples)}."
+    )
+related_samples = {normalize_id(row["sample_id"]) for row in related_rows}
+if related_samples != expected_related_samples:
+    raise RuntimeError(
+        "Frozen related no-eGFR exclusions changed: "
+        f"observed={sorted(related_samples)}, expected={sorted(expected_related_samples)}."
+    )
+if any(str(row.get("pretraining_split", "")).lower() != "train" for row in train_rows):
+    raise RuntimeError("An IKEM pretraining-train row lacks split=train.")
+if any(
+    str(row.get("pretraining_split", "")).lower() != "validation"
+    for row in validation_rows
+):
+    raise RuntimeError("An IKEM pretraining-validation row lacks split=validation.")
 
 with probe_path.open(newline="", encoding="utf-8-sig") as handle:
     probe_count = sum(1 for _ in csv.DictReader(handle))
@@ -450,6 +586,49 @@ with (candidate / "ikem_rma_reference_samples.csv").open(
 ) as handle:
     ikem_train_count = sum(1 for _ in csv.DictReader(handle))
 
+def membership_sha256(namespace: str, sample_ids: list[str]) -> str:
+    values = sorted(
+        f"{namespace.upper()}:{str(sample_id).strip().upper()}"
+        for sample_id in sample_ids
+    )
+    return hashlib.sha256(("\n".join(values) + "\n").encode("utf-8")).hexdigest()
+
+def frozen_sample_id(row: dict[str, str]) -> str:
+    sample_key = str(row.get("sample_key", "")).strip()
+    if sample_key.upper().startswith("GEO:"):
+        return sample_key.split(":", 1)[1].strip().upper()
+    return str(row.get("sample_id", row.get("GSM", ""))).strip().upper()
+
+with split_path.open(newline="", encoding="utf-8-sig") as handle:
+    frozen_rows = list(csv.DictReader(handle))
+geo_train_rows = [
+    row for row in frozen_rows
+    if str(row.get("split", "")).strip().lower() == "train"
+    and (
+        str(row.get("sample_key", "")).upper().startswith("GEO:")
+        or str(row.get("sample_id", row.get("GSM", ""))).upper().startswith("GSM")
+    )
+]
+geo_train_signature = membership_sha256(
+    "GEO", [frozen_sample_id(row) for row in geo_train_rows]
+)
+ikem_train_signature = membership_sha256(
+    "SUPERVISED", [normalize_id(row["sample_id"]) for row in train_rows]
+)
+ikem_validation_signature = membership_sha256(
+    "SUPERVISED", [normalize_id(row["sample_id"]) for row in validation_rows]
+)
+if len(geo_train_rows) != expected_geo_train or geo_train_count != expected_geo_train:
+    raise RuntimeError(
+        "Frozen GEO train membership changed: "
+        f"split rows={len(geo_train_rows)}, installed rows={geo_train_count}, "
+        f"expected={expected_geo_train}."
+    )
+if ikem_train_count != expected_train:
+    raise RuntimeError(
+        f"IKEM RMA reference has {ikem_train_count} rows; expected {expected_train}."
+    )
+
 geo_provenance = {
     "format": 1,
     "method": "cel_level_train_reference_rma",
@@ -457,8 +636,11 @@ geo_provenance = {
     "created_utc": datetime.now(timezone.utc).isoformat(),
     "frozen_split": str(split_path),
     "frozen_split_sha256": sha256(split_path),
+    "fit_membership_contract": "namespaced sorted sample IDs, one ID per line",
+    "geo_train_sample_ids_sha256": geo_train_signature,
+    "ikem_train_sample_ids_sha256": ikem_train_signature,
     "output": matrix_stats(geo_store / "rma_global.npy"),
-    "fit_scope": "GEO TRAIN plus IKEM no-eGFR TRAIN arrays only",
+    "fit_scope": "GEO TRAIN plus donor-clean IKEM no-eGFR TRAIN arrays only",
     "geo_train_samples": geo_train_count,
     "ikem_no_egfr_train_samples": ikem_train_count,
     "fit_samples": geo_train_count + ikem_train_count,
@@ -468,7 +650,8 @@ geo_provenance = {
 )
 
 ikem_provenance = {
-    "format": 3,
+    "format": 4,
+    "cohort_samples": expected_samples,
     "primary_source": str(private_cel_dir),
     "public_fallback": "GSE290167",
     "public_source_url": "https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE290167",
@@ -476,11 +659,26 @@ ikem_provenance = {
     "created_utc": datetime.now(timezone.utc).isoformat(),
     "outcome_availability_source": str(egfr_table),
     "outcome_availability_source_sha256": sha256(egfr_table),
-    "outcome_gate": "train iff all of egfr_7d, egfr_3m, egfr_6m, egfr_12m are missing",
-    "outcome_gate_unit": "biopsy",
-    "train_no_measured_egfr_samples": len(train_rows),
+    "outcome_gate": (
+        "eligible only if no biopsy from the donor has any measured value among "
+        "egfr_7d, egfr_3m, egfr_6m, egfr_12m"
+    ),
+    "outcome_gate_unit": "donor",
+    "split_unit": "donor",
+    "split_seed": int(os.environ.get("ARCHCON_IKEM_SPLIT_SEED", "20260915")),
+    "validation_fraction": float(
+        os.environ.get("ARCHCON_IKEM_VALIDATION_FRACTION", "0.20")
+    ),
+    "no_measured_egfr_biopsies": expected_no_egfr_total,
+    "donor_clean_pretraining_eligible_samples": expected_eligible,
+    "pretraining_train_samples": len(train_rows),
+    "pretraining_validation_samples": len(validation_rows),
+    "related_no_egfr_held_out_samples": len(related_rows),
     "held_out_measured_egfr_samples": len(held_rows),
-    "donors_crossing_biopsy_level_outcome_gate": crossing_donors,
+    "pretraining_train_donors": sorted(train_donors),
+    "pretraining_validation_donors": sorted(validation_donors),
+    "ikem_train_sample_ids_sha256": ikem_train_signature,
+    "ikem_validation_sample_ids_sha256": ikem_validation_signature,
     "private_cel_samples": sum(row.get("cel_source") == "STADNIUK_LEGACY_CEL" for row in sample_rows),
     "public_fallback_samples": sum(row.get("cel_source") == "GSE290167" for row in sample_rows),
     "frozen_pretraining_split": str(split_path),
@@ -498,10 +696,10 @@ ikem_provenance = {
             **method_stats["rma_per_gse"],
             "algorithm": (
                 "IKEM-specific quantile target and median-polish probe effects fitted "
-                "only on biopsies without measured longitudinal eGFR; every "
-                "measured-eGFR biopsy is transformed with frozen parameters"
+                "only on donor-clean no-eGFR pretraining-TRAIN biopsies; IKEM "
+                "validation and all outcome-held-out biopsies use frozen parameters"
             ),
-            "fit_scope": "IKEM samples without measured longitudinal eGFR only",
+            "fit_scope": "IKEM donor-clean no-eGFR pretraining-TRAIN samples only",
             "reference_samples": "ikem_rma_reference_samples.csv",
             "uses_outcome_values_in_fit": False,
             "uses_outcome_availability_for_partition": True,
@@ -512,9 +710,10 @@ ikem_provenance = {
             **method_stats["rma_global"],
             "algorithm": (
                 "per-array RMA background correction followed by the frozen combined "
-                "GEO TRAIN plus IKEM no-eGFR TRAIN quantile target and probe effects"
+                "GEO TRAIN plus donor-clean IKEM no-eGFR pretraining-TRAIN "
+                "quantile target and probe effects"
             ),
-            "fit_scope": "frozen GEO TRAIN plus IKEM no-eGFR TRAIN samples only",
+            "fit_scope": "frozen GEO TRAIN plus donor-clean IKEM pretraining TRAIN only",
             "geo_train_samples": geo_train_count,
             "ikem_no_egfr_train_samples": ikem_train_count,
             "fit_samples": geo_train_count + ikem_train_count,
@@ -538,6 +737,7 @@ install_names = [
     "ikem_cel_correspondence.csv",
     "ikem_gse290167_correspondence.csv",
     "ikem_rma_reference_samples.csv",
+    "legacy_probe_correspondence.csv",
     "legacy_rma_comparison.csv",
     "preprocessing_provenance.json",
 ]
@@ -560,7 +760,11 @@ for name in install_names:
     os.replace(temporary, destination)
 
 print("Verified and installed coherent IKEM CEL matrices:", output)
-print(f"Outcome gate: {len(train_rows)} TRAIN, {len(held_rows)} HELD OUT")
+print(
+    "Donor-level roles: "
+    f"{len(train_rows)} TRAIN, {len(validation_rows)} VALIDATION, "
+    f"{len(related_rows)} RELATED HELD OUT, {len(held_rows)} eGFR HELD OUT"
+)
 if comparison["available"]:
     print(
         "Descriptive historical overlap: "

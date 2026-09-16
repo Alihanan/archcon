@@ -675,10 +675,11 @@ def split_summary_markdown(split: pd.DataFrame, source: str = "generated") -> st
         if "split_group" in split.columns
         else 0
     )
-    supervised_mask = (
-        split.get("dataset_role", pd.Series("", index=split.index))
-        .astype(str)
-        .str.contains("supervised dataset", case=False, na=False)
+    source_kind = split.get("source_kind", pd.Series("", index=split.index))
+    dataset_role = split.get("dataset_role", pd.Series("", index=split.index))
+    supervised_mask = source_kind.astype(str).str.casefold().eq("ikem") | (
+        dataset_role.astype(str)
+        .str.contains(r"IKEM|supervised dataset", case=False, na=False, regex=True)
     )
     n_supervised = int(supervised_mask.sum())
     n_geo = int(n_total - n_supervised)
@@ -688,10 +689,11 @@ def split_summary_markdown(split: pd.DataFrame, source: str = "generated") -> st
         sup_counts = split.loc[supervised_mask, "split"].astype(str).str.lower().value_counts()
         extra = (
             f"\n\nThe molecular pool contains **{n_geo:,} public GEO samples** plus "
-            f"**{n_supervised:,} supervised-dataset samples without eGFR** "
+            f"**{n_supervised:,} donor-clean IKEM samples without eGFR** "
             f"({int(sup_counts.get('train', 0))} train / "
             f"{int(sup_counts.get('validation', 0))} validation / "
-            f"{int(sup_counts.get('test', 0))} test). Samples with any eGFR are absent from this split."
+            f"{int(sup_counts.get('test', 0))} test). IKEM is split by donor, has no "
+            "molecular-test rows, and excludes every biopsy from a donor with measured eGFR."
         )
 
     return f"""
@@ -703,7 +705,7 @@ def split_summary_markdown(split: pd.DataFrame, source: str = "generated") -> st
   <div class="metric"><div class="value">{seed}</div><div class="label">seed</div></div>
 </div>
 
-**Split source:** {source}. Public GEO assignment is by **connected source-GSE component**, not by individual GSM. Related SubSeries/SuperSeries stay together. The GEO validation and test sets contain {n_val_groups:,} and {n_test_groups:,} independent study components respectively ({n_groups:,} total). Supervised-dataset samples without eGFR are split independently at the same 90/5/5 target. Test rows are held out from gradient updates, convergence checks, checkpoint selection, and the hyperparameter sweep itself.{extra}
+**Split source:** {source}. Public GEO assignment is by **connected source-GSE component**, not by individual GSM. Related SubSeries/SuperSeries stay together. The GEO validation and test sets contain {n_val_groups:,} and {n_test_groups:,} independent study components respectively ({n_groups:,} total). Donor-clean IKEM rows use the separately frozen 24-train / 6-validation donor split. GEO test rows are held out from gradient updates, convergence checks, checkpoint selection, and the hyperparameter sweep itself.{extra}
 """
 
 

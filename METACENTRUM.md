@@ -1,287 +1,328 @@
-# ArchCon 0.5.15 on MetaCentrum
+# ArchCon 0.5.16 on MetaCentrum
 
-> **0.5.8 frozen-input fix.** The supervised store may contain 42,921 probes while the GEO experiment uses 42,917, and the Stadniuk-rescaled GEO store may contain the same 42,917 probes in a different native column order. ArchCon now resolves **all** of those mappings exactly once during sweep generation by probe ID, freezes method-specific GEO row and column arrays, writes the outcome-blind supervised subset into one canonical 42,917-probe space, and freezes final train/validation/test logical row arrays. Generated jobs only read those prepared artifacts. Persistent `latest.pt`/`best.pt` checkpointing from 0.5.6 is unchanged.
+This is the final-paper, donor-separated workflow. It preserves the existing GEO split and
+changes only the IKEM eligibility/role contract, the preprocessing products that depend on those
+IKEM roles, and the models selected with the new target-domain validation signal.
 
+## Frozen paper contract
 
-This release uses one fixed **molecular ~90/5/5 train/validation/test split** across all preprocessing/model combinations. GEO rows are grouped by connected GSE component. Supervised-dataset rows without eGFR are independently assigned using the same target fractions. Every sample with eGFR is kept outside molecular pretraining and reserved for downstream evaluation.
+| Domain | Train | Validation | Test | Split unit |
+|---|---:|---:|---:|---|
+| GEO | 10,522 | 585 | 584 | connected source-GSE component |
+| IKEM, donor-clean and no eGFR | 24 | 6 | 0 | donor, stratified by L/P biopsy pattern |
+| Combined molecular rows | 10,546 | 591 | 584 | as above |
 
-The default CPU sweep contains **1,440 runs**: for each of three preprocessing arms there are 360 Stadniuk-MLP configurations (180 at dropout 0.1 and 180 at dropout 0) and 120 ResNet-LN configurations. Both MSE and masked-MSE objectives are tested. Every PBS subjob uses one CPU and executes its own readable `jobs/run_XXXX.py`. The former Stadniuk rescaling arm is replaced by per-dataset standardization. The legacy-named global-RMA arm requires a reference fitted only on the frozen GEO training rows.
+IKEM eligibility is determined before splitting: if either biopsy from a donor has any finite
+value in `egfr_7d`, `egfr_3m`, `egfr_6m`, or `egfr_12m`, every biopsy from that donor is excluded
+from molecular pretraining. In the canonical 288-biopsy cohort this gives:
 
-## 1. Data already on MetaCentrum
+- 254 biopsies with measured eGFR, held out;
+- four no-eGFR siblings of measured-eGFR biopsies, held out: `D006_L`, `D037_P`, `D106_P`,
+  `D118_L`;
+- 30 donor-clean no-eGFR biopsies, all used: 24 train and six validation;
+- validation donors `D076`, `D097`, `D184`, and `D204`, giving samples `D076_L`, `D076_P`,
+  `D097_L`, `D097_P`, `D184_P`, and `D204_L`.
 
-Your persistent project directory is:
+The IKEM split is deterministic with seed `20260915` and validation fraction `0.20`. The software
+fails closed if any canonical count, donor, sample, role, or membership hash changes.
+
+Checkpoint and hyperparameter selection occurs separately inside each of the six
+preprocessing×architecture groups. The predeclared score is
 
 ```text
-/storage/praha1/home/anuarali/DP/ARCHCON
+0.50 × GEO clean-validation MSE
++ 0.50 × donor-balanced IKEM clean-validation MSE
 ```
 
-Keep the transferred data here:
+The IKEM term first averages probes within a biopsy, then biopsies within a donor, then the four
+donors. The 584 GEO test rows are evaluated only after the six winners are frozen. eGFR outcomes
+never choose an encoder; downstream CV reports all six fixed encoders as separate analyses.
+
+## 1. Project and input layout
+
+The examples assume:
 
 ```text
-/storage/praha1/home/anuarali/DP/ARCHCON/data/GEO_NUMPY_STORE/
+/storage/brno2/home/anuarali/DP/ARCHCON/
+├── .venv/
+├── scripts/
+├── data/
+│   ├── GEO_NUMPY_STORE/
+│   ├── GEO_DWNLD/
+│   ├── GEO_DWNLD_TRAIN_REFERENCE_REBUILD/
+│   ├── IKEM_CEL/STADNIUK_LEGACY_CEL/
+│   ├── IKEM_NUMPY_STORE/                 # historical; left untouched
+│   ├── common_probes.pkl
+│   ├── sample_metadata.csv
+│   ├── egfr_data.xlsx
+│   └── Klasifikator_20_3_24_v2.xlsx
+└── sweeps/
 ```
 
-The sweep reads `GEO_NUMPY_STORE/raw_original.npy`, `GEO_NUMPY_STORE/rma_per_gse.npy`, the corrected `GEO_NUMPY_STORE/rma_global.npy`, and `IKEM_NUMPY_STORE/expression.npy`. Sweep generation freezes per-dataset standardization parameters and all sample/probe mappings. After generating the sweep, run `archcon-rebuild-global-normalization --data-dir DATA --sweep-root SWEEP --replace` unless the exact CEL rebuild has already installed a matching train-reference global matrix.
+`sample_metadata.csv` must contain all 288 canonical biopsy IDs. The private-CEL directory may
+contain all available original Stadniuk CELs; for canonical samples without a private CEL, the R
+pipeline uses the matching public GSE290167 CEL. The classifier workbook is used only to
+cross-check identities. Numeric eGFR values are read only to form the donor-level availability
+gate and never enter normalization or autoencoder fitting.
 
-Install ArchCon 0.5.12 first, then rebuild and replace the contaminated matrix:
+The final coherent 288-row output is installed into `data/IKEM_CEL_NUMPY_STORE/`. The historical
+`IKEM_NUMPY_STORE/` is retained for audit comparison and is never overwritten.
 
-```bash
-/storage/praha1/home/anuarali/DP/ARCHCON/.venv/bin/archcon-rebuild-global-normalization \
-  --data-dir /storage/praha1/home/anuarali/DP/ARCHCON/data \
-  --sweep-root /storage/praha1/home/anuarali/DP/ARCHCON/sweeps/archcon-pretrain-058 \
-  --replace
-```
+## 2. Build and install 0.5.16
 
-The replacement is atomic and the old matrix receives a timestamped
-`rma_global.all_samples_backup_*.npy` name. The command also removes the stale
-row-major training cache and writes `rma_global_provenance.json`; Global-RMA jobs refuse to
-start unless that provenance matches the sweep's frozen `prepared/sample_index.csv`.
-
-## 2. Build 0.5.12 locally
-
-From the 0.5.12 source root on your workstation:
+Build into a version-specific directory so older distributions need not be deleted:
 
 ```bash
+cd /path/to/archcon
 source .venv/bin/activate
 python -m pip install --upgrade build
-rm -rf build dist
-python -m build
-python scripts/verify_wheel.py dist/archcon-0.5.12-py3-none-any.whl
+python -m build --outdir dist-0516
+python -m zipfile -l dist-0516/archcon-0.5.16-py3-none-any.whl \
+  | grep 'archcon/data/training_sources.py'
 ```
 
-Expected artifacts:
-
-```text
-dist/archcon-0.5.12-py3-none-any.whl
-dist/archcon-0.5.12.tar.gz
-```
-
-Upload them without touching the already transferred data:
+Copy the wheel and updated `scripts/` directory to MetaCentrum, then install into the existing
+CPU-PyTorch environment:
 
 ```bash
-rsync -avhP dist/archcon-0.5.12-py3-none-any.whl dist/archcon-0.5.12.tar.gz \
-  anuarali@storage-praha1.metacentrum.cz:~/DP/ARCHCON/
-```
-
-## 3. Install into the existing CPU-PyTorch venv
-
-On MetaCentrum:
-
-```bash
-cd /storage/praha1/home/anuarali/DP/ARCHCON
+cd /storage/brno2/home/anuarali/DP/ARCHCON
 source .venv/bin/activate
-python --version
-python -c 'import torch; print(torch.__version__, torch.cuda.is_available())'
-python -m pip install --upgrade ./archcon-0.5.12-py3-none-any.whl
+python -m pip install --upgrade ./archcon-0.5.16-py3-none-any.whl
 python -m pip show archcon
+python -c 'import torch; print(torch.__version__, torch.cuda.is_available())'
 ```
 
-The environment must use Python >= 3.10. `CUDA: False` is expected for this CPU sweep.
+Python 3.9 or newer is required. `CUDA: False` is expected for the CPU sweep.
 
-## 4. Generate the corrected split and sweep locally
+The R rebuild needs `affxparser`, `preprocessCore`, `rhdf5`, `R.utils`, and `readxl` in the
+configured MetaCentrum R library.
 
-Start the 0.5.12 web UI against your local `data/` directory. In **05 · Split**, keep seed 42. ArchCon now assigns complete connected source-GSE components to approximately:
+## 3. Rebuild only data products affected by IKEM membership
 
-```text
-train       90%
-validation   5%
-test         5%
+The rebuild needs the already frozen GEO membership. For the first 0.5.16 bootstrap, point it at
+the preceding sweep's `prepared/sample_index.csv`; the wrapper immediately filters that file to
+GEO rows and asserts the exact 10,522/585/584 counts. Old IKEM assignments in that file are
+ignored. If a valid 0.5.16 sweep already exists, it can be used instead.
+
+```bash
+cd /storage/brno2/home/anuarali/DP/ARCHCON
+
+qsub \
+  -v ARCHCON_PROJECT_ROOT=/storage/brno2/home/anuarali/DP/ARCHCON,ARCHCON_SWEEP_ROOT=/storage/brno2/home/anuarali/DP/ARCHCON/sweeps/archcon-pretrain-0515 \
+  scripts/metacentrum_rebuild_geo_rma.pbs.sh
 ```
 
-The exact sample fractions can differ slightly because whole GSE components are indivisible. Save/export that exact split once.
+For a parallel Phase-3 run, override both the PBS allocation and worker count, for example:
 
-For command-line generation on MetaCentrum, use the data layout explicitly. This is important because generation itself freezes the probe alignment and final row indices:
+```bash
+qsub \
+  -l select=1:ncpus=8:mem=128gb:scratch_local=1gb \
+  -v ARCHCON_PROJECT_ROOT=/storage/brno2/home/anuarali/DP/ARCHCON,ARCHCON_SWEEP_ROOT=/storage/brno2/home/anuarali/DP/ARCHCON/sweeps/archcon-pretrain-0515,ARCHCON_RMA_CPUS=8 \
+  scripts/metacentrum_rebuild_geo_rma.pbs.sh
+```
+
+The wrapper is resumable. Its signatures deliberately preserve unaffected work:
+
+| Artifact | Reused? | Reason |
+|---|---|---|
+| downloaded GEO archives and validated TAR markers | yes | GEO membership is unchanged |
+| per-GSE raw PM summaries and per-GSE RMA matrices | yes | no IKEM sample participates |
+| final `raw_original.npy` and `rma_per_gse.npy` GEO matrices | yes | no IKEM-dependent fit |
+| IKEM raw PM extraction | yes when CEL/metadata signatures match | sample-level CEL work is cached |
+| IKEM-local RMA target/effects and transforms | recomputed as needed | reference is now exactly 24 IKEM train biopsies |
+| combined global target, probe effects, and `rma_global.npy` | recomputed | the 24-member IKEM contribution changed |
+
+Changing only IKEM roles cannot preserve the old global matrix: the paper's global arm fits one
+reference on 10,522 GEO training CELs plus 24 IKEM training CELs. A different IKEM training set
+changes the quantile target and probe effects, so every global transform is mathematically
+affected. The script invalidates only those combined-reference products; it does not redownload
+or redo per-GSE work.
+
+Rerun the same `qsub` command after interruption. Completion markers and block checkpoints make
+the pipeline continue from the last compatible unit rather than restart.
+
+After completion, verify the installed roles:
+
+```bash
+python - <<'PY'
+from pathlib import Path
+import pandas as pd
+
+root = Path('/storage/brno2/home/anuarali/DP/ARCHCON/data/IKEM_CEL_NUMPY_STORE')
+rows = pd.read_csv(root / 'sample_index.csv')
+print(rows['training_role'].value_counts())
+print(sorted(rows.loc[rows['pretraining_split'].eq('validation'), 'sample_id']))
+assert rows['training_role'].value_counts().to_dict() == {
+    'held_out_measured_egfr': 254,
+    'pretrain_train_no_egfr': 24,
+    'pretrain_validation_no_egfr': 6,
+    'held_out_related_to_measured_egfr': 4,
+}
+assert sorted(rows.loc[rows['pretraining_split'].eq('validation'), 'sample_id']) == [
+    'D076_L', 'D076_P', 'D097_L', 'D097_P', 'D184_P', 'D204_L'
+]
+PY
+```
+
+## 4. Generate a new final-paper sweep
+
+Do not regenerate the old sweep directory: its checkpoints used different IKEM training and
+validation membership and a different checkpoint-selection rule. Keep it as an audit archive and
+create `archcon-pretrain-0516`.
 
 ```python
 from pathlib import Path
-from archcon.batch import build_run_request, generate_sweep_bundle, recommended_comparison_grid_json
+
+from archcon.batch import (
+    build_run_request,
+    generate_sweep_bundle,
+    recommended_comparison_grid_json,
+)
 from archcon.data.defaults import project_data_layout
 from archcon.data.training import TrainingConfig
 from archcon.data.training_sources import create_shared_preprocessing_split
 
-ROOT = Path("/storage/praha1/home/anuarali/DP/ARCHCON")
-DATA = ROOT / "data"
+ROOT = Path('/storage/brno2/home/anuarali/DP/ARCHCON')
+DATA = ROOT / 'data'
 layout = project_data_layout(DATA)
+
 split = create_shared_preprocessing_split(
-    layout, seed=42, train_fraction=0.90, validation_fraction=0.05
+    layout,
+    seed=42,
+    train_fraction=0.90,
+    validation_fraction=0.05,
 )
 base = build_run_request(
-    method="Per-dataset RMA", split_seed=42, train_fraction=0.90,
-    validation_fraction=0.05, training=TrainingConfig()
+    method='Per-dataset RMA',
+    split_seed=42,
+    train_fraction=0.90,
+    validation_fraction=0.05,
+    training=TrainingConfig(),
 )
-generate_sweep_bundle(
+result = generate_sweep_bundle(
     base_request=base,
     grid_text=recommended_comparison_grid_json(),
-    destination_root=ROOT / "sweeps",
-    sweep_name="archcon-pretrain-057",
-    project_dir=str(ROOT), data_dir=str(DATA),
-    python_executable=str(ROOT / ".venv/bin/python"),
-    ncpus=1, memory="10gb", scratch="4gb", walltime="96:00:00", ngpus=0,
+    destination_root=ROOT / 'sweeps',
+    sweep_name='archcon-pretrain-0516',
+    project_dir=str(ROOT),
+    data_dir=str(DATA),
+    python_executable=str(ROOT / '.venv/bin/python'),
+    ncpus=1,
+    memory='10gb',
+    scratch='4gb',
+    walltime='24:00:00',
+    ngpus=0,
     split_frame=split,
     data_layout=layout,
 )
+print(result)
 ```
 
-The important argument is `data_layout=layout`: before any `run_XXXX.py` executes, ArchCon writes `prepared/train_rows.npy`, `validation_rows.npy`, `test_rows.npy`, method-specific GEO row **and probe-column** maps, and a 42,917-column `supervised_no_egfr_common.npy`.
+Generation freezes all data-dependent decisions in `prepared/`. Before any job is written it
+recomputes the donor gate from `egfr_data.xlsx`, compares it with the R-produced role manifest,
+checks exact membership hashes/provenance, aligns probes, materializes only the 30 eligible IKEM
+rows for each preprocessing arm, and writes the final integer row arrays. Generated jobs never
+reclassify outcomes or recompute a split.
 
-In **06 · Molecular AE → Headless / MetaCentrum sweep export**, use:
+Expected prepared counts are 10,546 train, 591 validation, and 584 test. `prepared.json` records
+24/6 IKEM membership and the 50/50 selection policy.
 
-```text
-Project directory: /storage/praha1/home/anuarali/DP/ARCHCON
-Data directory:    /storage/praha1/home/anuarali/DP/ARCHCON/data
-Python executable: /storage/praha1/home/anuarali/DP/ARCHCON/.venv/bin/python
-PBS CPUs:          1
-PBS RAM:           10gb
-PBS scratch:       4gb
-PBS walltime:      48:00:00
-PBS GPUs:          0
-```
+## 5. Preflight and submit
 
-The generated directory contains:
-
-```text
-archcon-pretrain/
-├── jobs/
-│   ├── run_0001.py
-│   └── ... run_1440.py
-├── configs/
-│   ├── run_0001.json
-│   └── ... run_1440.json
-├── split.csv
-├── prepared/
-│   ├── prepared.json
-│   ├── sample_index.csv
-│   ├── probe_index.csv
-│   ├── train_rows.npy
-│   ├── validation_rows.npy
-│   ├── test_rows.npy
-│   ├── supervised_no_egfr_common.npy
-│   ├── geo_rows_stadniuk.npy
-│   ├── geo_columns_stadniuk.npy
-│   ├── geo_rows_per_gse_rma.npy
-│   ├── geo_columns_per_gse_rma.npy
-│   ├── geo_rows_global_rma.npy
-│   └── geo_columns_global_rma.npy
-├── manifest.csv
-├── run_array.pbs.sh
-├── submit.sh
-└── README.txt
-```
-
-Each Python job states the exact architecture, loss, L2, optimizer, cosine scheduler, batch size, seed, and split policy. **No job computes or modifies the data split.** `prepared/train_rows.npy`, `validation_rows.npy`, and `test_rows.npy` are the final logical indices created once during sweep generation. Jobs merely memory-map the selected GEO matrix, the already aligned `supervised_no_egfr_common.npy`, the saved method-specific GEO row/column maps, and those integer index arrays. Only train and validation rows are passed to PyTorch.
-
-## 5. Copy the sweep
-
-From the local machine:
+Run one generated job inside an interactive PBS allocation:
 
 ```bash
-rsync -avhP archcon-pretrain/ \
-  anuarali@storage-praha1.metacentrum.cz:~/DP/ARCHCON/sweep/
-```
-
-## 6. Preflight one job
-
-Inside an interactive PBS job:
-
-```bash
-cd /storage/praha1/home/anuarali/DP/ARCHCON
+cd /storage/brno2/home/anuarali/DP/ARCHCON
 source .venv/bin/activate
 
-export OMP_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export OPENBLAS_NUM_THREADS=1
-export NUMEXPR_NUM_THREADS=1
-export ARCHCON_CPU_THREADS=1
-
-.venv/bin/python sweep/jobs/run_0001.py \
-  --data-dir /storage/praha1/home/anuarali/DP/ARCHCON/data \
-  --output-root /storage/praha1/home/anuarali/DP/ARCHCON/test-results
+.venv/bin/python sweeps/archcon-pretrain-0516/jobs/run_0001.py \
+  --data-dir data \
+  --output-root sweeps/archcon-pretrain-0516/preflight-results
 ```
 
-The startup log should report `Train/validation/test: ...` and state that samples with eGFR are excluded from molecular pretraining.
+The startup output must report 10,546/591/584 rows and six IKEM validation samples from four
+donors. During training, `best.pt` is replaced only when the 50/50 validation score improves;
+learning-rate plateau detection and convergence use that same score.
 
-## 7. Submit the array
-
-After the preflight succeeds:
+Submit the full 1,440-run CPU grid:
 
 ```bash
-cd /storage/praha1/home/anuarali/DP/ARCHCON/sweep
+cd /storage/brno2/home/anuarali/DP/ARCHCON/sweeps/archcon-pretrain-0516
 ./submit.sh
 qstat -t
 ```
 
-`submit.sh` creates a randomized list of unfinished indices and submits that list as an array.
+Each array job stages only its selected GEO matrix, one small method-matched IKEM matrix, frozen
+mappings, job, and checkpoints under `SCRATCHDIR`. Training has a 23-hour timeout inside the
+24-hour PBS allocation. Complete checkpoints and small provenance files are copied atomically to
+the persistent `results/run_XXXX/` directory. Resubmitting with `./submit.sh` randomizes and
+submits only unfinished run indices.
 
-## Persistent epoch checkpoints
+Old checkpoints cannot be reused as final-paper results: both their molecular training rows and
+their validation/checkpoint criterion differ. Within the new sweep, `latest.pt` resumes only when
+the exact matrix, train/validation row arrays, validation domains, and IKEM donor IDs match.
 
-Version 0.5.12 retains the 0.5.6 rule that model checkpoints are never staged in a hidden `.run_XXXX.work` directory. The PBS wrapper creates `results/run_XXXX/` **before training starts**. At the end of every completed epoch, ArchCon atomically replaces:
+## 6. Validation diagnostics and final evaluation
 
-```text
-results/run_XXXX/latest.pt
-```
-
-Whenever validation improves it also updates:
-
-```text
-results/run_XXXX/best.pt
-```
-
-The Python job, selected data matrix, prepared inputs, Torch caches, and `.pt` checkpoints all remain under `SCRATCHDIR` while training. The launcher stops Python after 23 hours inside a 24-hour PBS allocation, then atomically copies complete checkpoints and small provenance files to `praha1`.
-
-## 8. Expanded grid
-
-For **each preprocessing arm** (`Per-dataset standardization`, `Per-dataset RMA`, `Global RMA`):
-
-Stadniuk MLP: 360 model configurations (180 at dropout 0.1 and 180 at dropout 0).
-
-```text
-hidden widths       5: 256 / 256→64 / 256→128→64 / 256→192→128→64 / 256→224→192→128→64
-latent dim          3: 3 / 8 / 16
-objective           2: MSE / masked MSE
-explicit L2         3: 0 / 1e-5 / 1e-4
-BatchNorm           2: off / on
-```
-
-ResNet-LN: 120 model configurations.
-
-```text
-hidden widths       5: same five profiles
-latent dim          3: 3 / 8 / 16
-objective           2: MSE / masked MSE
-residual blocks     2: 1 / 2 per stage
-FFN expansion       2: 2x / 4x
-LayerNorm           fixed on
-```
-
-Per preprocessing: **480**. Across three preprocessings: **1,440** jobs total.
-
-The autoencoders train only on molecular train rows and select checkpoints on molecular validation rows. The downstream group-selection stage pools the former molecular validation+test rows within each preprocessing×architecture group before nested donor-grouped eGFR CV. All supervised samples with eGFR remain outside pretraining. The global and IKEM-standardization references are frozen without eGFR outcomes, and their provenance must match the sweep.
-
-## 9. Frozen z and clinical-baseline eGFR evaluation
-
-After validation has selected the final checkpoint and its one-time frozen test evaluation is
-recorded, run the downstream stage from the project root:
+While the sweep is incomplete, validation-only diagnostics are allowed:
 
 ```bash
-cd /storage/praha1/home/anuarali/DP/ARCHCON
-source .venv/bin/activate
-
 archcon-evaluate-egfr \
-  --sweep-root sweeps/archcon-pretrain-058 \
+  --sweep-root sweeps/archcon-pretrain-0516 \
+  --data-dir data \
+  --allow-incomplete-sweep
+```
+
+This mode writes current molecular-validation scores and stops before touching GEO test or eGFR.
+Add `--include-running-checkpoints` only when explicitly inspecting best-so-far snapshots.
+
+After all 1,440 run summaries are complete, run the final workflow without the incomplete flag:
+
+```bash
+archcon-evaluate-egfr \
+  --sweep-root sweeps/archcon-pretrain-0516 \
   --data-dir data
 ```
 
-The script never ranks encoders by test performance. It scans `best.pt`, selects by clean
-validation MSE, aligns the complete supervised cohort using `prepared/probe_index.csv`, and
-computes z before loading eGFR. It also selects the best non-Stadniuk checkpoint by validation
-MSE when one is available. With a non-Stadniuk overall winner, the best Stadniuk checkpoint is
-used as the architecture comparator instead.
+The command:
 
-The default R/lme4 evaluation is 5 repeats × 5 folds. Folds are grouped by donor, categorical
-time is a fixed effect, and patient is a random intercept. Alongside time-only, z, and PCA, the
-command fits KDRI, donor-age, cold-ischemia, and combined-clinical trajectory baselines. It also
-fits matched KDRI/full-clinical models augmented with winner z or PCA. KDRI_8 stratifies folds
-when enough donor groups exist in every quartile; otherwise the script falls back to shuffled
-donor folds. PCA, every z standardization, and clinical median imputation/standardization are
-trained within each fold. Use `--no-clinical` for the former molecular-only model set. Install the
-R package `lme4` in advance; the script does not attempt a network installation inside a batch job.
+1. verifies the saved 50/50 validation score and role provenance for every completed checkpoint;
+2. freezes one winner in each of the six preprocessing×architecture groups;
+3. evaluates the 584 GEO test rows for those six winners only;
+4. creates method-matched IKEM embeddings without refitting on eGFR samples;
+5. evaluates every fixed encoder with 5×5 repeated donor-grouped eGFR CV, matched fold-fitted PCA,
+   KDRI, donor-age, cold-ischemia, and combined-clinical baselines.
+
+No eGFR-derived encoder rank or deployment winner is written. Fold-level uncertainty and matched
+baseline gains are descriptive for each pre-frozen encoder.
+
+If the long R/lme4 phase is interrupted after its design files have been created, resume it as a
+separate MetaCentrum job:
+
+```bash
+qsub scripts/metacentrum_run_saved_egfr_mixed_models.pbs.sh
+```
+
+The launcher stages any existing `fixed_fold_metrics.csv` and `fixed_oof_predictions.csv`, and the
+R helper skips complete `fit_id` values. Partial results are copied back on timeout or failure.
+
+Final outputs are under
+`sweeps/archcon-pretrain-0516/downstream/molecular_egfr/`, including:
+
+```text
+molecular_selection/
+├── molecular_selection_scores.csv
+└── molecular_group_winners.csv
+embeddings/
+├── embeddings.csv
+├── embeddings.npz
+├── candidate_<preprocessing>_<architecture>_z.npy
+└── metadata.json
+mixed_models/
+├── fixed_fold_metrics.csv
+├── fixed_oof_predictions.csv
+├── fold_metrics_with_deltas.csv
+├── all_model_cv_summary.csv
+├── fixed_encoder_cv_summary.csv
+└── fixed_encoder_comparisons.csv
+```

@@ -40,9 +40,11 @@ from .data.training_sources import (
     create_shared_preprocessing_split,
     load_prepared_pretraining_source,
     load_prepared_split_rows,
+    load_prepared_validation_partition,
     load_pretraining_source,
     prepare_pretraining_assets,
     split_rows_for_source,
+    validation_partition_from_split,
 )
 from .data.training import (
     TrainingConfig,
@@ -50,7 +52,7 @@ from .data.training import (
     train_autoencoder_stream,
 )
 
-RUN_CONFIG_FORMAT = 4
+RUN_CONFIG_FORMAT = 5
 _SWEEP_MAX_RUNS = 10_000
 
 _LOSS_ALIASES = {
@@ -226,8 +228,8 @@ def preprocessing_policy(method: str) -> str:
         )
     if method == METHOD_GLOBAL_RMA:
         return (
-            "legacy-named Global RMA arm; train-reference quantile normalization fitted only "
-            "on frozen GEO training rows from probe-set PM medians; not exact CEL-level RMA"
+            "exact CEL-level global RMA; target and probe effects fitted only on the frozen "
+            "10,522 GEO plus 24 donor-clean IKEM training CELs, then applied unchanged"
         )
     if method == METHOD_PER_DATASET_STANDARDIZED:
         return (
@@ -266,10 +268,14 @@ def build_run_request(
         "train_fraction": float(train_fraction),
         "validation_fraction": float(validation_fraction),
         "test_fraction": float(test_fraction),
-        "split_unit": "connected source-GSE component + outcome-blind supervised sample",
+        "split_unit": "GEO connected component + IKEM donor",
         "test_policy": "held out from training, convergence checks, checkpoint selection, and sweep ranking",
-        "molecular_pretraining_data": "public GEO plus supervised-dataset samples without eGFR",
-        "supervised_outcome_policy": "samples with any eGFR remain completely excluded from molecular pretraining",
+        "molecular_pretraining_data": (
+            "public GEO plus 30 donor-clean IKEM samples: 24 train / 6 validation"
+        ),
+        "supervised_outcome_policy": (
+            "every biopsy from a donor with any finite eGFR remains excluded from pretraining"
+        ),
         "preprocessing_policy": preprocessing_policy(method),
         "training": training_config_dict(training),
     }
@@ -344,8 +350,9 @@ def run_training_request(
             prepared_source = source.parent / prepared_source
         training_source = load_prepared_pretraining_source(layout, method, prepared_source)
         train_rows, validation_rows, test_rows = load_prepared_split_rows(prepared_source)
+        validation_partition = load_prepared_validation_partition(prepared_source)
     else:
-        # Legacy single-run compatibility only. Generated 0.5.15 sweeps always
+        # Legacy single-run compatibility only. Generated 0.5.16 sweeps always
         # contain prepared_dir and never execute this branch.
         training_source = load_pretraining_source(layout, method)
         split_file = request.get("split_file")
@@ -365,6 +372,7 @@ def run_training_request(
         train_rows, validation_rows, test_rows = split_rows_for_source(
             split, training_source, include_test=True
         )
+        validation_partition = validation_partition_from_split(split)
     matrix = training_source.matrix
     root = (
         Path(output_root).expanduser().resolve()
@@ -382,6 +390,12 @@ def run_training_request(
         config,
         root,
         method=method,
+        validation_domains=(
+            validation_partition.domains if validation_partition is not None else None
+        ),
+        validation_donor_ids=(
+            validation_partition.donor_ids if validation_partition is not None else None
+        ),
     ):
         final = update
         if update.epoch != last_epoch or update.done:
@@ -431,7 +445,8 @@ def write_run_summary(
     (run_dir / "run_request.json").write_text(
         json.dumps(request_copy, indent=2, ensure_ascii=False), encoding="utf-8"
     )
-    best_index = int(np.argmin(final.val_loss)) if final.val_loss else None
+    best_values = final.selection_score if final.selection_score else final.val_loss
+    best_index = int(np.argmin(best_values)) if best_values else None
     summary = {
         "run_id": final.run_id,
         "status": final.status,
@@ -445,9 +460,33 @@ def write_run_summary(
         "n_validation": int(len(validation_rows)),
         "n_test": int(len(test_rows)) if test_rows is not None else 0,
         "geo_test_used": False,
-        "ikem_diagnostic": False,
-        "best_geo_validation_epoch": (
+        "validation_selection_policy": (
+            "50% GEO clean MSE + 50% donor-balanced IKEM clean MSE"
+            if final.selection_score
+            else "validation objective"
+        ),
+        "geo_test_used_for_selection": False,
+        "best_molecular_validation_epoch": (
             int(final.val_epoch[best_index]) if best_index is not None else None
+        ),
+        "best_molecular_validation_score": (
+            float(best_values[best_index]) if best_index is not None else None
+        ),
+        "best_geo_validation_mse": (
+            float(final.geo_mse[best_index])
+            if best_index is not None and len(final.geo_mse) == len(best_values)
+            else None
+        ),
+        "best_ikem_validation_donor_balanced_mse": (
+            float(final.ikem_mse[best_index])
+            if best_index is not None and len(final.ikem_mse) == len(best_values)
+            else None
+        ),
+        "best_ikem_validation_donor_mse_sd": (
+            float(final.ikem_mse_donor_sd[best_index])
+            if best_index is not None
+            and len(final.ikem_mse_donor_sd) == len(best_values)
+            else None
         ),
         "config_path": str(source_config),
         "data_dir": str(Path(data_root).expanduser().resolve()),
@@ -660,9 +699,9 @@ def generated_job_python(
         f"Convergence: max relative validation Δ <= {config.convergence_tolerance} over {config.convergence_window} validations, only at LR floor",
         f"Max epochs: {config.epochs}",
         f"Seed: {config.seed}",
-        "Split: frozen once at sweep generation · GEO connected GSEs + supervised no-eGFR samples · approximately 90/5/5",
+        "Split: GEO connected-study 90/5/5 + donor-clean IKEM 80/20 train/validation (no IKEM test)",
         "Test: held out from neural training/ranking and not evaluated by sweep jobs",
-        "Supervised samples with eGFR: completely excluded from molecular pretraining",
+        "IKEM donors with any finite eGFR: every biopsy excluded from molecular pretraining",
         '"""',
     ]
     imports = [
@@ -684,6 +723,7 @@ def generated_job_python(
         "from archcon.data.training_sources import (",
         "    load_prepared_pretraining_source,",
         "    load_prepared_split_rows,",
+        "    load_prepared_validation_partition,",
         ")",
         "",
         f"JOB_INDEX = {int(index)}",
@@ -749,15 +789,16 @@ def generated_job_python(
         "    layout = project_data_layout(data_dir)",
         "    method = str(RUN_REQUEST['method'])",
         "",
-        "    # 0.5.15 batch policy: preprocessing identities, 42,917-probe alignment,",
-        "    # supervised eligibility, and final split rows were frozen once when",
+        "    # 0.5.16 paper policy: preprocessing identities, donor-safe IKEM roles,",
+        "    # 42,917-probe alignment, and final split rows were frozen once when",
         "    # the sweep was generated. A job only mmaps those prepared artifacts.",
         "    prepared_rel = RUN_REQUEST.get('prepared_dir')",
         "    if not prepared_rel:",
-        "        raise RuntimeError('Sweep has no frozen prepared_dir; regenerate it with ArchCon 0.5.15.')",
+        "        raise RuntimeError('Sweep has no frozen prepared_dir; regenerate it with ArchCon 0.5.16.')",
         "    prepared_dir = (Path(__file__).resolve().parent / str(prepared_rel)).resolve()",
         "    training_source = load_prepared_pretraining_source(layout, method, prepared_dir)",
         "    train_rows, validation_rows, test_rows = load_prepared_split_rows(prepared_dir)",
+        "    validation_partition = load_prepared_validation_partition(prepared_dir)",
         "    if int(training_source.matrix.shape[1]) != EXPECTED_INPUT_DIM:",
         "        raise ValueError(",
         "            f'{method} has {training_source.matrix.shape[1]} probes; expected {EXPECTED_INPUT_DIM}.'",
@@ -766,8 +807,13 @@ def generated_job_python(
         "    print(f'Job {JOB_INDEX:04d} · {BRANCH}')",
         "    print(f'Preprocessing: {method}')",
         "    print(f'Train/validation/test: {len(train_rows)}/{len(validation_rows)}/{len(test_rows)}')",
+        "    print(",
+        "        'Validation domains: '",
+        "        f'{validation_partition.n_geo} GEO + {validation_partition.n_ikem} IKEM '",
+        "        f'({validation_partition.n_ikem_donors} donors); 50/50 domain weighting'",
+        "    )",
         "    print('Test policy: BLINDED during training and sweep selection')",
-        "    print('Supervised outcome policy: any sample with eGFR is excluded from molecular pretraining')",
+        "    print('IKEM outcome policy: every biopsy from a donor with finite eGFR is excluded')",
         "    print(TRAINING_CONFIG)",
         "",
         "    final = None",
@@ -779,6 +825,8 @@ def generated_job_python(
         "        TRAINING_CONFIG,",
         "        output_root,",
         "        method=method,",
+        "        validation_domains=validation_partition.domains,",
+        "        validation_donor_ids=validation_partition.donor_ids,",
         "        model_factory=build_job_model,",
         "        objective_function=job_objective,",
         "        optimizer_factory=build_optimizer,",
@@ -1131,12 +1179,13 @@ optimizer/scheduler, L2 penalty and all TrainingConfig values. The `prepared/` d
 only source of batch split/mapping decisions: train_rows.npy, validation_rows.npy, test_rows.npy,
 method-specific GEO row maps, and the already probe-aligned supervised-no-eGFR matrix are written
 once during sweep generation. Jobs only read those files; they never reclassify outcomes, align
-probes, remap samples, or resplit data. Outcome-bearing samples are excluded. The three GEO preprocessing arms are per-dataset standardization, independent per-study RMA,
-and the legacy-named Global RMA arm, which requires a train-reference matrix tied to this
-sweep's frozen split. `submit.sh` randomly orders unfinished runs and omits result folders that
+probes, remap samples, or resplit data. Every IKEM donor with any measured eGFR is excluded. The
+three preprocessing arms are per-dataset standardization, independent per-study RMA, and exact
+combined-reference Global RMA tied to this sweep's frozen 10,522-GEO + 24-IKEM training set.
+`submit.sh` randomly orders unfinished runs and omits result folders that
 already contain a `.pt` checkpoint. Each array element stages only its generated job, frozen
 prepared mappings, supplemental matrix, and selected expression matrix beneath node-local
-`SCRATCHDIR`. Python executes there for at most 12 hours; checkpoints and logs remain local
+`SCRATCHDIR`. Python executes there for at most 23 hours; checkpoints and logs remain local
 during training and are copied atomically to persistent `results/run_XXXX/` only after Python
 stops. The persistent virtual environment is used read-only and is not copied to every node.
 

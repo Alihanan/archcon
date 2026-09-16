@@ -97,5 +97,5 @@ def test_standalone_scripts_are_organized_under_scripts_directory() -> None:
     assert not (project_root / "run_array.pbs.sh").exists()
     assert not (project_root / "submit.sh").exists()
     assert (project_root / "scripts" / "evaluate_molecular_egfr.py").is_file()
-    assert (project_root / "scripts" / "metacentrum" / "run_array.pbs.sh").is_file()
-    assert (project_root / "scripts" / "metacentrum" / "submit.sh").is_file()
+    assert (project_root / "scripts" / "metacentrum_run_array.pbs.sh").is_file()
+    assert (project_root / "scripts" / "metacentrum_submit.sh").is_file()

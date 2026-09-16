@@ -118,6 +118,7 @@ class TrainingConfig:
     background_prefetch: bool = True
     deterministic: bool = True
     validation_every_epochs: int = 1
+    validation_geo_weight: float = 0.50
     ui_update_batches: int = 10
     latent_pca_every_epochs: int = 5
     latent_pca_max_samples: int = 2000
@@ -174,6 +175,8 @@ class TrainingConfig:
             raise ValueError(f"Unknown precision mode: {self.precision}")
         if int(self.validation_every_epochs) < 1:
             raise ValueError("validation_every_epochs must be positive.")
+        if not 0.0 < float(self.validation_geo_weight) < 1.0:
+            raise ValueError("validation_geo_weight must be in (0, 1).")
         if int(self.ui_update_batches) < 1:
             raise ValueError("ui_update_batches must be positive.")
         if int(self.latent_pca_every_epochs) < 1:
@@ -231,8 +234,12 @@ class TrainingUpdate:
     val_mse: list[float] = field(default_factory=list)
     val_r2: list[float] = field(default_factory=list)
     val_aux: list[float] = field(default_factory=list)
+    selection_score: list[float] = field(default_factory=list)
+    geo_mse: list[float] = field(default_factory=list)
+    geo_r2: list[float] = field(default_factory=list)
     ikem_mse: list[float] = field(default_factory=list)
     ikem_r2: list[float] = field(default_factory=list)
+    ikem_mse_donor_sd: list[float] = field(default_factory=list)
     aux_label: str | None = None
     learning_rates: list[float] = field(default_factory=list)
     latent_pca: np.ndarray | None = None
@@ -252,8 +259,12 @@ class _History:
     val_mse: list[float] = field(default_factory=list)
     val_r2: list[float] = field(default_factory=list)
     val_aux: list[float] = field(default_factory=list)
+    selection_score: list[float] = field(default_factory=list)
+    geo_mse: list[float] = field(default_factory=list)
+    geo_r2: list[float] = field(default_factory=list)
     ikem_mse: list[float] = field(default_factory=list)
     ikem_r2: list[float] = field(default_factory=list)
+    ikem_mse_donor_sd: list[float] = field(default_factory=list)
     aux_label: str | None = None
     learning_rates: list[float] = field(default_factory=list)
 
@@ -268,8 +279,12 @@ class _History:
             "val_mse": list(self.val_mse),
             "val_r2": list(self.val_r2),
             "val_aux": list(self.val_aux),
+            "selection_score": list(self.selection_score),
+            "geo_mse": list(self.geo_mse),
+            "geo_r2": list(self.geo_r2),
             "ikem_mse": list(self.ikem_mse),
             "ikem_r2": list(self.ikem_r2),
+            "ikem_mse_donor_sd": list(self.ikem_mse_donor_sd),
             "aux_label": self.aux_label,
             "learning_rates": list(self.learning_rates),
         }
@@ -288,8 +303,14 @@ class _History:
             val_mse=[float(x) for x in value.get("val_mse", [])],
             val_r2=[float(x) for x in value.get("val_r2", [])],
             val_aux=[float(x) for x in value.get("val_aux", [])],
+            selection_score=[float(x) for x in value.get("selection_score", [])],
+            geo_mse=[float(x) for x in value.get("geo_mse", [])],
+            geo_r2=[float(x) for x in value.get("geo_r2", [])],
             ikem_mse=[float(x) for x in value.get("ikem_mse", [])],
             ikem_r2=[float(x) for x in value.get("ikem_r2", [])],
+            ikem_mse_donor_sd=[
+                float(x) for x in value.get("ikem_mse_donor_sd", [])
+            ],
             aux_label=(str(value.get("aux_label")) if value.get("aux_label") else None),
             learning_rates=[float(x) for x in value.get("learning_rates", [])],
         )
@@ -1249,6 +1270,9 @@ def inspect_checkpoint(path: str | Path) -> dict[str, object]:
         "path": str(Path(path).expanduser().resolve()),
         "epoch": int(checkpoint.get("epoch", 0)),
         "best_val_loss": float(checkpoint.get("best_val_loss", float("nan"))),
+        "best_selection_score": float(
+            checkpoint.get("best_selection_score", checkpoint.get("best_val_loss", float("nan")))
+        ),
         "input_dim": int(checkpoint.get("input_dim", 0)),
         "method": str(checkpoint.get("method", "unknown")),
         "n_train": len(checkpoint.get("train_rows", [])),
@@ -1266,11 +1290,13 @@ def _checkpoint_payload(
     input_dim: int,
     method: str,
     epoch: int,
-    best_val_loss: float,
+    best_selection_score: float,
     history: _History,
     run_id: str,
     train_rows: np.ndarray,
     validation_rows: np.ndarray,
+    validation_domains: np.ndarray | None,
+    validation_donor_ids: np.ndarray | None,
 ) -> dict[str, object]:
     return {
         "archcon_checkpoint_format": _CHECKPOINT_FORMAT,
@@ -1279,11 +1305,37 @@ def _checkpoint_payload(
         "input_dim": int(input_dim),
         "method": str(method),
         "epoch": int(epoch),
-        "best_val_loss": float(best_val_loss),
+        # best_val_loss is retained as a compatibility alias. In donor-safe
+        # paper runs it is the declared domain-balanced clean-MSE score.
+        "best_val_loss": float(best_selection_score),
+        "best_selection_score": float(best_selection_score),
+        "validation_selection_policy": (
+            {
+                "metric": "clean_reconstruction_mse",
+                "geo_weight": float(config.validation_geo_weight),
+                "ikem_weight": 1.0 - float(config.validation_geo_weight),
+                "ikem_aggregation": "donor_balanced",
+                "ikem_uncertainty": "sample_sd_across_donor_mean_mse",
+                "uses_geo_test": False,
+                "uses_egfr_values": False,
+            }
+            if validation_domains is not None
+            else {"metric": "validation_objective", "uses_geo_test": False}
+        ),
         "config": asdict(config),
         "history": history.to_dict(),
         "train_rows": [int(value) for value in train_rows],
         "validation_rows": [int(value) for value in validation_rows],
+        "validation_domains": (
+            [str(value) for value in validation_domains]
+            if validation_domains is not None
+            else None
+        ),
+        "validation_donor_ids": (
+            [str(value) for value in validation_donor_ids]
+            if validation_donor_ids is not None
+            else None
+        ),
         "model_state": {key: value.detach().cpu() for key, value in model.state_dict().items()},
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict(),
@@ -1307,6 +1359,7 @@ def _config_compatible(checkpoint_config: dict[str, object], config: TrainingCon
         "residual_blocks": 1,
         "residual_expansion": 1,
         "stadniuk_batch_norm": False,
+        "validation_geo_weight": 0.5,
     }
     keys = (
         "hidden_widths",
@@ -1318,6 +1371,7 @@ def _config_compatible(checkpoint_config: dict[str, object], config: TrainingCon
         "residual_blocks",
         "residual_expansion",
         "stadniuk_batch_norm",
+        "validation_geo_weight",
     )
     for key in keys:
         left = checkpoint_config.get(key, defaults.get(key))
@@ -1344,6 +1398,8 @@ def _load_checkpoint_into_run(
     method: str,
     train_rows: np.ndarray,
     validation_rows: np.ndarray,
+    validation_domains: np.ndarray | None,
+    validation_donor_ids: np.ndarray | None,
 ) -> tuple[int, float, _History]:
     checkpoint = _safe_torch_load(path)
     if checkpoint.get("archcon_checkpoint_format") != _CHECKPOINT_FORMAT:
@@ -1383,11 +1439,23 @@ def _load_checkpoint_into_run(
             "Exact resume requires the same train/validation split stored in the checkpoint. "
             "Use 'Load weights only' to initialize a new run on a different split."
         )
+    checkpoint_domains = checkpoint.get("validation_domains")
+    checkpoint_donors = checkpoint.get("validation_donor_ids")
+    expected_domains = (
+        None if validation_domains is None else [str(value) for value in validation_domains]
+    )
+    expected_donors = (
+        None if validation_donor_ids is None else [str(value) for value in validation_donor_ids]
+    )
+    if checkpoint_domains != expected_domains or checkpoint_donors != expected_donors:
+        raise ValueError(
+            "Exact resume requires the same frozen validation domains and donor identities."
+        )
     optimizer.load_state_dict(checkpoint["optimizer_state"])
     scheduler.load_state_dict(checkpoint["scheduler_state"])
     return (
         int(checkpoint.get("epoch", 0)),
-        float(checkpoint.get("best_val_loss", float("inf"))),
+        float(checkpoint.get("best_selection_score", checkpoint.get("best_val_loss", float("inf")))),
         _History.from_dict(checkpoint.get("history", {})),
     )
 
@@ -1401,6 +1469,44 @@ def _auxiliary_label(loss_name: str) -> str | None:
     if loss_name == LOSS_COSINE:
         return "cosine distance"
     return None
+
+
+@dataclass(frozen=True)
+class _ValidationResult:
+    objective: float
+    mse: float
+    r2: float
+    auxiliary: float
+    selection_score: float
+    geo_mse: float
+    geo_r2: float
+    ikem_mse: float
+    ikem_r2: float
+    ikem_mse_donor_sd: float
+    latents: np.ndarray | None
+
+
+def _weighted_clean_metrics(
+    row_sse: np.ndarray,
+    row_sum: np.ndarray,
+    row_sum2: np.ndarray,
+    n_features: int,
+    weights: np.ndarray,
+) -> tuple[float, float]:
+    weights = np.asarray(weights, dtype=np.float64)
+    if len(weights) != len(row_sse) or not np.isfinite(weights).all() or np.any(weights < 0):
+        raise ValueError("Invalid validation row weights.")
+    weight_sum = float(weights.sum())
+    if weight_sum <= 0:
+        raise ValueError("Validation metric has no positively weighted rows.")
+    squared_error = float(np.dot(weights, row_sse))
+    sum_y = float(np.dot(weights, row_sum))
+    sum_y2 = float(np.dot(weights, row_sum2))
+    value_count = weight_sum * int(n_features)
+    mse = squared_error / value_count
+    denominator = sum_y2 - sum_y * sum_y / value_count
+    r2 = 1.0 - squared_error / denominator if denominator > 0.0 else float("nan")
+    return mse, r2
 
 def _validation_pass(
     model,
@@ -1416,7 +1522,9 @@ def _validation_pass(
     regularization_model=None,
     objective_function=None,
     l2_penalty_function=None,
-) -> tuple[float, float, float, float, np.ndarray | None]:
+    validation_domains: np.ndarray | None = None,
+    validation_donor_ids: np.ndarray | None = None,
+) -> _ValidationResult:
     _require_torch()
     model.eval()
     objective_total = 0.0
@@ -1426,6 +1534,9 @@ def _validation_pass(
     value_count = 0
     sum_y = 0.0
     sum_y2 = 0.0
+    row_sse_parts: list[np.ndarray] = []
+    row_sum_parts: list[np.ndarray] = []
+    row_sum2_parts: list[np.ndarray] = []
     latent_parts: list[np.ndarray] = []
     mask_rng = (
         np.random.default_rng(int(config.seed) + 104_729)
@@ -1482,6 +1593,11 @@ def _validation_pass(
             squared_error += float(torch.sum(residual * residual).detach().cpu())
             sum_y += float(torch.sum(x).detach().cpu())
             sum_y2 += float(torch.sum(x * x).detach().cpu())
+            row_sse_parts.append(
+                torch.sum(residual * residual, dim=1).detach().double().cpu().numpy()
+            )
+            row_sum_parts.append(torch.sum(x, dim=1).detach().double().cpu().numpy())
+            row_sum2_parts.append(torch.sum(x * x, dim=1).detach().double().cpu().numpy())
             value_count += int(x.numel())
             if collect_latent:
                 latent_parts.append(
@@ -1494,50 +1610,78 @@ def _validation_pass(
     denominator = sum_y2 - (sum_y * sum_y / max(value_count, 1))
     r2 = 1.0 - squared_error / denominator if denominator > 0 else float("nan")
     latents = np.concatenate(latent_parts, axis=0) if latent_parts else None
-    return val_objective, mse, r2, val_auxiliary, latents
+    row_sse = np.concatenate(row_sse_parts)
+    row_sum = np.concatenate(row_sum_parts)
+    row_sum2 = np.concatenate(row_sum2_parts)
+
+    if validation_domains is None:
+        selection_score = val_objective
+        geo_mse, geo_r2 = mse, r2
+        ikem_mse = ikem_r2 = float("nan")
+        ikem_mse_donor_sd = float("nan")
+    else:
+        domains = np.asarray(validation_domains, dtype=str)
+        donors = np.asarray(validation_donor_ids, dtype=str)
+        if len(domains) != len(rows) or len(donors) != len(rows):
+            raise ValueError("Validation domains/donors must align with validation_rows.")
+        if set(domains) != {"geo", "ikem"}:
+            raise ValueError("Paper validation requires both GEO and IKEM domains.")
+        geo_mask = domains == "geo"
+        ikem_mask = domains == "ikem"
+        geo_mse, geo_r2 = _weighted_clean_metrics(
+            row_sse[geo_mask],
+            row_sum[geo_mask],
+            row_sum2[geo_mask],
+            int(matrix.shape[1]),
+            np.ones(int(geo_mask.sum()), dtype=np.float64),
+        )
+        ikem_donors = donors[ikem_mask]
+        if np.any(np.char.str_len(ikem_donors) == 0):
+            raise ValueError("Every IKEM validation biopsy needs a donor ID.")
+        donor_counts = {
+            donor: int((ikem_donors == donor).sum()) for donor in np.unique(ikem_donors)
+        }
+        ikem_weights = np.asarray(
+            [1.0 / donor_counts[donor] for donor in ikem_donors], dtype=np.float64
+        )
+        ikem_mse, ikem_r2 = _weighted_clean_metrics(
+            row_sse[ikem_mask],
+            row_sum[ikem_mask],
+            row_sum2[ikem_mask],
+            int(matrix.shape[1]),
+            ikem_weights,
+        )
+        donor_mean_mse = np.asarray(
+            [
+                float(row_sse[ikem_mask][ikem_donors == donor].mean())
+                / int(matrix.shape[1])
+                for donor in sorted(donor_counts)
+            ],
+            dtype=np.float64,
+        )
+        ikem_mse_donor_sd = (
+            float(donor_mean_mse.std(ddof=1))
+            if len(donor_mean_mse) > 1
+            else float("nan")
+        )
+        geo_weight = float(config.validation_geo_weight)
+        selection_score = geo_weight * geo_mse + (1.0 - geo_weight) * ikem_mse
+
+    return _ValidationResult(
+        objective=val_objective,
+        mse=mse,
+        r2=r2,
+        auxiliary=val_auxiliary,
+        selection_score=selection_score,
+        geo_mse=geo_mse,
+        geo_r2=geo_r2,
+        ikem_mse=ikem_mse,
+        ikem_r2=ikem_r2,
+        ikem_mse_donor_sd=ikem_mse_donor_sd,
+        latents=latents,
+    )
 
 
-
-def _clean_reconstruction_metrics(
-    model,
-    matrix: np.ndarray,
-    config: TrainingConfig,
-    device,
-    *,
-    autocast_enabled: bool = False,
-    autocast_dtype=None,
-) -> tuple[float, float]:
-    """Compute clean-input MSE/R² for an evaluation-only matrix.
-
-    This is used for supervised-dataset monitoring.  It never contributes to convergence checks,
-    learning-rate scheduling, or best-checkpoint selection.
-    """
-    _require_torch()
-    model.eval()
-    squared_error = 0.0
-    value_count = 0
-    sum_y = 0.0
-    sum_y2 = 0.0
-    rows = np.arange(int(matrix.shape[0]), dtype=np.int64)
-    with torch.no_grad():
-        for _, batch_np in _iter_numpy_batches(
-            matrix,
-            rows,
-            int(config.batch_size),
-            background_prefetch=bool(config.background_prefetch),
-        ):
-            x = _tensor_from_numpy(batch_np, device)
-            with _autocast_context(device, autocast_enabled, autocast_dtype):
-                reconstruction, _, _, _ = model(x, sample=False)
-            residual = reconstruction - x
-            squared_error += float(torch.sum(residual * residual).detach().cpu())
-            sum_y += float(torch.sum(x).detach().cpu())
-            sum_y2 += float(torch.sum(x * x).detach().cpu())
-            value_count += int(x.numel())
-    mse = squared_error / max(value_count, 1)
-    denominator = sum_y2 - (sum_y * sum_y / max(value_count, 1))
-    r2 = 1.0 - squared_error / denominator if denominator > 0 else float("nan")
-    return mse, r2
 
 def _compute_latent_pca(latents: np.ndarray, max_samples: int) -> np.ndarray:
     from sklearn.decomposition import PCA
@@ -1588,8 +1732,12 @@ def _snapshot(
         val_mse=list(history.val_mse),
         val_r2=list(history.val_r2),
         val_aux=list(history.val_aux),
+        selection_score=list(history.selection_score),
+        geo_mse=list(history.geo_mse),
+        geo_r2=list(history.geo_r2),
         ikem_mse=list(history.ikem_mse),
         ikem_r2=list(history.ikem_r2),
+        ikem_mse_donor_sd=list(history.ikem_mse_donor_sd),
         aux_label=history.aux_label,
         learning_rates=list(history.learning_rates),
         latent_pca=latent_pca,
@@ -1675,8 +1823,8 @@ def train_autoencoder_stream(
     method: str,
     checkpoint_path: str | Path | None = None,
     checkpoint_mode: str = CHECKPOINT_WEIGHTS,
-    evaluation_matrix: np.ndarray | None = None,
-    evaluation_label: str = "Supervised dataset",
+    validation_domains: np.ndarray | None = None,
+    validation_donor_ids: np.ndarray | None = None,
     model_factory=None,
     objective_function=None,
     optimizer_factory=None,
@@ -1698,13 +1846,6 @@ def train_autoencoder_stream(
         raise ValueError("Training matrix must be two-dimensional.")
     input_dim = int(matrix.shape[1])
     config.validate(input_dim)
-    if evaluation_matrix is not None:
-        if evaluation_matrix.ndim != 2 or int(evaluation_matrix.shape[1]) != input_dim:
-            raise ValueError(
-                f"{evaluation_label} evaluation matrix must have the same {input_dim:,} probes "
-                "as the GEO training matrix."
-            )
-
     train_rows = np.asarray(train_rows, dtype=np.int64)
     validation_rows = np.asarray(validation_rows, dtype=np.int64)
     if len(train_rows) < 1 or len(validation_rows) < 1:
@@ -1714,6 +1855,15 @@ def train_autoencoder_stream(
         raise ValueError("Split row index is outside the selected expression matrix.")
     if len(np.unique(all_rows)) != len(all_rows):
         raise ValueError("Train/validation rows overlap or contain duplicates.")
+    if (validation_domains is None) != (validation_donor_ids is None):
+        raise ValueError("Validation domains and donor IDs must be supplied together.")
+    if validation_domains is not None:
+        validation_domains = np.asarray(validation_domains, dtype=str)
+        validation_donor_ids = np.asarray(validation_donor_ids, dtype=str)
+        if len(validation_domains) != len(validation_rows) or len(validation_donor_ids) != len(
+            validation_rows
+        ):
+            raise ValueError("Validation metadata must align exactly with validation_rows.")
 
     run_id = uuid.uuid4().hex[:12]
     stop_event = _register_run(run_id)
@@ -1724,7 +1874,7 @@ def train_autoencoder_stream(
     output_dir.mkdir(parents=True, exist_ok=True)
     history = _History(aux_label=_auxiliary_label(config.loss_name))
     start_epoch = 0
-    best_val_loss = float("inf")
+    best_selection_score = float("inf")
     latest_checkpoint: str | None = None
     best_checkpoint: str | None = None
     best_epoch = 0
@@ -1850,7 +2000,7 @@ def train_autoencoder_stream(
         )
 
         if checkpoint_path:
-            start_epoch, best_val_loss, history = _load_checkpoint_into_run(
+            start_epoch, best_selection_score, history = _load_checkpoint_into_run(
                 checkpoint_path,
                 checkpoint_mode,
                 base_model,
@@ -1861,8 +2011,12 @@ def train_autoencoder_stream(
                 method,
                 train_rows,
                 validation_rows,
+                validation_domains,
+                validation_donor_ids,
             )
             history.aux_label = _auxiliary_label(config.loss_name)
+            if history.selection_score:
+                best_epoch = history.val_epoch[int(np.argmin(history.selection_score))]
 
         model = base_model
         compiled = False
@@ -2062,11 +2216,13 @@ def train_autoencoder_stream(
                     input_dim=input_dim,
                     method=method,
                     epoch=epoch - 1,
-                    best_val_loss=best_val_loss,
+                    best_selection_score=best_selection_score,
                     history=history,
                     run_id=run_id,
                     train_rows=train_rows,
                     validation_rows=validation_rows,
+                    validation_domains=validation_domains,
+                    validation_donor_ids=validation_donor_ids,
                 )
                 latest_checkpoint = _save_checkpoint(output_dir / "stopped.pt", payload)
                 break
@@ -2086,7 +2242,7 @@ def train_autoencoder_stream(
                 collect_latent = (
                     epoch == 1 or epoch % int(config.latent_pca_every_epochs) == 0
                 )
-                val_loss, val_mse, val_r2, val_aux, latents = _validation_pass(
+                validation_result = _validation_pass(
                     model,
                     matrix,
                     validation_rows,
@@ -2099,41 +2255,51 @@ def train_autoencoder_stream(
                     regularization_model=base_model,
                     objective_function=objective_function,
                     l2_penalty_function=l2_penalty_function,
+                    validation_domains=validation_domains,
+                    validation_donor_ids=validation_donor_ids,
                 )
+                val_loss = validation_result.objective
+                val_mse = validation_result.mse
+                val_r2 = validation_result.r2
+                val_aux = validation_result.auxiliary
+                latents = validation_result.latents
+                control_value = float(validation_result.selection_score)
                 if config.lr_schedule == LR_SCHEDULE_PLATEAU:
-                    scheduler.step(val_loss)
+                    scheduler.step(control_value)
                 current_lr = float(optimizer.param_groups[0]["lr"])
-                previous_val_loss = history.val_loss[-1] if history.val_loss else None
+                previous_control = (
+                    history.selection_score[-1] if history.selection_score else None
+                )
                 history.val_epoch.append(epoch)
                 history.val_loss.append(float(val_loss))
                 history.val_mse.append(float(val_mse))
                 history.val_r2.append(float(val_r2))
                 history.val_aux.append(float(val_aux))
+                history.selection_score.append(float(validation_result.selection_score))
+                history.geo_mse.append(float(validation_result.geo_mse))
+                history.geo_r2.append(float(validation_result.geo_r2))
+                history.ikem_mse.append(float(validation_result.ikem_mse))
+                history.ikem_r2.append(float(validation_result.ikem_r2))
+                history.ikem_mse_donor_sd.append(
+                    float(validation_result.ikem_mse_donor_sd)
+                )
                 history.learning_rates.append(current_lr)
-                if evaluation_matrix is not None:
-                    ikem_mse, ikem_r2 = _clean_reconstruction_metrics(
-                        model,
-                        evaluation_matrix,
-                        config,
-                        device,
-                        autocast_enabled=autocast_enabled,
-                        autocast_dtype=autocast_dtype,
-                    )
-                    history.ikem_mse.append(float(ikem_mse))
-                    history.ikem_r2.append(float(ikem_r2))
 
-                improved = val_loss < best_val_loss - 1e-12
+                improved = validation_result.selection_score < best_selection_score - 1e-12
                 if improved:
-                    best_val_loss = float(val_loss)
+                    best_selection_score = float(validation_result.selection_score)
                     best_epoch = epoch
 
                 # Convergence is a numerical criterion, not a patience rule:
-                # compare successive validation objectives and only allow a stop
-                # once the decayed learning rate is already at its floor.
-                if previous_val_loss is not None:
-                    denominator = max(abs(float(previous_val_loss)), 1e-12)
+                # compare successive permitted selection scores and only allow
+                # a stop once the decayed learning rate is already at its floor.
+                # In final-paper runs this is the predeclared 50/50 GEO/IKEM
+                # clean-MSE composite; legacy calls without domain metadata use
+                # the validation objective as before.
+                if previous_control is not None:
+                    denominator = max(abs(float(previous_control)), 1e-12)
                     last_relative_delta = (
-                        abs(float(val_loss) - float(previous_val_loss)) / denominator
+                        abs(control_value - float(previous_control)) / denominator
                     )
                     convergence_deltas.append(float(last_relative_delta))
                     window = int(config.convergence_window)
@@ -2153,11 +2319,13 @@ def train_autoencoder_stream(
                 input_dim=input_dim,
                 method=method,
                 epoch=epoch,
-                best_val_loss=best_val_loss,
+                best_selection_score=best_selection_score,
                 history=history,
                 run_id=run_id,
                 train_rows=train_rows,
                 validation_rows=validation_rows,
+                validation_domains=validation_domains,
+                validation_donor_ids=validation_donor_ids,
             )
             latest_checkpoint = _save_checkpoint(output_dir / "latest.pt", payload)
             if improved:
@@ -2196,16 +2364,18 @@ def train_autoencoder_stream(
                     aux_text = (
                         f" · mask **{100.0 * config.mask_fraction:.1f}%** · clean-input MSE shown separately"
                     )
-                ikem_text = ""
-                if evaluation_matrix is not None and history.ikem_mse:
-                    ikem_text = (
-                        f" · {evaluation_label} diagnostic MSE **{history.ikem_mse[-1]:.6g}** "
-                        f"/ R² **{history.ikem_r2[-1]:.4f}** (not used for selection)"
+                selection_text = ""
+                if validation_domains is not None:
+                    selection_text = (
+                        f" · GEO clean MSE **{validation_result.geo_mse:.6g}**"
+                        f" · IKEM donor-balanced clean MSE **{validation_result.ikem_mse:.6g}** "
+                        f"(donor SD **{validation_result.ikem_mse_donor_sd:.6g}**)"
+                        f" · 50/50 selection score **{validation_result.selection_score:.6g}**"
                     )
                 status = (
                     f"✅ **Epoch {epoch}/{config.epochs} complete** in {epoch_seconds:.1f}s · "
                     f"validation objective **{val_loss:.6g}** · MSE **{val_mse:.6g}** · "
-                    f"R² **{val_r2:.4f}**{aux_text}{ikem_text} · best epoch **{best_epoch}**"
+                    f"R² **{val_r2:.4f}**{aux_text}{selection_text} · best epoch **{best_epoch}**"
                     + (
                         f" · relative Δ **{last_relative_delta:.3g}**"
                         if last_relative_delta is not None
@@ -2268,11 +2438,13 @@ def train_autoencoder_stream(
                 input_dim=input_dim,
                 method=method,
                 epoch=stopped_epoch,
-                best_val_loss=best_val_loss,
+                best_selection_score=best_selection_score,
                 history=history,
                 run_id=run_id,
                 train_rows=train_rows,
                 validation_rows=validation_rows,
+                validation_domains=validation_domains,
+                validation_donor_ids=validation_donor_ids,
             )
             latest_checkpoint = _save_checkpoint(output_dir / "stopped.pt", payload)
 
@@ -2287,7 +2459,8 @@ def train_autoencoder_stream(
             reason = "converged at minimum learning rate" if converged else "maximum epoch limit"
             final_status = (
                 f"🏁 **Training finished** at epoch {final_epoch} ({reason}). "
-                f"Best validation objective: **{best_val_loss:.6g}** at epoch **{best_epoch}**."
+                f"Best permitted molecular-validation score: **{best_selection_score:.6g}** "
+                f"at epoch **{best_epoch}**."
             )
             stopped = False
 
@@ -2316,7 +2489,12 @@ def train_autoencoder_stream(
 def _best_validation_index(update: TrainingUpdate) -> int | None:
     if not update.val_epoch or not update.val_loss:
         return None
-    values = np.asarray(update.val_loss, dtype=float)
+    values = np.asarray(
+        update.selection_score
+        if len(update.selection_score) == len(update.val_epoch)
+        else update.val_loss,
+        dtype=float,
+    )
     finite = np.isfinite(values)
     if not finite.any():
         return None
@@ -2375,7 +2553,7 @@ def plot_training_history(update: TrainingUpdate):
 
 
 def plot_validation_metrics(update: TrainingUpdate):
-    """Plot validation metrics plus evaluation-only supervised-dataset diagnostics."""
+    """Plot separate GEO/IKEM validation metrics and their selection epoch."""
     show_aux = bool(update.aux_label and update.val_aux and any(np.isfinite(update.val_aux)))
     n_rows = 3 if show_aux else 2
     fig, axes = plt.subplots(n_rows, 1, figsize=(8.6, 2.65 * n_rows), sharex=True)
@@ -2386,9 +2564,13 @@ def plot_validation_metrics(update: TrainingUpdate):
     if update.val_epoch:
         mse_color = "tab:blue"
         r2_color = "tab:orange"
+        geo_mse = (
+            update.geo_mse if len(update.geo_mse) == len(update.val_epoch) else update.val_mse
+        )
+        geo_r2 = update.geo_r2 if len(update.geo_r2) == len(update.val_epoch) else update.val_r2
         mse_ax.plot(
             update.val_epoch,
-            update.val_mse,
+            geo_mse,
             marker="o",
             linewidth=2.0,
             color=mse_color,
@@ -2396,7 +2578,7 @@ def plot_validation_metrics(update: TrainingUpdate):
         )
         r2_ax.plot(
             update.val_epoch,
-            update.val_r2,
+            geo_r2,
             marker="s",
             linewidth=2.0,
             color=r2_color,
@@ -2409,7 +2591,7 @@ def plot_validation_metrics(update: TrainingUpdate):
                 update.ikem_mse,
                 linestyle="--",
                 linewidth=1.8,
-                label="Supervised MSE · diagnostic only",
+                label="IKEM validation MSE · donor-balanced",
             )
         if len(update.ikem_r2) == len(update.val_epoch):
             r2_ax.plot(
@@ -2417,7 +2599,16 @@ def plot_validation_metrics(update: TrainingUpdate):
                 update.ikem_r2,
                 linestyle="--",
                 linewidth=1.8,
-                label="Supervised R² · diagnostic only",
+                label="IKEM validation R² · donor-balanced",
+            )
+        if len(update.selection_score) == len(update.val_epoch):
+            mse_ax.plot(
+                update.val_epoch,
+                update.selection_score,
+                linestyle=":",
+                linewidth=2.2,
+                color="black",
+                label="50/50 GEO–IKEM selection score",
             )
 
         mse_ax.set_ylabel("MSE", color=mse_color)
@@ -2432,7 +2623,7 @@ def plot_validation_metrics(update: TrainingUpdate):
         best_index = _best_validation_index(update)
         if best_index is not None:
             epoch = update.val_epoch[best_index]
-            for axis, values in ((mse_ax, update.val_mse), (r2_ax, update.val_r2)):
+            for axis, values in ((mse_ax, geo_mse), (r2_ax, geo_r2)):
                 axis.scatter(
                     [epoch],
                     [values[best_index]],

@@ -1,17 +1,15 @@
-"""Molecular pretraining/evaluation sources shared by web and headless runs.
+"""Frozen, donor-safe molecular pretraining sources for web and batch runs.
 
-Version 0.5.15 keeps one frozen molecular 90/5/5 split across the comparison: public GEO
-rows are assigned by connected source-GSE component, while supervised-dataset
-rows with no eGFR are independently assigned at the same target fractions and
-virtually appended. Outcome-bearing supervised rows are never exposed to the
-autoencoder. GEO itself is compared in three representations: per-dataset
-standardization, per-study RMA, and a legacy-named ``Global RMA`` arm rebuilt
-from a frozen train-only CEL/RMA reference.
+GEO keeps its connected-study 90/5/5 partition. IKEM is gated by donor: only
+biopsies from donors with no finite longitudinal eGFR enter molecular
+pretraining, and those donors are split 80/20 into train/validation with no
+IKEM test partition. The final jobs consume only frozen prepared artifacts.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 from types import SimpleNamespace
 from pathlib import Path
@@ -30,7 +28,20 @@ from .geo_rma import (
 )
 from .pretraining import create_train_validation_split
 from .loading import normalize_sample_id
-from .supervised import classify_supervised_samples, split_outcome_blind_samples
+from .supervised import (
+    IKEM_PAPER_RELATED_HELD_OUT_SAMPLES,
+    IKEM_PAPER_VALIDATION_DONORS,
+    IKEM_PAPER_VALIDATION_SAMPLES,
+    IKEM_PRETRAINING_SPLIT_SEED,
+    IKEM_ROLE_MEASURED_HELD_OUT,
+    IKEM_ROLE_RELATED_HELD_OUT,
+    IKEM_ROLE_TRAIN,
+    IKEM_ROLE_VALIDATION,
+    IKEM_VALIDATION_FRACTION,
+    classify_supervised_samples,
+    donor_id_from_sample_id,
+    split_outcome_blind_samples,
+)
 
 
 METHOD_PER_DATASET_STANDARDIZED = "Per-dataset standardization"
@@ -50,6 +61,9 @@ TRAINING_PREPROCESSING_OPTIONS = [
 _SAMPLE_ID_CANDIDATES = ("sample_id", "Sample_ID", "GSM", "sample", "id")
 _PROBE_ID_CANDIDATES = ("probe_id", "probe", "probeset_id", "ID", "id")
 _ROW_CANDIDATES = ("row_index_python", "global_row_python", "sample_row_python")
+PREPARED_FORMAT = 5
+VALIDATION_GEO_WEIGHT = 0.50
+GEO_PAPER_SPLIT_COUNTS = {"train": 10_522, "validation": 585, "test": 584}
 
 
 class StackedExpressionMatrix:
@@ -248,6 +262,56 @@ class ExpressionMatrixSource:
         return _find_column(self.sample_index, _SAMPLE_ID_CANDIDATES, "sample identifier")
 
 
+@dataclass(frozen=True)
+class ValidationPartition:
+    """Frozen validation-domain labels aligned exactly to ``validation_rows``."""
+
+    domains: np.ndarray
+    donor_ids: np.ndarray
+    n_geo: int
+    n_ikem: int
+    n_ikem_donors: int
+    geo_weight: float
+
+
+def _membership_sha256(namespace: str, sample_ids: list[str] | tuple[str, ...]) -> str:
+    values = sorted(
+        f"{str(namespace).upper()}:{str(sample_id).strip().upper()}"
+        for sample_id in sample_ids
+    )
+    payload = "\n".join(values) + "\n"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def validation_partition_from_split(split: pd.DataFrame) -> ValidationPartition:
+    """Build aligned domain labels from an already frozen identity-level split."""
+
+    validation = split.loc[split["split"].astype(str).str.lower().eq("validation")].copy()
+    if "source_kind" in validation.columns:
+        domains = validation["source_kind"].astype(str).str.lower().to_numpy(dtype=str)
+    elif "sample_key" in validation.columns:
+        domains = np.where(
+            validation["sample_key"].astype(str).str.startswith("GEO:"), "geo", "ikem"
+        )
+    else:
+        raise ValueError("Validation split lacks frozen source-domain identities.")
+    donor_series = validation.get("donor_id", pd.Series([""] * len(validation)))
+    donor_ids = donor_series.fillna("").astype(str).str.upper().to_numpy(dtype=str)
+    ikem_mask = domains == "ikem"
+    if set(domains) != {"geo", "ikem"} or np.any(
+        np.char.str_len(donor_ids[ikem_mask]) == 0
+    ):
+        raise ValueError("Paper validation requires GEO rows and donor-labelled IKEM rows.")
+    return ValidationPartition(
+        domains=np.asarray(domains, dtype=str),
+        donor_ids=donor_ids,
+        n_geo=int((domains == "geo").sum()),
+        n_ikem=int(ikem_mask.sum()),
+        n_ikem_donors=int(len(set(donor_ids[ikem_mask]))),
+        geo_weight=VALIDATION_GEO_WEIGHT,
+    )
+
+
 def _find_column(frame: pd.DataFrame, candidates: tuple[str, ...], description: str) -> str:
     for candidate in candidates:
         if candidate in frame.columns:
@@ -359,7 +423,21 @@ def _source_with_sample_keys(source: ExpressionMatrixSource, prefix: str, role: 
     frame["sample_id"] = ids
     frame["sample_key"] = [f"{prefix}:{value}" for value in ids]
     frame["dataset_role"] = role
+    frame["source_kind"] = str(prefix).lower()
     return frame
+
+
+def _assert_canonical_geo_split_counts(frame: pd.DataFrame) -> None:
+    """Fail closed if the canonical 11,691-row GEO split drifts."""
+
+    if len(frame) != sum(GEO_PAPER_SPLIT_COUNTS.values()):
+        return
+    observed = frame["split"].astype(str).str.lower().value_counts().to_dict()
+    if observed != GEO_PAPER_SPLIT_COUNTS:
+        raise RuntimeError(
+            "Canonical GEO split counts differ from the frozen paper contract: "
+            f"observed={observed}, expected={GEO_PAPER_SPLIT_COUNTS}."
+        )
 
 
 _IKEM_METHOD_MATRIX = {
@@ -375,16 +453,253 @@ _IKEM_METHOD_PROVENANCE = {
 }
 
 
+def _validated_ikem_role_manifest(source: ExpressionMatrixSource) -> pd.DataFrame:
+    """Validate the audited R-produced donor roles without recomputing them."""
+
+    required = {"training_role", "pretraining_split", "donor_id"}
+    missing = sorted(required.difference(source.sample_index.columns))
+    if missing:
+        raise RuntimeError(
+            "The IKEM CEL store lacks donor-safe role columns: " + ", ".join(missing)
+        )
+    frame = source.sample_index.copy()
+    frame["sample_id"] = frame[source.sample_id_column].map(normalize_sample_id)
+    frame["donor_id"] = frame["donor_id"].astype(str).str.strip().str.upper()
+    frame["training_role"] = frame["training_role"].astype(str).str.strip()
+    if frame["sample_id"].duplicated().any() or (frame["donor_id"] == "").any():
+        raise RuntimeError("The IKEM CEL role manifest has duplicate samples or blank donors.")
+    parsed_donors = frame["sample_id"].map(donor_id_from_sample_id).str.upper()
+    if not frame["donor_id"].equals(parsed_donors):
+        raise RuntimeError("IKEM donor IDs disagree with canonical biopsy IDs.")
+    allowed = {
+        IKEM_ROLE_TRAIN,
+        IKEM_ROLE_VALIDATION,
+        IKEM_ROLE_RELATED_HELD_OUT,
+        IKEM_ROLE_MEASURED_HELD_OUT,
+    }
+    unknown = sorted(set(frame["training_role"]) - allowed)
+    if unknown:
+        raise RuntimeError(f"The IKEM CEL store contains unknown training roles: {unknown}")
+    split = frame["pretraining_split"].fillna("").astype(str).str.strip().str.lower()
+    expected_split = np.select(
+        [
+            frame["training_role"].eq(IKEM_ROLE_TRAIN),
+            frame["training_role"].eq(IKEM_ROLE_VALIDATION),
+        ],
+        ["train", "validation"],
+        default="",
+    )
+    if not np.array_equal(split.to_numpy(dtype=str), expected_split.astype(str)):
+        raise RuntimeError("IKEM training_role and pretraining_split columns disagree.")
+    train_donors = set(frame.loc[frame["training_role"].eq(IKEM_ROLE_TRAIN), "donor_id"])
+    validation_donors = set(
+        frame.loc[frame["training_role"].eq(IKEM_ROLE_VALIDATION), "donor_id"]
+    )
+    held_out_donors = set(
+        frame.loc[
+            frame["training_role"].isin(
+                [IKEM_ROLE_RELATED_HELD_OUT, IKEM_ROLE_MEASURED_HELD_OUT]
+            ),
+            "donor_id",
+        ]
+    )
+    if (
+        train_donors & validation_donors
+        or train_donors & held_out_donors
+        or validation_donors & held_out_donors
+    ):
+        raise RuntimeError("IKEM donors overlap across train, validation, and held-out roles.")
+
+    # Fail closed for the canonical paper cohort while still permitting compact
+    # synthetic/external stores in tests and exploratory use.
+    if len(frame) == 288:
+        counts = frame["training_role"].value_counts().to_dict()
+        expected_counts = {
+            IKEM_ROLE_TRAIN: 24,
+            IKEM_ROLE_VALIDATION: 6,
+            IKEM_ROLE_RELATED_HELD_OUT: 4,
+            IKEM_ROLE_MEASURED_HELD_OUT: 254,
+        }
+        if counts != expected_counts:
+            raise RuntimeError(
+                f"Canonical IKEM role counts differ from the paper contract: {counts}."
+            )
+        if validation_donors != set(IKEM_PAPER_VALIDATION_DONORS):
+            raise RuntimeError(
+                "Canonical IKEM validation donors differ from the frozen paper contract."
+            )
+        validation_samples = set(
+            frame.loc[frame["training_role"].eq(IKEM_ROLE_VALIDATION), "sample_id"]
+        )
+        related_samples = set(
+            frame.loc[
+                frame["training_role"].eq(IKEM_ROLE_RELATED_HELD_OUT), "sample_id"
+            ]
+        )
+        if validation_samples != set(IKEM_PAPER_VALIDATION_SAMPLES):
+            raise RuntimeError(
+                "Canonical IKEM validation biopsies differ from the frozen paper contract."
+            )
+        if related_samples != set(IKEM_PAPER_RELATED_HELD_OUT_SAMPLES):
+            raise RuntimeError(
+                "Canonical IKEM related-donor exclusions differ from the paper contract."
+            )
+    return frame
+
+
+def _assert_frozen_ikem_split_matches_manifest(
+    split: pd.DataFrame,
+    source: ExpressionMatrixSource,
+) -> None:
+    """Require prepared IKEM identities/roles to equal the audited CEL manifest."""
+
+    manifest = _validated_ikem_role_manifest(source)
+    eligible = manifest.loc[
+        manifest["training_role"].isin([IKEM_ROLE_TRAIN, IKEM_ROLE_VALIDATION])
+    ].copy()
+    eligible["sample_key"] = eligible["sample_id"].map(
+        lambda value: f"SUPERVISED:{normalize_sample_id(value).upper()}"
+    )
+    eligible["split"] = np.where(
+        eligible["training_role"].eq(IKEM_ROLE_TRAIN), "train", "validation"
+    )
+    expected = eligible.set_index("sample_key")[["split", "donor_id", "training_role"]]
+
+    supplied = split.copy()
+    supplied["sample_key"] = supplied["sample_key"].map(
+        lambda value: (
+            "SUPERVISED:"
+            + normalize_sample_id(str(value).split(":", 1)[-1]).upper()
+        )
+    )
+    if supplied["sample_key"].duplicated().any():
+        raise ValueError("Frozen IKEM split contains duplicate normalized sample identities.")
+    supplied["split"] = supplied["split"].astype(str).str.lower()
+    supplied["donor_id"] = supplied["donor_id"].astype(str).str.strip().str.upper()
+    supplied["training_role"] = supplied["training_role"].astype(str).str.strip()
+    observed = supplied.set_index("sample_key")[["split", "donor_id", "training_role"]]
+
+    if set(observed.index) != set(expected.index):
+        missing = sorted(set(expected.index) - set(observed.index))[:5]
+        extra = sorted(set(observed.index) - set(expected.index))[:5]
+        raise ValueError(
+            "Frozen IKEM identities differ from the audited donor-clean CEL manifest: "
+            f"missing={missing}, extra={extra}."
+        )
+    observed = observed.loc[expected.index]
+    if not observed.equals(expected):
+        mismatches = observed.ne(expected).any(axis=1)
+        raise ValueError(
+            "Frozen IKEM train/validation roles differ from the audited CEL manifest; "
+            f"examples: {observed.index[mismatches].tolist()[:5]}."
+        )
+
+
+def _validate_ikem_role_count_provenance(
+    manifest: pd.DataFrame,
+    provenance: dict[str, object],
+) -> None:
+    """Cross-check every role count recorded by the installed V6 store."""
+
+    counts = manifest["training_role"].value_counts().to_dict()
+    expected = {
+        "cohort_samples": len(manifest),
+        "no_measured_egfr_biopsies": (
+            counts.get(IKEM_ROLE_TRAIN, 0)
+            + counts.get(IKEM_ROLE_VALIDATION, 0)
+            + counts.get(IKEM_ROLE_RELATED_HELD_OUT, 0)
+        ),
+        "donor_clean_pretraining_eligible_samples": (
+            counts.get(IKEM_ROLE_TRAIN, 0) + counts.get(IKEM_ROLE_VALIDATION, 0)
+        ),
+        "pretraining_train_samples": counts.get(IKEM_ROLE_TRAIN, 0),
+        "pretraining_validation_samples": counts.get(IKEM_ROLE_VALIDATION, 0),
+        "related_no_egfr_held_out_samples": counts.get(
+            IKEM_ROLE_RELATED_HELD_OUT, 0
+        ),
+        "held_out_measured_egfr_samples": counts.get(IKEM_ROLE_MEASURED_HELD_OUT, 0),
+    }
+    missing = [name for name in expected if name not in provenance]
+    if missing:
+        raise RuntimeError(
+            "The IKEM CEL store lacks complete V6 role-count provenance: "
+            + ", ".join(missing)
+        )
+    observed = {name: int(provenance[name]) for name in expected}
+    if observed != expected:
+        raise RuntimeError(
+            "IKEM provenance role counts disagree with sample_index.csv: "
+            f"observed={observed}, expected={expected}."
+        )
+
+
+def _validate_ikem_provenance(
+    source: ExpressionMatrixSource,
+    provenance: dict[str, object],
+    method: str,
+) -> None:
+    if int(provenance.get("format", -1)) != 4:
+        raise RuntimeError(
+            "The paper pipeline requires donor-safe IKEM CEL provenance format 4. "
+            "Rerun the V6 CEL/RMA rebuild."
+        )
+    if str(provenance.get("outcome_gate_unit", "")).lower() != "donor" or str(
+        provenance.get("split_unit", "")
+    ).lower() != "donor":
+        raise RuntimeError("IKEM preprocessing provenance is not donor-gated/split.")
+    if int(provenance.get("split_seed", -1)) != IKEM_PRETRAINING_SPLIT_SEED or not np.isclose(
+        float(provenance.get("validation_fraction", -1.0)), IKEM_VALIDATION_FRACTION
+    ):
+        raise RuntimeError("IKEM preprocessing provenance uses a different frozen split policy.")
+
+    manifest = _validated_ikem_role_manifest(source)
+    _validate_ikem_role_count_provenance(manifest, provenance)
+    methods_info = provenance.get("methods", {})
+    native_method = _IKEM_METHOD_PROVENANCE[method]
+    method_info = methods_info.get(native_method, {}) if isinstance(methods_info, dict) else {}
+    if (
+        not isinstance(method_info, dict)
+        or method_info.get("transductive_across_egfr_folds") is not False
+        or method_info.get("uses_outcome_values_in_fit") is not False
+        or method_info.get("uses_egfr_cv_fold") is not False
+    ):
+        raise RuntimeError(
+            f"IKEM {method} is not certified as an outcome-value-free, "
+            "non-transductive transform."
+        )
+
+    train = manifest.loc[manifest["training_role"].eq(IKEM_ROLE_TRAIN)]
+    validation = manifest.loc[manifest["training_role"].eq(IKEM_ROLE_VALIDATION)]
+    declared_train = int(provenance.get("pretraining_train_samples", -1))
+    declared_validation = int(provenance.get("pretraining_validation_samples", -1))
+    if declared_train != len(train) or declared_validation != len(validation):
+        raise RuntimeError("IKEM provenance sample counts disagree with sample_index.csv.")
+    declared_donors = {
+        str(value).upper() for value in provenance.get("pretraining_validation_donors", [])
+    }
+    if declared_donors != set(validation["donor_id"]):
+        raise RuntimeError("IKEM provenance validation donors disagree with sample_index.csv.")
+    expected_train_hash = _membership_sha256(
+        "SUPERVISED", train["sample_id"].astype(str).tolist()
+    )
+    expected_validation_hash = _membership_sha256(
+        "SUPERVISED", validation["sample_id"].astype(str).tolist()
+    )
+    if (
+        provenance.get("ikem_train_sample_ids_sha256") != expected_train_hash
+        or provenance.get("ikem_validation_sample_ids_sha256")
+        != expected_validation_hash
+    ):
+        raise RuntimeError(
+            "IKEM provenance membership hashes disagree with sample_index.csv."
+        )
+
+
 def load_ikem_source(
     layout: ProjectDataLayout,
     method: str | None = None,
 ) -> ExpressionMatrixSource | None:
-    """Load the supervised kidney-donor molecular store when available.
-
-    Prefer the compact internal ``IKEM_NUMPY_STORE`` used for repeated cluster runs. For
-    interactive/local compatibility, fall back to the historical
-    ``expression_matrix.csv`` understood by ArchCon's existing data loader.
-    """
+    """Load the preferred private-CEL IKEM store when available."""
     if layout.ikem_store.is_dir():
         if method is not None:
             method = str(method)
@@ -399,45 +714,36 @@ def load_ikem_source(
                     "GSE290167 CEL/RMA rebuild before generating or evaluating a sweep."
                 )
             provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
-            if (
-                int(provenance.get("format", -1)) != 2
-                or provenance.get("source") != "GSE290167"
-            ):
-                raise RuntimeError(
-                    f"Unsupported method-specific IKEM provenance: {provenance_path}"
-                )
-            methods_info = provenance.get("methods", {})
-            native_method = _IKEM_METHOD_PROVENANCE[method]
-            method_info = (
-                methods_info.get(native_method, {})
-                if isinstance(methods_info, dict)
-                else {}
-            )
-            if (
-                not isinstance(method_info, dict)
-                or method_info.get("transductive_across_egfr_folds") is not False
-                or method_info.get("uses_egfr") is not False
-                or method_info.get("uses_egfr_cv_fold") is not False
-            ):
-                raise RuntimeError(
-                    f"IKEM {method} is not certified as an outcome-free, "
-                    "non-transductive transform. Rebuild it from GSE290167 CELs."
-                )
-            return _load_simple_numpy_store(
+            source = _load_simple_numpy_store(
                 layout.ikem_store,
-                f"IKEM GSE290167 · {method}",
+                f"IKEM private CEL · {method}",
                 matrix_filename=filename,
             )
+            _validate_ikem_provenance(source, provenance, method)
+            return source
         default_filename = (
             "expression.npy"
             if (layout.ikem_store / "expression.npy").is_file()
             else "rma_per_gse.npy"
         )
-        return _load_simple_numpy_store(
+        source = _load_simple_numpy_store(
             layout.ikem_store,
             "Supervised dataset",
             matrix_filename=default_filename,
         )
+        if (layout.ikem_store / "preprocessing_provenance.json").is_file():
+            provenance = json.loads(
+                (layout.ikem_store / "preprocessing_provenance.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            if int(provenance.get("format", -1)) != 4:
+                raise RuntimeError(
+                    "The paper pipeline requires donor-safe IKEM CEL provenance format 4."
+                )
+            manifest = _validated_ikem_role_manifest(source)
+            _validate_ikem_role_count_provenance(manifest, provenance)
+        return source
     if not layout.expression_matrix.is_file():
         return None
 
@@ -459,6 +765,62 @@ def load_ikem_source(
         probe_ids=tuple(str(column) for column in frame.columns),
         root=layout.root,
     )
+
+
+def _ikem_pretraining_split(
+    layout: ProjectDataLayout,
+    source: ExpressionMatrixSource,
+) -> pd.DataFrame:
+    """Recompute the donor gate once and verify the audited CEL manifest."""
+
+    source_ids = source.sample_index[source.sample_id_column].map(normalize_sample_id)
+    status = classify_supervised_samples(layout, source_ids)
+    expected_donors = IKEM_PAPER_VALIDATION_DONORS if len(status.table) == 288 else None
+    split = split_outcome_blind_samples(
+        status,
+        seed=IKEM_PRETRAINING_SPLIT_SEED,
+        validation_fraction=IKEM_VALIDATION_FRACTION,
+        expected_validation_donors=expected_donors,
+    )
+
+    manifest = _validated_ikem_role_manifest(source)
+    audited = manifest[["sample_id", "donor_id", "training_role"]].copy()
+    audited["pretraining_split"] = (
+        manifest["pretraining_split"].fillna("").astype(str).str.strip().str.lower()
+    )
+    expected_roles = status.table[["sample_id", "donor_id", "training_role"]].copy()
+    eligible_roles = split[["sample_id", "training_role", "split"]].rename(
+        columns={"training_role": "eligible_role", "split": "eligible_split"}
+    )
+    expected_roles = expected_roles.merge(
+        eligible_roles, on="sample_id", how="left", validate="one_to_one"
+    )
+    expected_roles["training_role"] = expected_roles["eligible_role"].fillna(
+        expected_roles["training_role"]
+    )
+    expected_roles["pretraining_split"] = expected_roles["eligible_split"].fillna("")
+    expected_roles = expected_roles.drop(columns=["eligible_role", "eligible_split"])
+    comparison = audited.merge(
+        expected_roles,
+        on="sample_id",
+        how="outer",
+        suffixes=("_audited", "_expected"),
+        indicator=True,
+    )
+    mismatch = comparison.loc[
+        comparison["_merge"].ne("both")
+        | comparison["donor_id_audited"].ne(comparison["donor_id_expected"])
+        | comparison["training_role_audited"].ne(comparison["training_role_expected"])
+        | comparison["pretraining_split_audited"].ne(
+            comparison["pretraining_split_expected"]
+        )
+    ]
+    if not mismatch.empty:
+        raise RuntimeError(
+            "The audited IKEM CEL roles disagree with the eGFR-derived donor-safe split; "
+            f"first mismatches: {mismatch['sample_id'].head(5).tolist()}."
+        )
+    return split
 
 
 def _probe_alignment_indices(
@@ -576,12 +938,46 @@ def _validate_global_reference_for_prepared_sweep(
     ):
         raise RuntimeError(f"Unsupported global-normalization provenance: {provenance_path}")
     split_path = prepared_root / "sample_index.csv"
-    expected = str(provenance.get("frozen_split_sha256", ""))
-    observed = _sha256(split_path)
-    if not expected or expected != observed:
+    prepared = pd.read_csv(split_path)
+    required = {"sample_key", "sample_id", "source_kind", "split"}
+    if not required.issubset(prepared.columns):
+        raise RuntimeError("Prepared sample index lacks global-reference membership metadata.")
+    train = prepared.loc[prepared["split"].astype(str).str.lower().eq("train")]
+    geo_ids = train.loc[
+        train["source_kind"].astype(str).str.lower().eq("geo"), "sample_id"
+    ].astype(str).tolist()
+    ikem_ids = train.loc[
+        train["source_kind"].astype(str).str.lower().eq("ikem"), "sample_id"
+    ].astype(str).tolist()
+    expected_geo = str(provenance.get("geo_train_sample_ids_sha256", ""))
+    expected_ikem = str(provenance.get("ikem_train_sample_ids_sha256", ""))
+    if provenance.get("method") == "cel_level_train_reference_rma":
+        if (
+            not expected_geo
+            or not expected_ikem
+            or expected_geo != _membership_sha256("GEO", geo_ids)
+            or expected_ikem != _membership_sha256("SUPERVISED", ikem_ids)
+            or int(provenance.get("geo_train_samples", -1)) != len(geo_ids)
+            or int(provenance.get("ikem_no_egfr_train_samples", -1)) != len(ikem_ids)
+        ):
+            raise RuntimeError(
+                "The installed exact global-RMA reference was fitted for different GEO/IKEM "
+                "training identities. Resume the V6 CEL/RMA rebuild before Global RMA jobs."
+            )
+        return
+
+    # The summarized Python fallback has no IKEM contribution and therefore is
+    # not a final-paper global reference when donor-clean IKEM rows are present.
+    if ikem_ids:
         raise RuntimeError(
-            "The installed global-normalization matrix was fitted for a different frozen "
-            "split. Rebuild it with this sweep root before running Global RMA jobs."
+            "The Python probe-set fallback global normalizer excludes IKEM training arrays. "
+            "The final paper sweep requires the exact V6 CEL-level combined reference."
+        )
+    expected = str(provenance.get("frozen_split_sha256", ""))
+    if not expected or expected != _sha256(split_path):
+        raise RuntimeError(
+            "The installed fallback global-normalization matrix was fitted for a different "
+            "frozen split."
         )
 
 
@@ -595,9 +991,9 @@ def load_pretraining_source(
 
     The supervised cohort uses the CEL-derived representation matching the GEO
     arm: raw PM for standardization, frozen IKEM-train-reference RMA for
-    per-GSE RMA, and frozen GEO-train-reference RMA for Global RMA. Samples
-    with any eGFR follow-up are never appended here, and none contributes to a
-    fitted preprocessing parameter.
+    per-GSE RMA, and frozen combined GEO+IKEM-train-reference RMA for Global
+    RMA. Every biopsy from a donor with any finite eGFR is excluded, and none
+    contributes to a fitted preprocessing parameter.
     """
 
     geo = load_training_source(layout, method)
@@ -622,10 +1018,7 @@ def load_pretraining_source(
             root=geo.root,
         )
     supervised_columns = _probe_alignment_indices(geo, supervised)
-    status = classify_supervised_samples(
-        layout, supervised.sample_index[supervised.sample_id_column].astype(str)
-    )
-    eligible = status.table.loc[~status.table["has_egfr"]].reset_index(drop=True)
+    eligible = _ikem_pretraining_split(layout, supervised).reset_index(drop=True)
     if eligible.empty:
         return ExpressionMatrixSource(
             label=geo.label,
@@ -644,7 +1037,11 @@ def load_pretraining_source(
         {
             "sample_id": eligible["sample_id"].astype(str),
             "sample_key": eligible["sample_key"].astype(str),
-            "dataset_role": "supervised dataset · no eGFR",
+            "dataset_role": eligible["dataset_role"].astype(str),
+            "source_kind": "ikem",
+            "donor_id": eligible["donor_id"].astype(str),
+            "training_role": eligible["training_role"].astype(str),
+            "pretraining_split": eligible["split"].astype(str),
             "source_row_index": source_rows,
             "row_index_python": np.arange(
                 len(geo_index), len(geo_index) + len(eligible), dtype=np.int64
@@ -656,7 +1053,7 @@ def load_pretraining_source(
         geo.matrix, supervised.matrix, source_rows, secondary_columns=supervised_columns
     )
     return ExpressionMatrixSource(
-        label=f"{method} + supervised no-eGFR",
+        label=f"{method} + donor-clean IKEM no-eGFR",
         matrix=matrix,
         sample_index=combined_index,
         probe_ids=geo.probe_ids,
@@ -676,7 +1073,7 @@ def prepare_pretraining_assets(
 
     This function is intentionally run once when the sweep is generated.  It
     aligns the supervised expression matrix to the GEO 42,917-probe space,
-    materializes only the outcome-blind supervised rows, freezes a canonical
+    materializes only donor-clean outcome-blind IKEM rows, freezes a canonical
     logical sample order, saves method-specific GEO row maps, and writes the
     final train/validation/test integer row arrays.  Generated jobs only mmap
     these artifacts; they do not classify outcomes, align probes, resplit data,
@@ -714,6 +1111,37 @@ def prepare_pretraining_assets(
         raise ValueError(f"Unknown frozen sample-key namespace: {unknown.tolist()}")
     if geo_split.empty:
         raise ValueError("Frozen pretraining split contains no GEO samples.")
+    if set(geo_split["split"]) != {"train", "validation", "test"}:
+        raise ValueError("Frozen GEO rows must contain train, validation, and test.")
+    _assert_canonical_geo_split_counts(geo_split)
+    if not supervised_split.empty:
+        if set(supervised_split["split"]) != {"train", "validation"}:
+            raise ValueError("Frozen IKEM rows must contain train/validation and no test rows.")
+        required_ikem = {"donor_id", "training_role", "split_unit"}
+        missing_ikem = sorted(required_ikem.difference(supervised_split.columns))
+        if missing_ikem:
+            raise ValueError(
+                "Frozen IKEM split lacks donor-role metadata: " + ", ".join(missing_ikem)
+            )
+        if not supervised_split["split_unit"].astype(str).str.lower().eq("donor").all():
+            raise ValueError("Every frozen IKEM row must use donor as the split unit.")
+        expected_roles = np.where(
+            supervised_split["split"].eq("train"), IKEM_ROLE_TRAIN, IKEM_ROLE_VALIDATION
+        )
+        if not np.array_equal(
+            supervised_split["training_role"].astype(str).to_numpy(), expected_roles
+        ):
+            raise ValueError("Frozen IKEM training roles disagree with split labels.")
+        donor_partitions = supervised_split.groupby("donor_id")["split"].nunique()
+        if (donor_partitions > 1).any():
+            raise ValueError("A frozen IKEM donor crosses train and validation.")
+        audited_ikem = load_ikem_source(layout, method=methods[0])
+        if audited_ikem is None:
+            raise FileNotFoundError(
+                "Frozen split contains IKEM samples, but no audited IKEM CEL "
+                "expression store exists."
+            )
+        _assert_frozen_ikem_split_matches_manifest(supervised_split, audited_ikem)
 
     sources = {method: load_training_source(layout, method) for method in methods}
 
@@ -779,14 +1207,14 @@ def prepare_pretraining_assets(
         method_columns[method] = column_filename
         method_rows_arrays[method] = rows
 
-    # Materialize one outcome-blind supervised matrix per preprocessing arm.
+    # Materialize one donor-clean IKEM matrix per preprocessing arm.
     # Sharing the historical IKEM cohort-RMA matrix across all three arms was
     # inconsistent: GEO raw-standardization and GEO train-reference RMA must be
     # paired with the corresponding CEL-derived IKEM representations.
     supplemental_files: dict[str, str] = {}
     supplemental_paths: dict[str, Path] = {}
     for method in methods:
-        filename = f"supervised_no_egfr_{_method_file_stem(method)}.npy"
+        filename = f"ikem_donor_clean_no_egfr_{_method_file_stem(method)}.npy"
         path = root / filename
         supplemental_files[method] = filename
         supplemental_paths[method] = path
@@ -794,7 +1222,7 @@ def prepare_pretraining_assets(
             supervised = load_ikem_source(layout, method=method)
             if supervised is None:
                 raise FileNotFoundError(
-                    "Frozen split contains supervised samples, but no supervised "
+                    "Frozen split contains IKEM samples, but no audited IKEM CEL "
                     "expression store exists."
                 )
             probe_columns = _probe_alignment_indices(reference, supervised)
@@ -814,7 +1242,7 @@ def prepare_pretraining_assets(
             missing = [key for key in supervised_keys if key not in sample_lookup]
             if missing:
                 raise ValueError(
-                    f"Frozen split contains {len(missing):,} supervised samples absent "
+                    f"Frozen split contains {len(missing):,} IKEM samples absent "
                     f"from the IKEM {method} store; examples: {missing[:5]}."
                 )
             source_rows = np.asarray(
@@ -936,26 +1364,28 @@ def prepare_pretraining_assets(
             "geo_fit_scope": (
                 "each complete source dataset; each dataset occurs in one frozen split only"
             ),
-            "ikem_fit_scope": (
-                "outcome-blind IKEM molecular-pretraining train rows only"
-            ),
+            "ikem_fit_scope": "donor-clean no-eGFR IKEM pretraining-train rows only",
             "n_geo_datasets": int(len(group_order)),
             "n_ikem_reference_rows": int(len(supervised_train_positions)),
-            "uses_egfr": False,
+            "uses_outcome_values_in_fit": False,
+            "uses_outcome_availability_for_partition": True,
             "uses_egfr_cv_fold": False,
         }
 
-    roles = ["unsupervised data · GEO"] * len(geo_keys) + [
-        "supervised dataset · no eGFR"
-    ] * len(supervised_keys)
-    sample_ids = [key.split(":", 1)[1] for key in logical_keys]
+    ordered = frame.set_index("sample_key", drop=False).loc[logical_keys].reset_index(drop=True)
     sample_index = pd.DataFrame(
         {
             "row_index_python": np.arange(len(logical_keys), dtype=np.int64),
             "sample_key": logical_keys,
-            "sample_id": sample_ids,
-            "dataset_role": roles,
+            "sample_id": [key.split(":", 1)[1] for key in logical_keys],
+            "source_kind": ["geo"] * len(geo_keys) + ["ikem"] * len(supervised_keys),
+            "dataset_role": ordered["dataset_role"].astype(str).tolist(),
             "split": [split_lookup[key] for key in logical_keys],
+            "donor_id": ordered.get("donor_id", pd.Series([pd.NA] * len(ordered))),
+            "training_role": ordered.get(
+                "training_role", pd.Series([pd.NA] * len(ordered))
+            ),
+            "split_unit": ordered.get("split_unit", pd.Series([pd.NA] * len(ordered))),
         }
     )
     sample_index.to_csv(root / "sample_index.csv", index=False)
@@ -983,10 +1413,15 @@ def prepare_pretraining_assets(
         ).to_csv(root / "probe_index.csv", index=False)
 
     metadata = {
-        "format": 4,
+        "format": PREPARED_FORMAT,
         "n_samples": int(len(sample_index)),
         "n_geo": int(len(geo_keys)),
-        "n_supervised_no_egfr": int(len(supervised_keys)),
+        "n_ikem_donor_clean_no_egfr": int(len(supervised_keys)),
+        "n_geo_train": int((geo_split["split"] == "train").sum()),
+        "n_geo_validation": int((geo_split["split"] == "validation").sum()),
+        "n_geo_test": int((geo_split["split"] == "test").sum()),
+        "n_ikem_train": int((supervised_split["split"] == "train").sum()),
+        "n_ikem_validation": int((supervised_split["split"] == "validation").sum()),
         "n_probes": int(reference.n_probes),
         "train_rows": "train_rows.npy",
         "validation_rows": "validation_rows.npy",
@@ -998,11 +1433,21 @@ def prepare_pretraining_assets(
         "method_geo_columns": method_columns,
         "method_extra_files": method_extra_files,
         "standardization": standardization_metadata,
+        "validation_selection": {
+            "metric": "clean_reconstruction_mse",
+            "geo_weight": VALIDATION_GEO_WEIGHT,
+            "ikem_weight": 1.0 - VALIDATION_GEO_WEIGHT,
+            "geo_aggregation": "elementwise mean across GEO validation samples",
+            "ikem_aggregation": (
+                "mean per biopsy across probes, mean biopsies within donor, then mean donors"
+            ),
+            "uses_geo_test": False,
+            "uses_egfr_values": False,
+        },
         "policy": (
-            "All sample identities, GEO row mappings, GEO probe-column mappings, supervised "
-            "eligibility/alignment, 90/5/5 logical row indices, and standardization "
-            "parameters were frozen once during sweep generation. Generated jobs only read "
-            "these files."
+            "GEO connected-study 90/5/5 identities and donor-clean IKEM 80/20 "
+            "train/validation identities, row/probe mappings, and standardization parameters "
+            "were frozen once during sweep generation. Generated jobs only read these files."
         ),
     }
     (root / "prepared.json").write_text(
@@ -1019,10 +1464,10 @@ def _load_prepared_metadata(prepared_root: str | Path) -> tuple[Path, dict[str, 
             f"Prepared pretraining metadata not found: {path}. Regenerate the sweep before submitting."
         )
     metadata = json.loads(path.read_text(encoding="utf-8"))
-    if int(metadata.get("format", -1)) != 4:
+    if int(metadata.get("format", -1)) != PREPARED_FORMAT:
         raise ValueError(
-            "Unsupported prepared-pretraining format. Regenerate the sweep after "
-            "installing the GSE290167 CEL-derived IKEM matrices."
+            "Unsupported prepared-pretraining format. Regenerate the donor-safe "
+            "paper sweep after installing the V6 private-CEL IKEM matrices."
         )
     return root, metadata
 
@@ -1119,6 +1564,43 @@ def load_prepared_split_rows(
         raise ValueError("Prepared split contains out-of-range logical row indices.")
     return train_rows, validation_rows, test_rows
 
+
+def load_prepared_validation_partition(
+    prepared_root: str | Path,
+) -> ValidationPartition:
+    """Load frozen validation domains/donors in validation-row order."""
+
+    root, metadata = _load_prepared_metadata(prepared_root)
+    _, validation_rows, _ = load_prepared_split_rows(root)
+    sample_index = _normalize_sample_index(
+        pd.read_csv(root / str(metadata["sample_index"])), int(metadata["n_samples"])
+    )
+    validation = sample_index.iloc[validation_rows].copy()
+    domains = validation["source_kind"].astype(str).str.lower().to_numpy(dtype=str)
+    if set(domains) != {"geo", "ikem"}:
+        raise ValueError(
+            "Paper validation must contain separate GEO and IKEM rows; "
+            f"observed domains: {sorted(set(domains))}."
+        )
+    donor_ids = validation["donor_id"].fillna("").astype(str).str.upper().to_numpy(dtype=str)
+    ikem_mask = domains == "ikem"
+    if np.any(np.char.str_len(donor_ids[ikem_mask]) == 0):
+        raise ValueError("A frozen IKEM validation row has no donor ID.")
+    policy = metadata.get("validation_selection", {})
+    if not isinstance(policy, dict) or policy.get("uses_geo_test") is not False:
+        raise ValueError("Prepared validation-selection policy is missing or unsafe.")
+    geo_weight = float(policy.get("geo_weight", float("nan")))
+    if not np.isclose(geo_weight, VALIDATION_GEO_WEIGHT):
+        raise ValueError("Prepared validation weighting differs from the paper contract.")
+    return ValidationPartition(
+        domains=domains,
+        donor_ids=donor_ids,
+        n_geo=int((domains == "geo").sum()),
+        n_ikem=int(ikem_mask.sum()),
+        n_ikem_donors=int(len(set(donor_ids[ikem_mask]))),
+        geo_weight=geo_weight,
+    )
+
 def assert_probe_alignment(
     training_source: ExpressionMatrixSource,
     evaluation_source: ExpressionMatrixSource,
@@ -1143,13 +1625,13 @@ def create_shared_preprocessing_split(
     train_fraction: float = 0.90,
     methods: list[str] | tuple[str, ...] = tuple(TRAINING_PREPROCESSING_OPTIONS),
     validation_fraction: float = 0.05,
+    ikem_seed: int = IKEM_PRETRAINING_SPLIT_SEED,
+    ikem_validation_fraction: float = IKEM_VALIDATION_FRACTION,
 ) -> pd.DataFrame:
-    """Create the combined molecular 90/5/5 split used for pretraining.
+    """Create the GEO 90/5/5 plus donor-clean IKEM 80/20 split.
 
-    GEO is assigned by connected source-GSE component. Supervised-dataset
-    molecular samples without eGFR are assigned independently by sample using
-    the same seed and target fractions. Samples with eGFR are absent entirely.
-    The public function name is retained for API compatibility.
+    GEO is assigned by connected source-GSE component. IKEM roles must match
+    the audited CEL manifest and are assigned by donor, with no IKEM test rows.
     """
     methods = tuple(dict.fromkeys(str(method) for method in methods))
     if not methods:
@@ -1178,26 +1660,27 @@ def create_shared_preprocessing_split(
     split["sample_id"] = split["GSM"].astype(str)
     split["sample_key"] = [f"GEO:{value}" for value in split["sample_id"]]
     split["dataset_role"] = "unsupervised data · GEO"
+    split["source_kind"] = "geo"
     split["split_unit"] = "connected source-GSE component"
+    _assert_canonical_geo_split_counts(split)
 
     supervised = load_ikem_source(layout)
     if supervised is None or not layout.egfr_table.is_file():
         return split
-    status = classify_supervised_samples(
-        layout, supervised.sample_index[supervised.sample_id_column].astype(str)
-    )
-    supplemental = split_outcome_blind_samples(
-        status,
-        seed=int(seed),
-        train_fraction=float(train_fraction),
-        validation_fraction=float(validation_fraction),
-    )
+    if int(ikem_seed) != IKEM_PRETRAINING_SPLIT_SEED or not np.isclose(
+        float(ikem_validation_fraction), IKEM_VALIDATION_FRACTION
+    ):
+        raise ValueError(
+            "The final paper protocol freezes IKEM seed 20260915 and validation fraction 0.20."
+        )
+    supplemental = _ikem_pretraining_split(layout, supervised)
     if supplemental.empty:
         return split
     supplemental["GSM"] = pd.NA
     supplemental["GSE"] = pd.NA
     supplemental["source_GSE"] = pd.NA
     supplemental["row_index_python"] = pd.NA
+    supplemental["source_kind"] = "ikem"
     columns = list(dict.fromkeys([*split.columns, *supplemental.columns]))
     # Cast both small metadata frames to object before concatenation. This keeps
     # intentionally missing GEO-only metadata on supplemental rows without
@@ -1261,6 +1744,19 @@ def validate_pretraining_split(
         raise ValueError(
             "Split sample universe does not match current molecular data. "
             f"Missing examples: {missing_keys}; extra examples: {extra_keys}."
+        )
+
+    expected_assignments = expected.set_index("sample_key")["split"].astype(str)
+    supplied_assignments = frame.set_index("sample_key")["split"].astype(str)
+    changed_assignments = [
+        key
+        for key in expected_assignments.index
+        if supplied_assignments.get(key) != expected_assignments.get(key)
+    ]
+    if changed_assignments:
+        raise ValueError(
+            "Loaded split changes deterministic frozen GEO/IKEM assignments; examples: "
+            f"{changed_assignments[:5]}."
         )
 
     # Reattach canonical metadata while preserving the user's assignments.

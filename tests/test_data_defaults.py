@@ -89,3 +89,18 @@ def test_status_lists_expected_resources(tmp_path: Path) -> None:
     assert "geo_expr_normalized_to_ikem.parquet" in status
     assert "GEO_NUMPY_STORE/" in status
     assert "ARCHCON_DATA_DIR" in status
+
+
+def test_private_cel_ikem_store_is_preferred_over_historical_store(
+    tmp_path: Path,
+) -> None:
+    data = tmp_path / "data"
+    historical = data / "IKEM_NUMPY_STORE"
+    historical.mkdir(parents=True)
+    assert project_data_layout(data).ikem_store == historical.resolve()
+
+    private_cel = data / "IKEM_CEL_NUMPY_STORE"
+    private_cel.mkdir()
+    layout = project_data_layout(data)
+    assert layout.ikem_store == private_cel.resolve()
+    assert layout.ikem_legacy_store == historical.resolve()

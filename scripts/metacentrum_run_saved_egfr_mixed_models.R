@@ -23,7 +23,7 @@ design$time <- factor(design$time, levels = c("7d", "3m", "6m", "12m"))
 design$patient <- factor(design$patient)
 
 if (!"fit_id" %in% names(specs) || !"fit_id" %in% names(design)) {
-  stop("The saved nested design and specifications must both contain fit_id.")
+  stop("The saved fixed-encoder design and specifications must both contain fit_id.")
 }
 if (anyDuplicated(specs$fit_id)) {
   stop("The saved specifications contain duplicate fit_id values.")
@@ -46,31 +46,35 @@ if (have_metrics && have_predictions) {
     stringsAsFactors = FALSE,
     check.names = FALSE
   )
-  if (
+  reusable_schema <-
     "fit_id" %in% names(previous_metrics) &&
-      "fit_id" %in% names(previous_predictions)
-  ) {
+    "fit_id" %in% names(previous_predictions)
+  if (reusable_schema) {
     completed_ids <- intersect(
       unique(previous_metrics$fit_id),
       unique(previous_predictions$fit_id)
     )
     completed_ids <- intersect(specs$fit_id, completed_ids)
+    previous_metrics <- previous_metrics[
+      previous_metrics$fit_id %in% completed_ids,
+      ,
+      drop = FALSE
+    ]
+    previous_metrics <- previous_metrics[
+      !duplicated(previous_metrics$fit_id),
+      ,
+      drop = FALSE
+    ]
+    previous_predictions <- previous_predictions[
+      previous_predictions$fit_id %in% completed_ids,
+      ,
+      drop = FALSE
+    ]
+  } else {
+    completed_ids <- character()
+    previous_metrics <- previous_metrics[0, , drop = FALSE]
+    previous_predictions <- previous_predictions[0, , drop = FALSE]
   }
-  previous_metrics <- previous_metrics[
-    previous_metrics$fit_id %in% completed_ids,
-    ,
-    drop = FALSE
-  ]
-  previous_metrics <- previous_metrics[
-    !duplicated(previous_metrics$fit_id),
-    ,
-    drop = FALSE
-  ]
-  previous_predictions <- previous_predictions[
-    previous_predictions$fit_id %in% completed_ids,
-    ,
-    drop = FALSE
-  ]
   if (length(completed_ids) > 0) {
     write.table(
       previous_metrics,

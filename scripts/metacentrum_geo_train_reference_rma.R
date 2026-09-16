@@ -37,9 +37,10 @@
 #
 #   /expression/rma_global
 #       Leakage-safe train-reference RMA. The quantile target and probe effects
-#       are fitted on every molecular-pretraining TRAIN array: GEO TRAIN plus
-#       IKEM samples with no measured eGFR. GEO validation/test and every IKEM
-#       sample with measured eGFR never fit them.
+#       are fitted on every molecular-pretraining TRAIN array: 10,522 GEO TRAIN
+#       plus 24 donor-clean IKEM TRAIN biopsies. GEO validation/test, the six
+#       IKEM validation biopsies, and every outcome-held-out IKEM biopsy never
+#       fit them.
 #
 # All three matrices have identical orientation/order:
 #   rows    = samples (GSM)
@@ -51,17 +52,18 @@
 #
 # What the three passes do
 # ------------------------
-#   PASS 1 learns one quantile-normalization target from GEO TRAIN plus IKEM
-#          no-eGFR TRAIN arrays.
+#   PASS 1 learns one quantile-normalization target from 10,522 GEO TRAIN plus
+#          24 donor-clean IKEM TRAIN arrays.
 #   PASS 2 applies that frozen target to every GEO array and also caches the
-#          normalized IKEM no-measured-eGFR TRAIN arrays needed to fit probe
+#          normalized donor-clean IKEM TRAIN arrays needed to fit probe
 #          effects.
 #   PASS 3 learns probe effects from the combined TRAIN columns, saves those
 #          effects, and produces the final GEO sample-by-probe-set matrix.
 #
 # The reusable PASS 1 target and PASS 3 probe effects are exactly what Phase 4
-# later applies to every IKEM array. Only the outcome-free IKEM rows participate
-# in fitting; every measured-eGFR row is transform-only.
+# later applies to every IKEM array. Only the 24 frozen IKEM training rows
+# participate in fitting; IKEM validation and outcome-held-out rows are
+# transform-only.
 #
 # Why files are written in blocks
 # ------------------------------
@@ -3776,8 +3778,8 @@ store_manifest <- data.frame(
     paste0(
       "Train-reference RMA log2 expression. Background correction is per array; ",
       "the quantile target and median-polish probe effects are fitted on frozen ",
-      "GEO TRAIN plus IKEM no-eGFR TRAIN arrays. GEO/IKEM validation and test, ",
-      "and all eGFR arrays, are transformed with frozen parameters only."
+      "GEO TRAIN plus IKEM no-eGFR TRAIN arrays. GEO validation/test, IKEM ",
+      "validation, and all eGFR arrays are transformed with frozen parameters only."
     )
   ),
   stringsAsFactors = FALSE

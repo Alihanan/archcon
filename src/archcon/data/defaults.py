@@ -29,11 +29,15 @@ class ProjectDataLayout:
     geo_rma_store: Path
     geo_stadniuk_store: Path
     ikem_store: Path
+    ikem_cel_store: Path
+    ikem_legacy_store: Path
     cel_directory: Path
 
     @classmethod
     def from_root(cls, root: str | Path) -> "ProjectDataLayout":
         path = Path(root).expanduser().resolve()
+        ikem_cel_store = path / "IKEM_CEL_NUMPY_STORE"
+        ikem_legacy_store = path / "IKEM_NUMPY_STORE"
         return cls(
             root=path,
             expression_matrix=path / "expression_matrix.csv",
@@ -45,7 +49,11 @@ class ProjectDataLayout:
             geo_parquet=path / "geo_expr_normalized_to_ikem.parquet",
             geo_rma_store=path / "GEO_NUMPY_STORE",
             geo_stadniuk_store=path / "GEO_STADNIUK_STORE",
-            ikem_store=path / "IKEM_NUMPY_STORE",
+            ikem_store=(
+                ikem_cel_store if ikem_cel_store.is_dir() else ikem_legacy_store
+            ),
+            ikem_cel_store=ikem_cel_store,
+            ikem_legacy_store=ikem_legacy_store,
             cel_directory=path / "CEL",
         )
 
@@ -56,6 +64,7 @@ def _looks_like_archcon_data_directory(path: Path) -> bool:
         "GEO_NUMPY_STORE",
         "IKEM_NUMPY_STORE",
         "GEO_STADNIUK_STORE",
+        "IKEM_CEL_NUMPY_STORE",
         "splits",
         "common_probes.pkl",
         "gene_annotations.csv",
@@ -146,7 +155,8 @@ def data_directory_status(layout: ProjectDataLayout) -> str:
         ("geo_expr_normalized_to_ikem.parquet", layout.geo_parquet, "file"),
         ("GEO_NUMPY_STORE/", layout.geo_rma_store, "directory"),
         ("GEO_STADNIUK_STORE/", layout.geo_stadniuk_store, "directory"),
-        ("IKEM_NUMPY_STORE/", layout.ikem_store, "directory"),
+        ("IKEM_CEL_NUMPY_STORE/", layout.ikem_cel_store, "directory"),
+        ("IKEM_NUMPY_STORE/ (historical)", layout.ikem_legacy_store, "directory"),
         ("CEL/", layout.cel_directory, "directory"),
     )
 

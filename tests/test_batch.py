@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from archcon.batch import (
     build_run_request,
     generate_sweep_bundle,
@@ -208,11 +210,15 @@ def test_recommended_comparison_sweep_has_1440_architecture_preprocessing_runs(t
     assert "load_prepared_split_rows" in first_job
     assert "create_shared_preprocessing_split" not in first_job
     assert "Test: held out from neural training/ranking and not evaluated by sweep jobs" in first_job
-    assert "Supervised samples with eGFR: completely excluded from molecular pretraining" in first_job
+    assert (
+        "IKEM donors with any finite eGFR: every biopsy excluded from molecular pretraining"
+        in first_job
+    )
     compile(first_job, str(jobs[0]), "exec")
 
 
 def test_generated_python_job_model_is_checkpoint_compatible_with_canonical_builder() -> None:
+    pytest.importorskip("torch")
     from archcon.data.pretraining import ARCH_RESNET_LN
     from archcon.data.training import DEVICE_CPU, build_autoencoder
 

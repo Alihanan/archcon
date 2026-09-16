@@ -1,9 +1,10 @@
 """Frozen kidney embeddings and leakage-safe molecular eGFR evaluation.
 
-Configurations are first selected separately inside every preprocessing by
-architecture group using pooled molecular validation+test reconstruction MSE.
-The six resulting encoders are compared with nested donor-grouped eGFR CV: inner
-folds select the encoder and outer folds evaluate the complete selection rule.
+Configurations are selected inside every preprocessing×architecture group by
+the predeclared GEO/IKEM molecular-validation score stored in ``best.pt``. The
+GEO test partition is evaluated only after those six winners are frozen. The six
+encoders are then evaluated as fixed alternatives with repeated donor-grouped
+eGFR CV; eGFR outcomes never choose an unsupervised encoder.
 Outcome data are joined only after every frozen z has been computed. Molecular
 and clinical scaling, clinical imputation, and PCA are fitted inside each fold.
 """
@@ -32,6 +33,7 @@ from .training_sources import (
     load_ikem_source,
     load_prepared_pretraining_source,
     load_prepared_split_rows,
+    load_prepared_validation_partition,
 )
 
 TIME_LABELS = {
@@ -70,10 +72,17 @@ class ValidationCheckpoint:
     config: TrainingConfig
     input_dim: int = 0
     molecular_validation_mse: float | None = None
+    geo_validation_mse: float | None = None
+    ikem_validation_mse: float | None = None
+    ikem_validation_mse_donor_sd: float | None = None
     molecular_test_mse: float | None = None
+    molecular_test_r2: float | None = None
     molecular_selection_mse: float | None = None
     molecular_selection_r2: float | None = None
     n_molecular_validation: int = 0
+    n_geo_validation: int = 0
+    n_ikem_validation: int = 0
+    n_ikem_validation_donors: int = 0
     n_molecular_test: int = 0
 
 
@@ -205,7 +214,9 @@ def training_config_from_checkpoint(checkpoint: dict) -> TrainingConfig:
     return TrainingConfig(**{key: value for key, value in raw.items() if key in allowed})
 
 
-def _checkpoint_validation_metrics(checkpoint: dict) -> tuple[float, float, float, int]:
+def _checkpoint_validation_metrics(
+    checkpoint: dict,
+) -> tuple[float, float, float, float, float, float, float, int]:
     history = checkpoint.get("history", {})
     if not isinstance(history, dict):
         raise TypeError("Malformed checkpoint history.")
@@ -216,6 +227,46 @@ def _checkpoint_validation_metrics(checkpoint: dict) -> tuple[float, float, floa
     val_r2 = list(history.get("val_r2", []))
     val_loss = list(history.get("val_loss", []))
     val_epoch = list(history.get("val_epoch", []))
+    selection_score = list(history.get("selection_score", []))
+    geo_mse = list(history.get("geo_mse", []))
+    ikem_mse = list(history.get("ikem_mse", []))
+    ikem_mse_donor_sd = list(history.get("ikem_mse_donor_sd", []))
+    policy = checkpoint.get("validation_selection_policy", {})
+    if (
+        len(selection_score) != len(val_mse)
+        or len(geo_mse) != len(val_mse)
+        or len(ikem_mse) != len(val_mse)
+        or len(ikem_mse_donor_sd) != len(val_mse)
+        or not isinstance(policy, dict)
+        or policy.get("metric") != "clean_reconstruction_mse"
+        or policy.get("ikem_aggregation") != "donor_balanced"
+        or policy.get("ikem_uncertainty") != "sample_sd_across_donor_mean_mse"
+        or policy.get("uses_geo_test") is not False
+        or policy.get("uses_egfr_values") is not False
+        or not np.isclose(float(policy.get("geo_weight", -1.0)), 0.5)
+        or not np.isclose(float(policy.get("ikem_weight", -1.0)), 0.5)
+    ):
+        raise ValueError(
+            "Checkpoint predates the donor-balanced GEO/IKEM validation policy."
+        )
+    current_values = np.asarray(
+        [selection_score[index], geo_mse[index], ikem_mse[index], ikem_mse_donor_sd[index]],
+        dtype=np.float64,
+    )
+    expected_selection = 0.5 * float(geo_mse[index]) + 0.5 * float(ikem_mse[index])
+    declared_best = float(
+        checkpoint.get("best_selection_score", checkpoint.get("best_val_loss", float("nan")))
+    )
+    if (
+        not np.isfinite(current_values).all()
+        or not np.isclose(
+            float(selection_score[index]), expected_selection, rtol=1e-9, atol=1e-12
+        )
+        or not np.isclose(declared_best, float(selection_score[index]), rtol=1e-9, atol=1e-12)
+    ):
+        raise ValueError(
+            "Checkpoint validation components, composite score, and saved best score disagree."
+        )
     return (
         float(val_mse[index]),
         float(val_r2[index]) if index < len(val_r2) else float("nan"),
@@ -224,11 +275,11 @@ def _checkpoint_validation_metrics(checkpoint: dict) -> tuple[float, float, floa
             if index < len(val_loss)
             else float(checkpoint.get("best_val_loss", float("nan")))
         ),
-        (
-            int(val_epoch[index])
-            if index < len(val_epoch)
-            else int(checkpoint.get("epoch", 0))
-        ),
+        float(selection_score[index]),
+        float(geo_mse[index]),
+        float(ikem_mse[index]),
+        float(ikem_mse_donor_sd[index]),
+        int(val_epoch[index]) if index < len(val_epoch) else int(checkpoint.get("epoch", 0)),
     )
 
 
@@ -237,7 +288,7 @@ def scan_validation_checkpoints(
     *,
     progress=None,
 ) -> tuple[list[ValidationCheckpoint], list[str]]:
-    """Rank readable ``best.pt`` files by clean validation MSE.
+    """Read ``best.pt`` files carrying the exact domain-balanced validation score.
 
     Returns both records and warning strings so callers can report incomplete or
     corrupt runs without treating them as scientific results.
@@ -254,7 +305,9 @@ def scan_validation_checkpoints(
             continue
         try:
             checkpoint = load_checkpoint_metadata(path)
-            mse, r2, objective, epoch = _checkpoint_validation_metrics(checkpoint)
+            mse, r2, objective, selection, geo_mse, ikem_mse, ikem_sd, epoch = (
+                _checkpoint_validation_metrics(checkpoint)
+            )
             config = training_config_from_checkpoint(checkpoint)
             input_dim = int(checkpoint.get("input_dim", 0))
             records.append(
@@ -271,6 +324,11 @@ def scan_validation_checkpoints(
                     best_epoch=epoch,
                     config=config,
                     input_dim=input_dim,
+                    molecular_validation_mse=selection,
+                    geo_validation_mse=geo_mse,
+                    ikem_validation_mse=ikem_mse,
+                    ikem_validation_mse_donor_sd=ikem_sd,
+                    molecular_selection_mse=selection,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - one corrupt run must not stop the scan
@@ -282,7 +340,7 @@ def scan_validation_checkpoints(
             progress(index, total, len(records))
         if index % 50 == 0:
             gc.collect()
-    records.sort(key=lambda record: record.validation_mse)
+    records.sort(key=lambda record: float(record.molecular_selection_mse))
     return records, warnings
 
 
@@ -343,35 +401,95 @@ def score_molecular_selection_records(
     batch_size: int = 64,
     progress=None,
 ) -> list[ValidationCheckpoint]:
-    """Score every validation-selected checkpoint on pooled validation+test rows.
+    """Validate and rank checkpoint-embedded molecular validation scores.
 
-    ``best.pt`` still fixes the epoch without looking at the molecular test rows.
-    At this later comparison stage validation and test rows deliberately become
-    one molecular selection set. Their SSEs are pooled, rather than averaging
-    two MSEs with unequal sample counts.
+    The function deliberately never evaluates ``test_rows``. Its historical
+    name is retained for API compatibility.
     """
 
     if not records:
         raise ValueError("No readable validation checkpoints were found.")
+    prepared = Path(prepared_root).expanduser().resolve()
+    _, validation_rows, _ = load_prepared_split_rows(prepared)
+    partition = load_prepared_validation_partition(prepared)
+    scored: list[ValidationCheckpoint] = []
+    total = len(records)
+    validated_methods: set[str] = set()
+    for processed, record in enumerate(records, start=1):
+        if progress is not None:
+            progress(processed, total, record)
+        if record.method not in validated_methods:
+            source = load_prepared_pretraining_source(layout, record.method, prepared)
+            if int(source.matrix.shape[1]) != int(record.input_dim):
+                raise ValueError(
+                    f"Prepared source/checkpoint feature mismatch for {record.run}: "
+                    f"{source.matrix.shape[1]} vs {record.input_dim}."
+                )
+            del source
+            validated_methods.add(record.method)
+        checkpoint = load_checkpoint_metadata(record.path)
+        checkpoint_rows = np.asarray(checkpoint.get("validation_rows", []), dtype=np.int64)
+        checkpoint_domains = np.asarray(checkpoint.get("validation_domains", []), dtype=str)
+        checkpoint_donors = np.asarray(checkpoint.get("validation_donor_ids", []), dtype=str)
+        if (
+            not np.array_equal(checkpoint_rows, validation_rows)
+            or not np.array_equal(checkpoint_domains, partition.domains)
+            or not np.array_equal(checkpoint_donors, partition.donor_ids)
+        ):
+            raise ValueError(
+                f"Checkpoint {record.run} does not match the frozen validation identities."
+            )
+        scored.append(
+            replace(
+                record,
+                checkpoint=None,
+                molecular_selection_mse=record.molecular_validation_mse,
+                n_molecular_validation=len(validation_rows),
+                n_geo_validation=partition.n_geo,
+                n_ikem_validation=partition.n_ikem,
+                n_ikem_validation_donors=partition.n_ikem_donors,
+                n_molecular_test=0,
+            )
+        )
+    return sorted(
+        scored,
+        key=lambda record: (
+            record.method,
+            record.architecture,
+            float(record.molecular_selection_mse),
+        ),
+    )
+
+
+def evaluate_frozen_molecular_test_records(
+    selected: list[tuple[str, str, ValidationCheckpoint]],
+    layout: ProjectDataLayout,
+    prepared_root: str | Path,
+    *,
+    device: str = "cpu",
+    batch_size: int = 64,
+    progress=None,
+) -> list[tuple[str, str, ValidationCheckpoint]]:
+    """Evaluate GEO test once, after validation has frozen all group winners."""
+
+    if not selected:
+        return []
     try:
         import torch
     except ImportError as exc:  # pragma: no cover - optional training dependency
         raise RuntimeError("PyTorch is required; install archcon[training].") from exc
 
     prepared = Path(prepared_root).expanduser().resolve()
-    _, validation_rows, test_rows = load_prepared_split_rows(prepared)
-    scored: list[ValidationCheckpoint] = []
-    total = len(records)
+    _, _, test_rows = load_prepared_split_rows(prepared)
+    evaluated: list[tuple[str, str, ValidationCheckpoint]] = []
+    total = len(selected)
+    by_method: dict[str, list[tuple[str, str, ValidationCheckpoint]]] = {}
+    for item in selected:
+        by_method.setdefault(item[2].method, []).append(item)
     processed = 0
-    # Keep only one preprocessing store mapped at a time.  This also makes
-    # sequential reads friendlier to the OS page cache on memory-limited nodes.
-    methods = list(dict.fromkeys(record.method for record in records))
-    for method in methods:
+    for method, items in by_method.items():
         source = load_prepared_pretraining_source(layout, method, prepared)
-        validation_count, validation_sum, validation_sum2 = _target_totals(
-            source.matrix, validation_rows, batch_size=batch_size
-        )
-        for record in (item for item in records if item.method == method):
+        for model_id, label, record in items:
             processed += 1
             if progress is not None:
                 progress(processed, total, record)
@@ -393,39 +511,24 @@ def score_molecular_selection_records(
             gc.collect()
             if str(device).startswith("cuda"):
                 torch.cuda.empty_cache()
-
-            validation_sse = float(record.validation_mse) * validation_count
-            combined_sse = validation_sse + test[0]
-            combined_count = validation_count + test[1]
-            combined_sum = validation_sum + test[2]
-            combined_sum2 = validation_sum2 + test[3]
-            denominator = combined_sum2 - combined_sum * combined_sum / max(combined_count, 1)
-            combined_r2 = (
-                1.0 - combined_sse / denominator if denominator > 0.0 else float("nan")
-            )
-            scored.append(
-                replace(
-                    record,
-                    checkpoint=None,
-                    input_dim=input_dim,
-                    molecular_validation_mse=record.validation_mse,
-                    molecular_test_mse=test[0] / max(test[1], 1),
-                    molecular_selection_mse=combined_sse / max(combined_count, 1),
-                    molecular_selection_r2=combined_r2,
-                    n_molecular_validation=len(validation_rows),
-                    n_molecular_test=len(test_rows),
+            denominator = test[3] - test[2] * test[2] / max(test[1], 1)
+            test_r2 = 1.0 - test[0] / denominator if denominator > 0.0 else float("nan")
+            evaluated.append(
+                (
+                    model_id,
+                    label,
+                    replace(
+                        record,
+                        input_dim=input_dim,
+                        molecular_test_mse=test[0] / max(test[1], 1),
+                        molecular_test_r2=test_r2,
+                        n_molecular_test=len(test_rows),
+                    ),
                 )
             )
         del source
         gc.collect()
-    return sorted(
-        scored,
-        key=lambda record: (
-            record.method,
-            record.architecture,
-            float(record.molecular_selection_mse),
-        ),
-    )
+    return evaluated
 
 
 def select_molecular_group_winners(
@@ -433,7 +536,7 @@ def select_molecular_group_winners(
     *,
     expected_groups: int | None = 6,
 ) -> list[tuple[str, str, ValidationCheckpoint]]:
-    """Select one pooled validation+test winner per preprocessing×architecture."""
+    """Select one validation-only winner per preprocessing×architecture."""
 
     if not records:
         raise ValueError("No molecular selection scores were supplied.")
@@ -467,36 +570,45 @@ def save_molecular_selection(
     selected: list[tuple[str, str, ValidationCheckpoint]],
     output_root: str | Path,
 ) -> tuple[Path, Path]:
-    """Persist all pooled scores and the six group winners."""
+    """Persist validation-only rankings and post-freeze test audits."""
 
     root = Path(output_root).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
-    rows = [
-        {
+
+    def row_for(record: ValidationCheckpoint) -> dict[str, object]:
+        return {
             "run": record.run,
             "checkpoint": str(record.path),
             "preprocessing": record.method,
             "architecture": record.architecture,
             "latent_dim": record.latent_dim,
             "best_epoch": record.best_epoch,
-            "checkpoint_validation_mse": record.validation_mse,
-            "selection_validation_mse": record.molecular_validation_mse,
-            "test_mse": record.molecular_test_mse,
-            "pooled_validation_test_mse": record.molecular_selection_mse,
-            "pooled_validation_test_r2": record.molecular_selection_r2,
+            "all_validation_mse": record.validation_mse,
+            "geo_validation_mse": record.geo_validation_mse,
+            "ikem_validation_donor_balanced_mse": record.ikem_validation_mse,
+            "ikem_validation_donor_mse_sd": record.ikem_validation_mse_donor_sd,
+            "validation_selection_score": record.molecular_selection_mse,
             "n_validation_samples": record.n_molecular_validation,
+            "n_geo_validation_samples": record.n_geo_validation,
+            "n_ikem_validation_samples": record.n_ikem_validation,
+            "n_ikem_validation_donors": record.n_ikem_validation_donors,
+            "geo_test_mse_post_freeze": record.molecular_test_mse,
+            "geo_test_r2_post_freeze": record.molecular_test_r2,
             "n_test_samples": record.n_molecular_test,
+            "selection_uses_geo_test": False,
         }
-        for record in records
-    ]
+    rows = [row_for(record) for record in records]
     scores = pd.DataFrame(rows).sort_values(
-        ["preprocessing", "architecture", "pooled_validation_test_mse"]
+        ["preprocessing", "architecture", "validation_selection_score"]
     )
     score_path = root / "molecular_selection_scores.csv"
     scores.to_csv(score_path, index=False)
-    selected_runs = {record.run: model_id for model_id, _, record in selected}
-    winners = scores.loc[scores["run"].isin(selected_runs)].copy()
-    winners.insert(0, "candidate_id", winners["run"].map(selected_runs))
+    winner_rows = []
+    for model_id, _, record in selected:
+        row = row_for(record)
+        row = {"candidate_id": model_id, **row}
+        winner_rows.append(row)
+    winners = pd.DataFrame(winner_rows).sort_values(["preprocessing", "architecture"])
     winner_path = root / "molecular_group_winners.csv"
     winners.to_csv(winner_path, index=False)
     return score_path, winner_path
@@ -739,10 +851,14 @@ def save_embeddings(
                 "latent_dim": result.record.latent_dim,
                 "validation_mse": result.record.validation_mse,
                 "validation_r2": result.record.validation_r2,
-                "molecular_validation_mse": result.record.molecular_validation_mse,
-                "molecular_test_mse": result.record.molecular_test_mse,
-                "molecular_selection_mse": result.record.molecular_selection_mse,
-                "molecular_selection_r2": result.record.molecular_selection_r2,
+                "geo_validation_mse": result.record.geo_validation_mse,
+                "ikem_validation_donor_balanced_mse": result.record.ikem_validation_mse,
+                "ikem_validation_donor_mse_sd": (
+                    result.record.ikem_validation_mse_donor_sd
+                ),
+                "validation_selection_score": result.record.molecular_selection_mse,
+                "geo_test_mse_post_freeze": result.record.molecular_test_mse,
+                "geo_test_r2_post_freeze": result.record.molecular_test_r2,
                 "best_epoch": result.record.best_epoch,
                 "reconstruction_mse_supervised_all": result.reconstruction_mse,
                 "config": asdict(result.record.config),
@@ -985,12 +1101,17 @@ def prepare_mixed_model_design(
         test_features = np.column_stack(
             (test_main_features, test_interaction_features)
         ).astype(np.float32, copy=False)
+        fit_id = f"fixed_r{repeat:03d}_f{fold:03d}_{_slug(model_id)}"
         specifications.append(
             {
+                "fit_id": fit_id,
+                "stage": "fixed_evaluation",
                 "model_id": model_id,
                 "model_label": label,
+                "candidate_id": model_id if model_id in embedding_matrices else "",
                 "repeat": repeat,
                 "fold": fold,
+                "inner_fold": -1,
                 "n_features": n_features,
                 "n_main_features": n_main_features,
                 "n_time_interaction_features": n_time_interaction_features,
@@ -1005,6 +1126,7 @@ def prepare_mixed_model_design(
             subset = long.loc[long["patient"].isin(patient_ids), ["patient", "donor", "time", "egfr"]].copy()
             feature_lookup = {patients.iloc[index]["patient"]: features[position] for position, index in enumerate(indices)}
             subset.insert(0, "partition", partition)
+            subset.insert(0, "fit_id", fit_id)
             subset.insert(0, "fold", fold)
             subset.insert(0, "repeat", repeat)
             subset.insert(0, "model_id", model_id)
@@ -1013,6 +1135,10 @@ def prepare_mixed_model_design(
                     float(feature_lookup[patient][feature_index]) for patient in subset["patient"]
                 ]
             rows.append(subset)
+
+    embedding_dimensions = sorted(
+        {int(matrix.shape[1]) for matrix in embedding_matrices.values()}
+    )
 
     for repeat, fold, train_index, test_index in fold_definitions:
         empty_train = np.empty((len(train_index), 0), dtype=np.float32)
@@ -1044,27 +1170,42 @@ def prepare_mixed_model_design(
                 test_features,
                 feature_description=f"{model_id} latent components",
             )
-        train_pca: np.ndarray | None = None
-        test_pca: np.ndarray | None = None
+        pca_by_dimension: dict[int, tuple[np.ndarray, np.ndarray, str]] = {}
         if include_pca:
-            winner_dim = embeddings[0].z.shape[1]
-            n_components = min(int(winner_dim), len(train_index) - 1, expression.shape[1])
-            pca = PCA(n_components=n_components, svd_solver="randomized", random_state=seed + repeat)
-            train_pca = pca.fit_transform(expression[train_index])
-            test_pca = pca.transform(expression[test_index])
-            train_pca, test_pca = _standardize_train_test(train_pca, test_pca)
-            labels["pca"] = f"Fold-fitted PCA ({n_components} components)"
-            append_model(
-                "pca",
-                labels["pca"],
-                repeat,
-                fold,
-                train_index,
-                test_index,
-                train_pca,
-                test_pca,
-                feature_description="fold-fitted PCA components",
-            )
+            for requested_dimension in embedding_dimensions:
+                n_components = min(
+                    requested_dimension, len(train_index) - 1, expression.shape[1]
+                )
+                pca = PCA(
+                    n_components=n_components,
+                    svd_solver="randomized",
+                    random_state=seed + repeat,
+                )
+                train_pca = pca.fit_transform(expression[train_index])
+                test_pca = pca.transform(expression[test_index])
+                train_pca, test_pca = _standardize_train_test(train_pca, test_pca)
+                pca_id = (
+                    "pca"
+                    if len(embedding_dimensions) == 1
+                    else f"pca_d{requested_dimension}"
+                )
+                labels[pca_id] = f"Fold-fitted PCA ({n_components} components)"
+                pca_by_dimension[requested_dimension] = (
+                    train_pca,
+                    test_pca,
+                    pca_id,
+                )
+                append_model(
+                    pca_id,
+                    labels[pca_id],
+                    repeat,
+                    fold,
+                    train_index,
+                    test_index,
+                    train_pca,
+                    test_pca,
+                    feature_description="fold-fitted PCA components",
+                )
 
         if include_clinical:
             train_clinical, test_clinical = _impute_standardize_train_test(
@@ -1106,39 +1247,45 @@ def prepare_mixed_model_design(
                 feature_description=" + ".join(clinical_columns),
             )
 
-            winner_train, winner_test = standardized_embeddings["winner_z"]
             kdri_index = clinical_indices["KDRI_8"]
-            append_model(
-                "winner_z_kdri",
-                "Winner z + KDRI × time",
-                repeat,
-                fold,
-                train_index,
-                test_index,
-                winner_train,
-                winner_test,
-                train_clinical[:, [kdri_index]],
-                test_clinical[:, [kdri_index]],
-                feature_description="winner_z + KDRI_8",
-            )
-            append_model(
-                "winner_z_clinical",
-                "Winner z + full clinical × time",
-                repeat,
-                fold,
-                train_index,
-                test_index,
-                winner_train,
-                winner_test,
-                train_clinical,
-                test_clinical,
-                feature_description="winner_z + " + " + ".join(clinical_columns),
-            )
-
-            if include_pca and train_pca is not None and test_pca is not None:
+            for model_id, (embedding_train, embedding_test) in (
+                standardized_embeddings.items()
+            ):
                 append_model(
-                    "pca_kdri",
-                    "PCA + KDRI × time",
+                    f"{model_id}_kdri",
+                    f"{labels[model_id]} + KDRI × time",
+                    repeat,
+                    fold,
+                    train_index,
+                    test_index,
+                    embedding_train,
+                    embedding_test,
+                    train_clinical[:, [kdri_index]],
+                    test_clinical[:, [kdri_index]],
+                    feature_description=f"{model_id} + KDRI_8",
+                )
+                append_model(
+                    f"{model_id}_clinical",
+                    f"{labels[model_id]} + full clinical × time",
+                    repeat,
+                    fold,
+                    train_index,
+                    test_index,
+                    embedding_train,
+                    embedding_test,
+                    train_clinical,
+                    test_clinical,
+                    feature_description=model_id + " + " + " + ".join(clinical_columns),
+                )
+
+            for requested_dimension, (
+                train_pca,
+                test_pca,
+                pca_id,
+            ) in pca_by_dimension.items():
+                append_model(
+                    f"{pca_id}_kdri",
+                    f"{labels[pca_id]} + KDRI × time",
                     repeat,
                     fold,
                     train_index,
@@ -1147,11 +1294,11 @@ def prepare_mixed_model_design(
                     test_pca,
                     train_clinical[:, [kdri_index]],
                     test_clinical[:, [kdri_index]],
-                    feature_description="PCA + KDRI_8",
+                    feature_description=f"PCA({requested_dimension}) + KDRI_8",
                 )
                 append_model(
-                    "pca_clinical",
-                    "PCA + full clinical × time",
+                    f"{pca_id}_clinical",
+                    f"{labels[pca_id]} + full clinical × time",
                     repeat,
                     fold,
                     train_index,
@@ -1160,7 +1307,10 @@ def prepare_mixed_model_design(
                     test_pca,
                     train_clinical,
                     test_clinical,
-                    feature_description="PCA + " + " + ".join(clinical_columns),
+                    feature_description=(
+                        f"PCA({requested_dimension}) + "
+                        + " + ".join(clinical_columns)
+                    ),
                 )
 
     design = pd.concat(rows, ignore_index=True, sort=False)
@@ -1767,6 +1917,180 @@ def finalize_nested_selection(
     final_metric_frame.to_csv(final_metrics_path, index=False)
     final_prediction_frame.to_csv(final_predictions_path, index=False)
     return final_metrics_path, final_predictions_path, selections, deployment_ranking
+
+
+def summarize_fixed_encoder_results(
+    metrics_path: str | Path,
+    predictions_path: str | Path,
+    embeddings: list[EmbeddingResult],
+    output_root: str | Path,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Summarize fixed-encoder eGFR CV without outcome-based encoder selection."""
+
+    if not embeddings:
+        raise ValueError("At least one frozen encoder is required.")
+    metrics = pd.read_csv(metrics_path)
+    predictions = pd.read_csv(predictions_path)
+    required = {"model_id", "model_label", "repeat", "fold", "rmse", "mae"}
+    missing = required.difference(metrics.columns)
+    if missing:
+        raise ValueError(f"Mixed-model metrics are missing columns: {sorted(missing)}")
+    candidate_ids = [result.model_id for result in embeddings]
+    if len(candidate_ids) != len(set(candidate_ids)):
+        raise ValueError("Frozen encoder model IDs must be unique.")
+    available = set(metrics["model_id"].astype(str))
+    absent = sorted(set(candidate_ids).difference(available))
+    if absent:
+        raise ValueError(f"Mixed-model results omit frozen encoders: {absent}")
+    key = ["repeat", "fold"]
+    if metrics.duplicated(["model_id", *key]).any():
+        raise ValueError("Mixed-model metrics contain duplicate model/fold rows.")
+    reference = metrics.loc[
+        metrics["model_id"].eq("time_only"), key + ["rmse"]
+    ].rename(columns={"rmse": "rmse_time_only"})
+    if reference.empty:
+        raise ValueError("Mixed-model results omit the time-only baseline.")
+    merged = metrics.merge(reference, on=key, how="left", validate="many_to_one")
+    if merged["rmse_time_only"].isna().any():
+        raise ValueError("Some model folds have no matching time-only baseline.")
+    merged["delta_vs_time_only"] = merged["rmse_time_only"] - merged["rmse"]
+
+    prediction_required = {"model_id", "egfr", "prediction"}
+    prediction_missing = prediction_required.difference(predictions.columns)
+    if prediction_missing:
+        raise ValueError(
+            "Mixed-model predictions are missing columns: "
+            f"{sorted(prediction_missing)}"
+        )
+    pooled = (
+        predictions.assign(
+            squared_error=lambda value: (value["egfr"] - value["prediction"]) ** 2
+        )
+        .groupby("model_id", as_index=False)["squared_error"]
+        .mean()
+        .rename(columns={"squared_error": "pooled_mse"})
+    )
+    pooled["pooled_rmse"] = np.sqrt(pooled["pooled_mse"])
+    summary = (
+        merged.groupby(["model_id", "model_label"], as_index=False)
+        .agg(
+            mean_rmse=("rmse", "mean"),
+            sd_rmse=("rmse", "std"),
+            mean_mae=("mae", "mean"),
+            mean_delta_vs_time=("delta_vs_time_only", "mean"),
+            sd_delta_vs_time=("delta_vs_time_only", "std"),
+            positive_folds_vs_time=(
+                "delta_vs_time_only", lambda value: float((value > 0).mean())
+            ),
+            n_folds=("rmse", "count"),
+        )
+        .merge(pooled[["model_id", "pooled_rmse"]], on="model_id", how="left")
+    )
+    summary["se_rmse"] = summary["sd_rmse"] / np.sqrt(summary["n_folds"])
+    summary["mean_rmse_ci95_low"] = summary["mean_rmse"] - 1.96 * summary["se_rmse"]
+    summary["mean_rmse_ci95_high"] = summary["mean_rmse"] + 1.96 * summary["se_rmse"]
+    summary["se_delta_vs_time"] = summary["sd_delta_vs_time"] / np.sqrt(
+        summary["n_folds"]
+    )
+    summary["delta_vs_time_ci95_low"] = (
+        summary["mean_delta_vs_time"] - 1.96 * summary["se_delta_vs_time"]
+    )
+    summary["delta_vs_time_ci95_high"] = (
+        summary["mean_delta_vs_time"] + 1.96 * summary["se_delta_vs_time"]
+    )
+
+    metadata = pd.DataFrame(
+        [
+            {
+                "model_id": result.model_id,
+                "frozen_order": index,
+                "run": result.record.run,
+                "preprocessing": result.record.method,
+                "architecture": result.record.architecture,
+                "latent_dim": int(result.z.shape[1]),
+                "molecular_validation_selection_score": (
+                    result.record.molecular_selection_mse
+                ),
+                "geo_test_mse_post_freeze": result.record.molecular_test_mse,
+            }
+            for index, result in enumerate(embeddings)
+        ]
+    )
+    fixed = metadata.merge(summary, on="model_id", how="left", validate="one_to_one")
+    fixed = fixed.sort_values("frozen_order").reset_index(drop=True)
+
+    comparisons: list[dict[str, object]] = []
+
+    def append_comparison(
+        candidate_id: str,
+        candidate_model_id: str,
+        baseline_model_id: str,
+        comparison: str,
+    ) -> None:
+        if candidate_model_id not in available or baseline_model_id not in available:
+            return
+        candidate = metrics.loc[
+            metrics["model_id"].eq(candidate_model_id), key + ["rmse"]
+        ].rename(columns={"rmse": "candidate_rmse"})
+        baseline = metrics.loc[
+            metrics["model_id"].eq(baseline_model_id), key + ["rmse"]
+        ].rename(columns={"rmse": "baseline_rmse"})
+        matched = baseline.merge(candidate, on=key, validate="one_to_one")
+        gain = matched["baseline_rmse"] - matched["candidate_rmse"]
+        n_folds = len(gain)
+        sd_gain = float(gain.std(ddof=1)) if n_folds > 1 else float("nan")
+        se_gain = sd_gain / np.sqrt(n_folds) if n_folds else float("nan")
+        comparisons.append(
+            {
+                "candidate_id": candidate_id,
+                "candidate_model_id": candidate_model_id,
+                "baseline_model_id": baseline_model_id,
+                "comparison": comparison,
+                "mean_gain": float(gain.mean()),
+                "sd_gain": sd_gain,
+                "se_gain": se_gain,
+                "gain_ci95_low": float(gain.mean()) - 1.96 * se_gain,
+                "gain_ci95_high": float(gain.mean()) + 1.96 * se_gain,
+                "candidate_better_fraction": float((gain > 0).mean()),
+                "n_folds": n_folds,
+            }
+        )
+
+    multiple_dimensions = len({int(result.z.shape[1]) for result in embeddings}) > 1
+    for result in embeddings:
+        candidate_id = result.model_id
+        pca_id = f"pca_d{int(result.z.shape[1])}" if multiple_dimensions else "pca"
+        append_comparison(candidate_id, candidate_id, "time_only", "z vs time only")
+        append_comparison(candidate_id, candidate_id, pca_id, "z vs matched PCA")
+        append_comparison(
+            candidate_id,
+            f"{candidate_id}_kdri",
+            "clinical_kdri",
+            "z + KDRI vs KDRI",
+        )
+        append_comparison(
+            candidate_id,
+            f"{candidate_id}_clinical",
+            "clinical_full",
+            "z + clinical vs clinical",
+        )
+        append_comparison(
+            candidate_id,
+            f"{candidate_id}_clinical",
+            f"{pca_id}_clinical",
+            "z + clinical vs matched PCA + clinical",
+        )
+    comparison_frame = pd.DataFrame(comparisons)
+
+    root = Path(output_root).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    merged.to_csv(root / "fold_metrics_with_deltas.csv", index=False)
+    summary.sort_values(["model_id"]).to_csv(
+        root / "all_model_cv_summary.csv", index=False
+    )
+    fixed.to_csv(root / "fixed_encoder_cv_summary.csv", index=False)
+    comparison_frame.to_csv(root / "fixed_encoder_comparisons.csv", index=False)
+    return summary, fixed, comparison_frame
 
 
 def summarize_mixed_model_results(

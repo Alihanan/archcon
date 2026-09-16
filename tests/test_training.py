@@ -497,42 +497,47 @@ def test_cosine_schedule_decreases_deterministically(tmp_path: Path) -> None:
     assert all(left > right for left, right in zip(final.learning_rates, final.learning_rates[1:]))
 
 
-def test_ikem_diagnostic_does_not_change_geo_training_or_selection(tmp_path: Path) -> None:
+def test_ikem_validation_materially_enters_checkpoint_selection(tmp_path: Path) -> None:
     from archcon.data.training import LR_SCHEDULE_COSINE
 
     rng = np.random.default_rng(41)
     matrix = rng.normal(size=(24, 8)).astype(np.float32)
-    ikem = rng.normal(loc=5.0, scale=3.0, size=(5, 8)).astype(np.float32)
     config = _tiny_config(LOSS_MSE, epochs=3)
     config = TrainingConfig(**{**config.__dict__, "lr_schedule": LR_SCHEDULE_COSINE})
-
-    without = list(
+    final = list(
         train_autoencoder_stream(
             matrix,
             np.arange(18),
             np.arange(18, 24),
             config,
-            tmp_path / "without",
+            tmp_path / "paper",
             method="geo",
-        )
-    )[-1]
-    with_ikem = list(
-        train_autoencoder_stream(
-            matrix,
-            np.arange(18),
-            np.arange(18, 24),
-            config,
-            tmp_path / "with",
-            method="geo",
-            evaluation_matrix=ikem,
-            evaluation_label="IKEM",
+            validation_domains=np.asarray(["geo"] * 4 + ["ikem"] * 2),
+            validation_donor_ids=np.asarray([""] * 4 + ["D100", "D101"]),
         )
     )[-1]
 
-    assert np.allclose(without.val_loss, with_ikem.val_loss, rtol=0, atol=1e-7)
-    assert len(with_ikem.ikem_mse) == len(with_ikem.val_epoch)
-    assert len(with_ikem.ikem_r2) == len(with_ikem.val_epoch)
-    assert Path(without.best_checkpoint).name == Path(with_ikem.best_checkpoint).name == "best.pt"
+    expected = 0.5 * np.asarray(final.geo_mse) + 0.5 * np.asarray(final.ikem_mse)
+    np.testing.assert_allclose(final.selection_score, expected)
+    assert len(final.ikem_mse) == len(final.val_epoch)
+    assert len(final.ikem_r2) == len(final.val_epoch)
+    assert len(final.ikem_mse_donor_sd) == len(final.val_epoch)
+    assert Path(final.best_checkpoint).name == "best.pt"
+
+
+def test_donor_balancing_does_not_double_weight_paired_biopsies() -> None:
+    from archcon.data.training import _weighted_clean_metrics
+
+    # First two biopsies are siblings and receive half weight each; the third
+    # belongs to another donor and receives weight one.
+    mse, _ = _weighted_clean_metrics(
+        np.asarray([10.0, 14.0, 100.0]),
+        np.asarray([2.0, 2.0, 2.0]),
+        np.asarray([4.0, 4.0, 4.0]),
+        2,
+        np.asarray([0.5, 0.5, 1.0]),
+    )
+    assert mse == pytest.approx(28.0)
 
 
 def test_best_validation_epoch_is_circled_on_each_metric_plot() -> None:

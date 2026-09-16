@@ -11,17 +11,17 @@ from .data.defaults import project_data_layout
 from .data.downstream import (
     CLINICAL_COLUMNS,
     aligned_ikem_matrix,
+    evaluate_frozen_molecular_test_records,
     extract_checkpoint_embedding,
-    finalize_nested_selection,
     load_egfr_wide,
-    prepare_nested_mixed_model_design,
+    prepare_mixed_model_design,
     run_lme4_benchmark,
     save_embeddings,
     save_molecular_selection,
     scan_validation_checkpoints,
     score_molecular_selection_records,
     select_molecular_group_winners,
-    summarize_mixed_model_results,
+    summarize_fixed_encoder_results,
 )
 from .data.geo_rma import METHOD_PER_GSE_RMA
 from .data.ikem_preprocessing import prepare_ikem_evaluation_sources
@@ -42,9 +42,9 @@ def choose_device(name: str) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Select one checkpoint per preprocessing×architecture group using pooled molecular "
-            "validation+test MSE, then select and evaluate the encoder with nested donor-grouped "
-            "eGFR CV."
+            "Select one checkpoint per preprocessing×architecture group using the predeclared "
+            "GEO/IKEM molecular-validation score, evaluate GEO test only after freezing those "
+            "choices, and evaluate every frozen encoder with donor-grouped eGFR CV."
         )
     )
     parser.add_argument("--sweep-root", type=Path, default=Path.cwd())
@@ -56,12 +56,15 @@ def main() -> None:
     parser.add_argument(
         "--allow-incomplete-sweep",
         action="store_true",
-        help="Compatibility flag; incomplete-sweep evaluation is now the default.",
+        help=(
+            "Write validation-only diagnostics for the currently completed runs, then stop "
+            "before GEO test and eGFR evaluation."
+        ),
     )
     parser.add_argument(
         "--require-complete-sweep",
         action="store_true",
-        help="Refuse evaluation unless every generated sweep run has completed.",
+        help="Compatibility flag; complete-sweep evaluation is already the default.",
     )
     parser.add_argument(
         "--include-running-checkpoints",
@@ -75,9 +78,8 @@ def main() -> None:
         "--evaluate-all-readable-checkpoints",
         action="store_true",
         help=(
-            "Send every eligible best.pt checkpoint to preliminary eGFR CV instead of only "
-            "one molecular winner per preprocessing×architecture group. This can become very "
-            "expensive when many runs are available."
+            "Deprecated exploratory option. The final-paper workflow refuses eGFR-based "
+            "inspection of non-frozen hyperparameter candidates."
         ),
     )
     parser.add_argument("--folds", type=int, default=5)
@@ -86,7 +88,7 @@ def main() -> None:
         "--inner-folds",
         type=int,
         default=5,
-        help="Donor-grouped inner folds used to select among molecular group winners.",
+        help="Deprecated compatibility option; fixed-encoder evaluation has no inner CV.",
     )
     parser.add_argument("--cv-seed", type=int, default=0)
     parser.add_argument(
@@ -110,7 +112,10 @@ def main() -> None:
     parser.add_argument(
         "--no-non-stadniuk",
         action="store_true",
-        help="Do not add the best validation-selected non-Stadniuk encoder.",
+        help=(
+            "Deprecated compatibility flag; the paper workflow always retains all six "
+            "preprocessing×architecture group winners."
+        ),
     )
     parser.add_argument("--no-pca", action="store_true")
     parser.add_argument(
@@ -135,6 +140,11 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    if args.evaluate_all_readable_checkpoints:
+        raise SystemExit(
+            "--evaluate-all-readable-checkpoints is incompatible with the final-paper "
+            "contract: eGFR outcomes must not inspect hyperparameter candidates."
+        )
 
     sweep_root = args.sweep_root.expanduser().resolve()
     results_root = (
@@ -179,10 +189,24 @@ def main() -> None:
         print(f"WARNING: {warning}", file=sys.stderr)
     if not readable_records:
         raise SystemExit("No readable run_*/best.pt checkpoints were found.")
-    expected_runs = len(list((sweep_root / "configs").glob("run_*.json")))
-    completed_names = {
+    expected_names = {
+        path.stem for path in (sweep_root / "configs").glob("run_*.json")
+    }
+    expected_runs = len(expected_names)
+    if not expected_names:
+        raise SystemExit(f"No generated run configs were found under {sweep_root / 'configs'}.")
+    all_completed_names = {
         path.parent.name for path in results_root.glob("run_*/run_summary.json")
     }
+    unexpected_names = sorted(all_completed_names.difference(expected_names))
+    if unexpected_names:
+        print(
+            "WARNING: ignoring result folders with no matching generated config: "
+            + ", ".join(unexpected_names[:10]),
+            file=sys.stderr,
+        )
+    completed_names = all_completed_names.intersection(expected_names)
+    readable_records = [record for record in readable_records if record.run in expected_names]
     completed_records = [
         record for record in readable_records if record.run in completed_names
     ]
@@ -192,16 +216,19 @@ def main() -> None:
             "No eligible readable best.pt checkpoint was found. Use "
             "--include-running-checkpoints to include best-so-far checkpoints."
         )
-    complete = (
-        expected_runs > 0
-        and len(completed_records) == expected_runs
-        and len(completed_names) == expected_runs
-    )
-    if args.require_complete_sweep and not args.allow_incomplete_sweep and not complete:
+    completed_readable_names = {record.run for record in completed_records}
+    complete = completed_names == expected_names == completed_readable_names
+    if args.require_complete_sweep and args.allow_incomplete_sweep:
+        raise SystemExit(
+            "Choose either --require-complete-sweep or --allow-incomplete-sweep, not both."
+        )
+    if not complete and not args.allow_incomplete_sweep:
         raise SystemExit(
             "Sweep is incomplete: "
             f"{len(completed_records)}/{expected_runs} completed readable checkpoints and "
-            f"{len(completed_names)}/{expected_runs} completed run summaries."
+            f"{len(completed_names)}/{expected_runs} completed run summaries. Use "
+            "--allow-incomplete-sweep for validation diagnostics only; that mode never "
+            "touches GEO test or eGFR outcomes."
         )
     groups = {(record.method, record.architecture) for record in records}
     if complete and len(groups) != 6:
@@ -226,12 +253,13 @@ def main() -> None:
             )
         print("Results will change as additional sweep runs complete.\n")
     print(
-        f"Scoring {len(records)} validation-selected best.pt checkpoints on the pooled "
-        "molecular validation+test rows."
+        f"Checking {len(records)} best.pt files against the frozen molecular-validation "
+        "identities and checkpoint scores."
     )
     print(
-        "Scores are compared only within each preprocessing × architecture group; "
-        "raw MSE is not compared across preprocessing arms."
+        "Selection score = 0.50 × GEO clean-validation MSE + 0.50 × donor-balanced "
+        "IKEM clean-validation MSE. Scores are compared only within each preprocessing "
+        "× architecture group."
     )
 
     layout = project_data_layout(data_dir)
@@ -252,28 +280,61 @@ def main() -> None:
     group_winners = select_molecular_group_winners(
         scored, expected_groups=6 if complete else None
     )
+
+    if not complete:
+        score_path, group_path = save_molecular_selection(
+            scored, group_winners, output_root / "molecular_selection"
+        )
+        print("\n" + LINE)
+        print(f"PRELIMINARY VALIDATION-ONLY WINNERS ({len(group_winners)}/6 GROUPS)")
+        print(LINE)
+        for _, _, record in group_winners:
+            print(
+                f"{record.run:<10} score={record.molecular_selection_mse:.10g} | "
+                f"GEO={record.geo_validation_mse:.10g} | "
+                f"IKEM donor-balanced={record.ikem_validation_mse:.10g} "
+                f"(donor SD={record.ikem_validation_mse_donor_sd:.10g}) | "
+                f"{record.method} | {record.architecture} | z={record.latent_dim}"
+            )
+        print(f"\nValidation scores: {score_path}")
+        print(f"Current group winners: {group_path}")
+        print(
+            "Stopped before GEO test and eGFR evaluation because the sweep is incomplete."
+        )
+        return
+
+    print("Evaluating the 584-row GEO test partition for the six frozen winners only...")
+    group_winners = evaluate_frozen_molecular_test_records(
+        group_winners,
+        layout,
+        prepared_root,
+        device=device,
+        batch_size=args.batch_size,
+        progress=report_progress,
+    )
     score_path, group_path = save_molecular_selection(
         scored, group_winners, output_root / "molecular_selection"
     )
 
     print("\n" + LINE)
     print(
-        "SIX MOLECULAR GROUP WINNERS"
-        if complete
-        else f"CURRENT GROUP WINNERS ({len(group_winners)}/6 GROUPS)"
+        "SIX FROZEN MOLECULAR GROUP WINNERS"
     )
     print(LINE)
-    for model_id, label, record in group_winners:
+    for _, _, record in group_winners:
         print(
-            f"{record.run:<10} pooled MSE={record.molecular_selection_mse:.10g} | "
-            f"VAL={record.molecular_validation_mse:.10g} | TEST={record.molecular_test_mse:.10g} | "
+            f"{record.run:<10} score={record.molecular_selection_mse:.10g} | "
+            f"GEO val={record.geo_validation_mse:.10g} | "
+            f"IKEM val donor-balanced={record.ikem_validation_mse:.10g} "
+            f"(donor SD={record.ikem_validation_mse_donor_sd:.10g}) | "
+            f"GEO test={record.molecular_test_mse:.10g} | "
             f"{record.method} | {record.architecture} | z={record.latent_dim}"
         )
     print(f"\nAll molecular scores: {score_path}")
     print(f"Group winners: {group_path}")
     print(
-        "The former molecular test partition is now part of model selection and is not "
-        "reported as an untouched test set."
+        "GEO test was evaluated only after validation froze all six group winners; it did "
+        "not participate in checkpoint or hyperparameter selection."
     )
     print(
         "NOTE: Per-dataset standardization uses one source dataset at a time; each GEO "
@@ -283,30 +344,7 @@ def main() -> None:
         "independently. Global RMA must carry matching GEO-train-reference provenance."
     )
 
-    if args.evaluate_all_readable_checkpoints:
-        selected = [
-            (
-                f"candidate_{record.run}_z",
-                (
-                    f"{record.run} · {record.method} × {record.architecture} "
-                    f"· z={record.latent_dim}"
-                ),
-                record,
-            )
-            for record in sorted(
-                scored,
-                key=lambda item: (float(item.molecular_selection_mse), item.run),
-            )
-        ]
-        print(
-            f"\nPRELIMINARY eGFR MODE: evaluating all {len(selected)} readable checkpoints."
-        )
-        print(
-            "Final-sweep analysis should omit --evaluate-all-readable-checkpoints so only "
-            "the six molecular group winners enter eGFR selection."
-        )
-    else:
-        selected = group_winners
+    selected = group_winners
 
     print("\nPreparing method-matched IKEM inputs without using eGFR outcomes or CV folds...")
     required_ikem_methods = tuple(
@@ -368,7 +406,7 @@ def main() -> None:
     egfr = load_egfr_wide(layout, expression_samples["sample_id"])
     stratify_column = None if args.stratify_column.lower() == "none" else args.stratify_column
     benchmark_root = output_root / "mixed_models"
-    design_path, specs_path, specs = prepare_nested_mixed_model_design(
+    design_path, specs_path, specs = prepare_mixed_model_design(
         egfr,
         embeddings,
         expression,
@@ -376,16 +414,15 @@ def main() -> None:
         benchmark_root,
         n_splits=args.folds,
         n_repeats=args.repeats,
-        inner_splits=args.inner_folds,
         seed=args.cv_seed,
         stratify_column=stratify_column,
         include_pca=not args.no_pca,
         include_clinical=not args.no_clinical,
     )
     print(
-        f"Prepared {len(specs)} nested model fits from {egfr['patient'].nunique()} patients "
-        f"and {egfr['donor'].nunique()} donor groups. Inner folds select the encoder; "
-        "outer folds evaluate that selection."
+        f"Prepared {len(specs)} fixed-model fits from {egfr['patient'].nunique()} patients "
+        f"and {egfr['donor'].nunique()} donor groups. Every encoder was frozen by molecular "
+        "validation before outcomes were loaded."
     )
     r_resource = files("archcon.assets").joinpath("molecular_mixed_models.R")
     with as_file(r_resource) as r_script:
@@ -395,108 +432,53 @@ def main() -> None:
             r_script,
             benchmark_root,
             rscript=args.rscript,
-            output_prefix="nested_all_",
+            output_prefix="fixed_",
         )
-    metrics_path, predictions_path, _selections, candidate_ranking = finalize_nested_selection(
+    summary, fixed_encoder_summary, comparisons = summarize_fixed_encoder_results(
         metrics_path, predictions_path, embeddings, benchmark_root
     )
-    summary, pairwise, clinical_incremental = summarize_mixed_model_results(
-        metrics_path, predictions_path, benchmark_root
-    )
 
     print("\n" + LINE)
-    print("eGFR ENCODER SELECTION")
+    print("FIXED-ENCODER eGFR EVALUATION")
     print(LINE)
-    ranking_columns = [
-        "model_label",
-        "mean_cv_rmse",
-        "nested_selection_count",
-        "nested_selection_fraction",
-        "run",
-    ]
-    print(
-        candidate_ranking[ranking_columns].to_string(
-            index=False, float_format=lambda value: f"{value:.6g}"
-        )
-    )
-    deployment = candidate_ranking.iloc[0]
-    print(
-        "\nFull-data CV deployment winner: "
-        f"{deployment['run']} · {deployment['preprocessing']} · "
-        f"{deployment['architecture']} · z={int(deployment['latent_dim'])}"
-    )
-    print(
-        "Its ordinary CV score is used to lock a future deployment model; the unbiased "
-        "performance estimate below comes from nested outer folds."
-    )
-
-    fixed_encoder_summary = summary.loc[
-        summary["model_id"].astype(str).str.startswith("candidate_")
-    ].copy()
-    print("\n" + LINE)
-    print("ALL FIXED MOLECULAR ENCODERS: OUTER-CV eGFR PERFORMANCE")
-    print(LINE)
-    print(
-        "Each row fixes one molecular group winner before eGFR CV. Comparing these six "
-        "rows is an additional experiment; choosing the minimum and reporting that same "
-        "minimum as final performance would be optimistic, so the nested result remains "
-        "the unbiased choose-one-of-six estimate.\n"
-    )
     fixed_columns = [
         "model_label",
         "mean_rmse",
+        "mean_rmse_ci95_low",
+        "mean_rmse_ci95_high",
         "pooled_rmse",
         "mean_delta_vs_time",
-        "lcb_delta_vs_time",
         "positive_folds_vs_time",
+        "run",
     ]
     print(
         fixed_encoder_summary[fixed_columns].to_string(
             index=False, float_format=lambda value: f"{value:.6g}"
         )
     )
-    print(f"\nSaved: {benchmark_root / 'all_fixed_encoder_cv_summary.csv'}")
-
-    print("\n" + LINE)
-    print("NESTED-CV eGFR MIXED-MODEL SUMMARY")
-    print(LINE)
+    print(
+        "\nNo encoder ranking or deployment winner is derived from these outcomes. "
+        "Each row is a separately reported, molecular-validation-frozen analysis."
+    )
     if not args.no_clinical:
         print("Clinical variables: " + ", ".join(CLINICAL_COLUMNS))
-        print("Clinical imputation and scaling are fitted within each training fold.\n")
-    columns = [
-        "model_label",
-        "mean_rmse",
-        "pooled_rmse",
-        "mean_delta_vs_time",
-        "lcb_delta_vs_time",
-        "positive_folds_vs_time",
-    ]
-    print(summary[columns].to_string(index=False, float_format=lambda value: f"{value:.6g}"))
-    print(
-        "\nNested-selected z against baselines "
-        "(positive gain means selected z has lower RMSE):"
-    )
-    pair_columns = [
-        "model_label",
-        "mean_winner_gain",
-        "lcb_winner_gain",
-        "winner_better_fraction",
-    ]
-    print(pairwise[pair_columns].to_string(index=False, float_format=lambda value: f"{value:.6g}"))
-    if not clinical_incremental.empty:
+        print("Clinical imputation and scaling are fitted within each training fold.")
+    if not comparisons.empty:
         print(
-            "\nIncremental value beyond clinical baselines "
-            "(positive gain means the augmented model has lower RMSE):"
+            "\nMatched-fold comparisons (positive gain favors the frozen encoder model):"
         )
-        clinical_columns = [
-            "comparison_label",
+        comparison_columns = [
+            "candidate_id",
+            "comparison",
             "mean_gain",
-            "lcb_gain",
-            "augmented_better_fraction",
+            "gain_ci95_low",
+            "gain_ci95_high",
+            "candidate_better_fraction",
         ]
         print(
-            clinical_incremental[clinical_columns].to_string(
+            comparisons[comparison_columns].to_string(
                 index=False, float_format=lambda value: f"{value:.6g}"
             )
         )
+    print(f"\nAll-model summary rows: {len(summary)}")
     print(f"\nComplete results: {benchmark_root}")

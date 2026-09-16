@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 
@@ -14,11 +15,17 @@ from archcon.data.training_sources import (
     load_ikem_source,
     load_prepared_pretraining_source,
     load_prepared_split_rows,
+    load_pretraining_source,
     load_training_source,
     prepare_pretraining_assets,
     split_rows_for_source,
-    load_pretraining_source,
+    validate_pretraining_split,
 )
+
+
+def _membership_sha256(namespace: str, sample_ids: list[str]) -> str:
+    values = sorted(f"{namespace.upper()}:{value.upper()}" for value in sample_ids)
+    return hashlib.sha256(("\n".join(values) + "\n").encode()).hexdigest()
 
 
 def _write_geo_rma_store(root: Path, samples: list[str], probes: list[str]) -> None:
@@ -75,24 +82,62 @@ def _write_simple_store(root: Path, samples: list[str], probes: list[str], offse
         root / "sample_index.csv", index=False
     )
     pd.DataFrame({"probe_id": probes}).to_csv(root / "probe_index.csv", index=False)
+
+
+def _write_ikem_store(root: Path, probes: list[str]) -> None:
+    samples = ["D001_L", "D002_L", "D003_L", "D004_L"]
+    _write_simple_store(root, samples, probes, 200)
+    roles = [
+        "held_out_measured_egfr",
+        "pretrain_train_no_egfr",
+        "pretrain_train_no_egfr",
+        "pretrain_validation_no_egfr",
+    ]
+    pd.DataFrame(
+        {
+            "GSM": samples,
+            "row_index_python": range(len(samples)),
+            "donor_id": ["D001", "D002", "D003", "D004"],
+            "training_role": roles,
+            "pretraining_split": [None, "train", "train", "validation"],
+        }
+    ).to_csv(root / "sample_index.csv", index=False)
     (root / "preprocessing_provenance.json").write_text(
         json.dumps(
             {
-                "format": 2,
-                "source": "GSE290167",
+                "format": 4,
+                "source": "private IKEM CEL collection",
+                "outcome_gate_unit": "donor",
+                "split_unit": "donor",
+                "split_seed": 20260915,
+                "validation_fraction": 0.20,
+                "cohort_samples": 4,
+                "no_measured_egfr_biopsies": 3,
+                "donor_clean_pretraining_eligible_samples": 3,
+                "pretraining_train_samples": 2,
+                "pretraining_validation_samples": 1,
+                "related_no_egfr_held_out_samples": 0,
+                "held_out_measured_egfr_samples": 1,
+                "pretraining_validation_donors": ["D004"],
+                "ikem_train_sample_ids_sha256": _membership_sha256(
+                    "SUPERVISED", ["D002_L", "D003_L"]
+                ),
+                "ikem_validation_sample_ids_sha256": _membership_sha256(
+                    "SUPERVISED", ["D004_L"]
+                ),
                 "methods": {
                     "raw_original": {
-                        "uses_egfr": False,
+                        "uses_outcome_values_in_fit": False,
                         "uses_egfr_cv_fold": False,
                         "transductive_across_egfr_folds": False,
                     },
                     "rma_per_gse": {
-                        "uses_egfr": False,
+                        "uses_outcome_values_in_fit": False,
                         "uses_egfr_cv_fold": False,
                         "transductive_across_egfr_folds": False,
                     },
                     "rma_global": {
-                        "uses_egfr": False,
+                        "uses_outcome_values_in_fit": False,
                         "uses_egfr_cv_fold": False,
                         "transductive_across_egfr_folds": False,
                     },
@@ -116,10 +161,10 @@ def _layout(tmp_path: Path):
         list(reversed(probes)),
         100,
     )
-    _write_simple_store(tmp_path / "IKEM_NUMPY_STORE", ["IKEM1", "IKEM2", "IKEM3", "IKEM4"], probes, 200)
+    _write_ikem_store(tmp_path / "IKEM_CEL_NUMPY_STORE", probes)
     pd.DataFrame(
         {
-            "patient": ["IKEM1", "IKEM2", "IKEM3", "IKEM4"],
+            "patient": ["D001_L", "D002_L", "D003_L", "D004_L"],
             "egfr_7d": [50.0, None, None, None],
             "egfr_3m": [55.0, None, None, None],
         }
@@ -141,7 +186,7 @@ def test_ikem_method_source_rejects_transductive_provenance(
     native_method: str,
 ) -> None:
     layout, _, _ = _layout(tmp_path)
-    provenance_path = tmp_path / "IKEM_NUMPY_STORE" / "preprocessing_provenance.json"
+    provenance_path = tmp_path / "IKEM_CEL_NUMPY_STORE" / "preprocessing_provenance.json"
     provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
     provenance["methods"][native_method]["transductive_across_egfr_folds"] = True
     provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
@@ -150,13 +195,24 @@ def test_ikem_method_source_rejects_transductive_provenance(
         load_ikem_source(layout, method=method)
 
 
+def test_ikem_method_source_rejects_mismatched_membership_hash(tmp_path: Path) -> None:
+    layout, _, _ = _layout(tmp_path)
+    provenance_path = tmp_path / "IKEM_CEL_NUMPY_STORE" / "preprocessing_provenance.json"
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["ikem_validation_sample_ids_sha256"] = "0" * 64
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="membership hashes"):
+        load_ikem_source(layout, method=METHOD_PER_GSE_RMA)
+
+
 def test_shared_split_is_sampled_once_and_maps_by_gsm(tmp_path: Path) -> None:
     layout, samples, _ = _layout(tmp_path)
     first = create_shared_preprocessing_split(layout, seed=42, train_fraction=0.75)
     second = create_shared_preprocessing_split(layout, seed=42, train_fraction=0.75)
     assert first[["GSM", "split"]].equals(second[["GSM", "split"]])
     assert set(first.loc[first["dataset_role"] == "unsupervised data · GEO", "GSM"]) == set(samples)
-    assert (first["dataset_role"] == "supervised dataset · no eGFR").sum() == 3
+    assert (first["dataset_role"] == "IKEM · donor-clean no eGFR").sum() == 3
     assert (first["split"] == "train").sum() >= 5
     assert (first["split"] == "validation").sum() >= 1
     assert (first["split"] == "test").sum() >= 1
@@ -212,9 +268,9 @@ def test_pretraining_source_appends_only_supervised_samples_without_egfr(tmp_pat
     assert source.matrix.shape == (len(samples) + 3, 5)
     roles = source.sample_index["dataset_role"].value_counts().to_dict()
     assert roles["unsupervised data · GEO"] == len(samples)
-    assert roles["supervised dataset · no eGFR"] == 3
-    assert "SUPERVISED:IKEM1" not in set(source.sample_index["sample_key"])
-    assert {"SUPERVISED:IKEM2", "SUPERVISED:IKEM3", "SUPERVISED:IKEM4"}.issubset(
+    assert roles["IKEM · donor-clean no eGFR"] == 3
+    assert "SUPERVISED:D001_L" not in set(source.sample_index["sample_key"])
+    assert {"SUPERVISED:D002_L", "SUPERVISED:D003_L", "SUPERVISED:D004_L"}.issubset(
         set(source.sample_index["sample_key"])
     )
 
@@ -225,19 +281,43 @@ def test_shared_split_adds_supervised_no_egfr_rows_and_maps_to_combined_source(t
         layout, seed=42, train_fraction=0.6, validation_fraction=0.2
     )
     geo = split.loc[split["dataset_role"] == "unsupervised data · GEO"]
-    supervised = split.loc[split["dataset_role"] == "supervised dataset · no eGFR"]
+    supervised = split.loc[split["dataset_role"] == "IKEM · donor-clean no eGFR"]
     assert set(geo["GSM"].dropna()) == set(samples)
     assert len(supervised) == 3
-    assert set(supervised["split"]) == {"train", "validation", "test"}
+    assert set(supervised["split"]) == {"train", "validation"}
+    assert set(supervised.loc[supervised["split"].eq("validation"), "donor_id"]) == {
+        "D004"
+    }
     source = load_pretraining_source(layout, METHOD_PER_GSE_RMA)
     train, validation, test = split_rows_for_source(split, source, include_test=True)
     assert len(train) + len(validation) + len(test) == len(samples) + 3
 
 
+def test_loaded_split_cannot_change_frozen_geo_assignments(tmp_path: Path) -> None:
+    layout, _, _ = _layout(tmp_path)
+    split = create_shared_preprocessing_split(
+        layout, seed=42, train_fraction=0.6, validation_fraction=0.2
+    )
+    changed = split.copy()
+    geo_train = changed.index[
+        changed["sample_key"].str.startswith("GEO:") & changed["split"].eq("train")
+    ][0]
+    geo_test = changed.index[
+        changed["sample_key"].str.startswith("GEO:") & changed["split"].eq("test")
+    ][0]
+    changed.loc[geo_train, "split"] = "test"
+    changed.loc[geo_test, "split"] = "train"
+    path = tmp_path / "changed_split.csv"
+    changed.to_csv(path, index=False)
+
+    with pytest.raises(ValueError, match="frozen GEO/IKEM assignments"):
+        validate_pretraining_split(layout, path)
+
+
 
 def test_prepared_assets_align_extra_supervised_probes_and_freeze_rows(tmp_path: Path) -> None:
     layout, samples, probes = _layout(tmp_path)
-    supervised_samples = ["IKEM1", "IKEM2", "IKEM3", "IKEM4"]
+    supervised_samples = ["D001_L", "D002_L", "D003_L", "D004_L"]
     extra_probes = ["unused_extra_probe", *probes]
     values = np.arange(
         len(supervised_samples) * len(extra_probes), dtype=np.float32
@@ -264,8 +344,8 @@ def test_prepared_assets_align_extra_supervised_probes_and_freeze_rows(tmp_path:
     )
 
     metadata = json.loads((prepared / "prepared.json").read_text())
-    assert metadata["format"] == 4
-    # IKEM1 has eGFR, so frozen supplemental rows are IKEM2..4; the extra probe is dropped.
+    assert metadata["format"] == 5
+    # D001_L has eGFR, so frozen supplemental rows are D002_L..D004_L.
     for method, filename in metadata["supplemental_matrices"].items():
         supplemental = np.load(prepared / filename, mmap_mode="r")
         assert supplemental.shape == (3, len(probes)), method
@@ -295,6 +375,31 @@ def test_prepared_assets_align_extra_supervised_probes_and_freeze_rows(tmp_path:
             np.testing.assert_array_equal(observed, values[1:, 1:])
 
 
+def test_prepared_assets_reject_ikem_roles_changed_after_manifest_audit(
+    tmp_path: Path,
+) -> None:
+    layout, _, _ = _layout(tmp_path)
+    split = create_shared_preprocessing_split(
+        layout, seed=42, train_fraction=0.6, validation_fraction=0.2
+    )
+    changed = split.copy()
+    for sample_id, partition, role in (
+        ("D002_L", "validation", "pretrain_validation_no_egfr"),
+        ("D004_L", "train", "pretrain_train_no_egfr"),
+    ):
+        mask = changed["sample_key"].eq(f"SUPERVISED:{sample_id}")
+        changed.loc[mask, "split"] = partition
+        changed.loc[mask, "training_role"] = role
+
+    with pytest.raises(ValueError, match="audited CEL manifest"):
+        prepare_pretraining_assets(
+            layout,
+            changed,
+            tmp_path / "prepared_changed_roles",
+            methods=(METHOD_PER_GSE_RMA,),
+        )
+
+
 def test_prepared_assets_freeze_different_geo_probe_orders(tmp_path: Path) -> None:
     layout, samples, probes = _layout(tmp_path)
     split = create_shared_preprocessing_split(
@@ -320,7 +425,7 @@ def test_prepared_assets_freeze_different_geo_probe_orders(tmp_path: Path) -> No
     np.testing.assert_array_equal(source.matrix[[gsm0_row], :][0], expected)
 
     metadata = __import__("json").loads((prepared / "prepared.json").read_text())
-    assert metadata["format"] == 4
+    assert metadata["format"] == 5
     assert set(metadata["method_geo_columns"]) == {
         METHOD_PER_DATASET_STANDARDIZED,
         METHOD_PER_GSE_RMA,
@@ -331,7 +436,7 @@ def test_prepared_assets_freeze_different_geo_probe_orders(tmp_path: Path) -> No
         np.load(prepared / "geo_columns_standardized.npy"),
         np.asarray([0, 1, 2, 3, 4], dtype=np.int64),
     )
-    assert metadata["standardization"]["uses_egfr"] is False
+    assert metadata["standardization"]["uses_outcome_values_in_fit"] is False
     assert metadata["standardization"]["uses_egfr_cv_fold"] is False
 
 

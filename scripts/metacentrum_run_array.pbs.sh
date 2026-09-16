@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Flat source-tree reference launcher for MetaCentrum.
-#PBS -N archcon-pretrain-058
+#PBS -N archcon-pretrain-0516
 #PBS -l select=1:ncpus=1:mem=10gb:scratch_local=4gb
 #PBS -l walltime=24:00:00
 #PBS -j oe
@@ -11,7 +11,7 @@ set -euo pipefail
 : "${ARCHCON_SWEEP_DIR:?submit.sh must export ARCHCON_SWEEP_DIR.}"
 : "${SCRATCHDIR:?This launcher requires PBS scratch_local storage.}"
 
-PROJECT_DIR="${ARCHCON_PROJECT_DIR:-/storage/praha1/home/anuarali/DP/ARCHCON}"
+PROJECT_DIR="${ARCHCON_PROJECT_DIR:-/storage/brno2/home/anuarali/DP/ARCHCON}"
 PERSISTENT_DATA_DIR="${ARCHCON_DATA_DIR:-$PROJECT_DIR/data}"
 PYTHON_BIN="${ARCHCON_PYTHON:-$PROJECT_DIR/.venv/bin/python}"
 PERSISTENT_RESULT_ROOT="${ARCHCON_RESULT_ROOT:-$ARCHCON_SWEEP_DIR/results}"

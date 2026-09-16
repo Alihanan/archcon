@@ -5,7 +5,8 @@
 #
 #   1. download GEO CEL archives
 #   2. build one RMA matrix per GEO dataset
-#   2B. fit IKEM per-dataset RMA from every row without measured eGFR
+#   2B. gate IKEM by donor, freeze 24 train / 6 validation biopsies, and fit
+#       IKEM per-dataset RMA from the 24 donor-clean training biopsies only
 #   3. build the combined GEO TRAIN + IKEM no-eGFR TRAIN global reference
 #   4. apply the frozen combined reference to every IKEM CEL; measured-eGFR
 #      rows are transform-only

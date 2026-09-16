@@ -17,6 +17,7 @@ from archcon.data.downstream import (
     scan_validation_checkpoints,
     select_embedding_checkpoints,
     select_molecular_group_winners,
+    summarize_fixed_encoder_results,
     summarize_mixed_model_results,
 )
 from archcon.data.training import TrainingConfig
@@ -79,7 +80,21 @@ def test_checkpoint_scan_retains_metadata_not_tensor_payload(tmp_path, monkeypat
             "val_r2": [0.5],
             "val_loss": [0.1],
             "val_epoch": [1],
+            "selection_score": [0.2],
+            "geo_mse": [0.1],
+            "ikem_mse": [0.3],
+            "ikem_mse_donor_sd": [0.04],
         },
+        "validation_selection_policy": {
+            "metric": "clean_reconstruction_mse",
+            "geo_weight": 0.5,
+            "ikem_weight": 0.5,
+            "ikem_aggregation": "donor_balanced",
+            "ikem_uncertainty": "sample_sd_across_donor_mean_mse",
+            "uses_geo_test": False,
+            "uses_egfr_values": False,
+        },
+        "best_selection_score": 0.2,
         "model_state": {"large_tensor": object()},
         "optimizer_state": {"large_tensor": object()},
     }
@@ -89,6 +104,51 @@ def test_checkpoint_scan_retains_metadata_not_tensor_payload(tmp_path, monkeypat
     assert len(records) == 1
     assert records[0].checkpoint is None
     assert records[0].input_dim == 42_917
+
+
+def test_checkpoint_scan_rejects_inconsistent_validation_composite(
+    tmp_path, monkeypatch
+) -> None:
+    checkpoint_path = tmp_path / "run_0001" / "best.pt"
+    checkpoint_path.parent.mkdir()
+    checkpoint_path.touch()
+    payload = {
+        "input_dim": 4,
+        "method": "Per-dataset RMA",
+        "config": {
+            "hidden_widths": [8],
+            "latent_dim": 2,
+            "architecture_family": "Stadniuk MLP",
+            "epochs": 1,
+        },
+        "history": {
+            "val_mse": [0.1],
+            "val_r2": [0.5],
+            "val_loss": [0.1],
+            "val_epoch": [1],
+            "selection_score": [0.9],
+            "geo_mse": [0.1],
+            "ikem_mse": [0.3],
+            "ikem_mse_donor_sd": [0.04],
+        },
+        "validation_selection_policy": {
+            "metric": "clean_reconstruction_mse",
+            "geo_weight": 0.5,
+            "ikem_weight": 0.5,
+            "ikem_aggregation": "donor_balanced",
+            "ikem_uncertainty": "sample_sd_across_donor_mean_mse",
+            "uses_geo_test": False,
+            "uses_egfr_values": False,
+        },
+        "best_selection_score": 0.9,
+    }
+    monkeypatch.setattr(downstream, "load_checkpoint_metadata", lambda _path: payload)
+
+    records, warnings = scan_validation_checkpoints(tmp_path)
+
+    assert not records
+    assert len(warnings) == 1
+    assert "composite score" in warnings[0]
 
 
 def test_model_loader_imports_torch_for_meta_construction(monkeypatch) -> None:
@@ -173,6 +233,27 @@ def test_molecular_selection_is_separate_per_preprocessing_and_architecture() ->
     selected = select_molecular_group_winners(records)
     assert len(selected) == 6
     assert all(record.run.endswith(("1", "3", "5", "7", "9", "11")) for _, _, record in selected)
+
+
+def test_molecular_group_selection_never_uses_geo_test_metric() -> None:
+    first = _record("run_0001", "Stadniuk MLP", 0.1)
+    second = _record("run_0002", "Stadniuk MLP", 0.2)
+    first = first.__class__(
+        **{
+            **first.__dict__,
+            "molecular_selection_mse": 0.1,
+            "molecular_test_mse": 100.0,
+        }
+    )
+    second = second.__class__(
+        **{
+            **second.__dict__,
+            "molecular_selection_mse": 0.2,
+            "molecular_test_mse": 0.0,
+        }
+    )
+    selected = select_molecular_group_winners([first, second], expected_groups=1)
+    assert selected[0][2].run == "run_0001"
 
 
 def test_egfr_long_uses_ordered_categorical_time() -> None:
@@ -286,6 +367,57 @@ def test_mixed_model_design_can_disable_clinical_models(tmp_path: Path) -> None:
     assert set(specs["model_id"]) == {"time_only", "winner_z", "pca"}
 
 
+def test_fixed_design_supports_multiple_frozen_encoders_without_a_winner(
+    tmp_path: Path,
+) -> None:
+    patients = _patients()
+    samples = pd.DataFrame(
+        {
+            "source_row_index": np.arange(len(patients)),
+            "sample_id": patients["patient"],
+            "donor_id": patients["donor"],
+            "has_egfr": True,
+        }
+    )
+    first = EmbeddingResult(
+        "candidate_a",
+        "Candidate A",
+        _record("run_0001", "Stadniuk MLP", 0.1),
+        np.ones((len(patients), 2), dtype=np.float32),
+        samples,
+        0.01,
+    )
+    second = EmbeddingResult(
+        "candidate_b",
+        "Candidate B",
+        _record("run_0002", "ResNet-LN", 0.2),
+        np.ones((len(patients), 3), dtype=np.float32),
+        samples,
+        0.02,
+    )
+    expression = np.arange(len(patients) * 4, dtype=np.float32).reshape(
+        len(patients), 4
+    )
+    _, _, specs = prepare_mixed_model_design(
+        patients,
+        [first, second],
+        expression,
+        samples,
+        tmp_path,
+        n_splits=5,
+        n_repeats=1,
+        include_pca=True,
+        include_clinical=False,
+    )
+    assert set(specs["model_id"]) == {
+        "time_only",
+        "candidate_a",
+        "candidate_b",
+        "pca_d2",
+        "pca_d3",
+    }
+
+
 def test_nested_design_has_inner_selection_and_unique_outer_fits(tmp_path: Path) -> None:
     patients = _patients()
     samples = pd.DataFrame(
@@ -391,6 +523,62 @@ def test_summary_uses_matched_fold_deltas(tmp_path: Path) -> None:
     ]
     assert beyond_full["mean_gain"] == 1.0
     assert (tmp_path / "clinical_incremental_summary.csv").is_file()
+
+
+def test_fixed_encoder_summary_reports_each_encoder_without_selecting_one(
+    tmp_path: Path,
+) -> None:
+    samples = pd.DataFrame({"sample_id": ["p1"]})
+    embeddings = [
+        EmbeddingResult(
+            f"candidate_{index}",
+            f"Candidate {index}",
+            _record(f"run_{index:04d}", "Stadniuk MLP", 0.1 + index),
+            np.empty((1, 2), dtype=np.float32),
+            samples,
+            0.0,
+        )
+        for index in range(2)
+    ]
+    metrics = pd.DataFrame(
+        [
+            {
+                "model_id": model_id,
+                "model_label": label,
+                "repeat": 0,
+                "fold": fold,
+                "rmse": rmse,
+                "mae": rmse / 2,
+            }
+            for fold in range(2)
+            for model_id, label, rmse in (
+                ("time_only", "Time only", 3.0 + fold),
+                ("candidate_0", "Candidate 0", 1.0 + fold),
+                ("candidate_1", "Candidate 1", 2.0 + fold),
+            )
+        ]
+    )
+    predictions = metrics.assign(
+        patient="p1",
+        donor="d1",
+        time="3m",
+        egfr=lambda frame: frame["rmse"],
+        prediction=0.0,
+    )
+    metrics_path = tmp_path / "fixed_metrics.csv"
+    predictions_path = tmp_path / "fixed_predictions.csv"
+    metrics.to_csv(metrics_path, index=False)
+    predictions.to_csv(predictions_path, index=False)
+
+    _, fixed, comparisons = summarize_fixed_encoder_results(
+        metrics_path, predictions_path, embeddings, tmp_path
+    )
+
+    assert fixed["model_id"].tolist() == ["candidate_0", "candidate_1"]
+    assert set(comparisons["candidate_id"]) == {"candidate_0", "candidate_1"}
+    assert (tmp_path / "fixed_encoder_cv_summary.csv").is_file()
+    assert (tmp_path / "fixed_encoder_comparisons.csv").is_file()
+    assert not (tmp_path / "candidate_cv_ranking.csv").exists()
 
 
 def test_final_nested_outputs_retain_every_fixed_encoder_cv_result(tmp_path: Path) -> None:

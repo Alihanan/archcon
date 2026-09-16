@@ -296,11 +296,16 @@ def serializable_scan(scan: dict[str, Any]) -> dict[str, Any]:
 def main() -> int:
     args = parse_args()
     project_root = args.project_root.expanduser().resolve()
-    sweep_root = (
-        args.sweep_root.expanduser().resolve()
-        if args.sweep_root is not None
-        else project_root / "sweeps" / "archcon-pretrain-0515"
-    )
+    if args.sweep_root is not None:
+        sweep_root = args.sweep_root.expanduser().resolve()
+    else:
+        final_sweep = project_root / "sweeps" / "archcon-pretrain-0516"
+        bootstrap_sweep = project_root / "sweeps" / "archcon-pretrain-0515"
+        sweep_root = (
+            final_sweep
+            if (final_sweep / "prepared" / "sample_index.csv").is_file()
+            else bootstrap_sweep
+        )
     rebuild_root = (
         args.rebuild_root.expanduser().resolve()
         if args.rebuild_root is not None

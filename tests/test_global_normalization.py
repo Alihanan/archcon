@@ -123,16 +123,18 @@ def test_prepared_global_loader_refuses_missing_provenance(tmp_path: Path) -> No
         {
             "row_index_python": [0, 1, 2],
             "sample_key": ["GEO:GSM1", "GEO:GSM2", "GEO:GSM3"],
+            "sample_id": ["GSM1", "GSM2", "GSM3"],
+            "source_kind": ["geo", "geo", "geo"],
             "split": ["train", "validation", "test"],
         }
     ).to_csv(prepared / "sample_index.csv", index=False)
     (prepared / "prepared.json").write_text(
         """{
-          "format": 3,
+          "format": 5,
           "n_samples": 3,
           "n_probes": 3,
           "sample_index": "sample_index.csv",
-          "supplemental_matrix": "supervised.npy",
+          "supplemental_matrices": {"Global RMA": "supervised.npy"},
           "method_geo_rows": {"Global RMA": "geo_rows_global_rma.npy"},
           "method_geo_columns": {"Global RMA": "geo_columns_global_rma.npy"}
         }"""

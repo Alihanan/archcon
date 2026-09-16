@@ -16,6 +16,7 @@ from archcon.data.pretraining import (
     create_train_validation_split,
     default_hidden_widths,
     parse_hidden_widths,
+    split_summary_markdown,
     validate_loaded_split,
 )
 
@@ -100,6 +101,29 @@ def test_saved_split_can_be_loaded_and_reordered(tmp_path: Path) -> None:
     loaded = validate_loaded_split(store, source)
     assert loaded["row_index_python"].tolist() == list(range(10))
     assert set(loaded["split"]) == {"train", "validation", "test"}
+
+
+def test_split_summary_recognizes_current_ikem_role_label() -> None:
+    split = pd.DataFrame(
+        {
+            "sample_key": ["GEO:GSM1", "GEO:GSM2", "SUPERVISED:D001_L", "SUPERVISED:D002_P"],
+            "split": ["train", "test", "train", "validation"],
+            "source_kind": ["geo", "geo", "ikem", "ikem"],
+            "dataset_role": [
+                "unsupervised data · GEO",
+                "unsupervised data · GEO",
+                "IKEM · donor-clean no eGFR",
+                "IKEM · donor-clean no eGFR",
+            ],
+            "split_group": ["GSE1", "GSE2", pd.NA, pd.NA],
+        }
+    )
+
+    summary = split_summary_markdown(split)
+
+    assert "2 donor-clean IKEM samples" in summary
+    assert "1 train / 1 validation / 0 test" in summary
+    assert "split by donor" in summary
 
 
 def test_default_hidden_widths_match_thesis_default() -> None:

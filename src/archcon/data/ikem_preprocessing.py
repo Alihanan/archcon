@@ -1,7 +1,7 @@
-"""Method-matched, CEL-derived IKEM inputs for downstream eGFR evaluation.
+"""Method-matched private-CEL IKEM inputs for downstream eGFR evaluation.
 
-GSE290167 supplies the original PrimeView CEL files for the IKEM cohort.  The
-R rebuild creates three aligned matrices in ``IKEM_NUMPY_STORE``.  This module
+The private 288-CEL collection is canonical; GSE290167 is fallback-only. The
+R rebuild creates three aligned matrices in ``IKEM_CEL_NUMPY_STORE``. This module
 never estimates an expression-normalization parameter from eGFR-bearing rows:
 
 * per-dataset standardization starts from raw PM probe-set medians and applies
@@ -9,8 +9,8 @@ never estimates an expression-normalization parameter from eGFR-bearing rows:
 * per-dataset RMA uses an IKEM-specific reference fitted only on outcome-free
   molecular-pretraining-train CELs and applies it independently to every other
   CEL;
-* Global RMA uses CEL-level target/probe effects fitted only on frozen GEO
-  pretraining-train arrays and applied to each IKEM CEL independently.
+* Global RMA uses CEL-level target/probe effects fitted on frozen GEO train plus
+  donor-clean IKEM train arrays and applies them to every other CEL independently.
 """
 
 from __future__ import annotations
@@ -30,10 +30,11 @@ from .geo_rma import METHOD_GLOBAL_RMA, METHOD_PER_GSE_RMA
 from .training_sources import (
     METHOD_PER_DATASET_STANDARDIZED,
     ExpressionMatrixSource,
+    _membership_sha256,
     load_ikem_source,
 )
 
-FORMAT_VERSION = 3
+FORMAT_VERSION = 4
 PROVENANCE_FILENAME = "preprocessing_provenance.json"
 MATRIX_FILES = {
     METHOD_PER_DATASET_STANDARDIZED: "per_dataset_standardization.npy",
@@ -138,7 +139,7 @@ def _load_saved_source(
 ) -> ExpressionMatrixSource:
     matrix = np.load(matrix_path, mmap_mode="r", allow_pickle=False)
     return ExpressionMatrixSource(
-        label=f"IKEM GSE290167 · {method}",
+        label=f"IKEM private CEL · {method}",
         matrix=matrix,
         sample_index=sample_index,
         probe_ids=probe_ids,
@@ -183,7 +184,7 @@ def _load_standardization_parameters(
     standardization = metadata.get("standardization", {})
     if (
         not isinstance(standardization, dict)
-        or standardization.get("uses_egfr") is not False
+        or standardization.get("uses_outcome_values_in_fit") is not False
         or standardization.get("uses_egfr_cv_fold") is not False
     ):
         raise ValueError(
@@ -238,12 +239,10 @@ def prepare_ikem_evaluation_sources(
     cel_provenance_path = layout.ikem_store / "preprocessing_provenance.json"
     if not prepared_index.is_file() or not cel_provenance_path.is_file():
         raise FileNotFoundError(
-            "The prepared split or GSE290167 IKEM CEL provenance is missing."
+            "The prepared split or private-CEL IKEM provenance is missing."
         )
     cel_provenance = json.loads(cel_provenance_path.read_text(encoding="utf-8"))
-    if int(cel_provenance.get("format", -1)) != 2 or cel_provenance.get(
-        "source"
-    ) != "GSE290167":
+    if int(cel_provenance.get("format", -1)) != 4:
         raise RuntimeError(f"Unsupported IKEM CEL provenance: {cel_provenance_path}")
     cel_methods = cel_provenance.get("methods", {})
     local_rma_info = (
@@ -252,20 +251,36 @@ def prepare_ikem_evaluation_sources(
     if (
         not isinstance(local_rma_info, dict)
         or local_rma_info.get("transductive_across_egfr_folds") is not False
-        or local_rma_info.get("uses_egfr") is not False
+        or local_rma_info.get("uses_outcome_values_in_fit") is not False
         or local_rma_info.get("uses_egfr_cv_fold") is not False
     ):
         raise RuntimeError(
             "IKEM per-dataset RMA is not a certified frozen train-reference transform."
         )
-    expected_split_hash = str(
-        cel_provenance.get("frozen_pretraining_split_sha256", "")
-    )
     observed_split_hash = _sha256(prepared_index)
-    if not expected_split_hash or expected_split_hash != observed_split_hash:
+    prepared_samples = pd.read_csv(prepared_index)
+    required_columns = {"sample_id", "source_kind", "split"}
+    if not required_columns.issubset(prepared_samples.columns):
+        raise RuntimeError("Prepared sample index lacks IKEM membership metadata.")
+    ikem_rows = prepared_samples.loc[
+        prepared_samples["source_kind"].astype(str).str.lower().eq("ikem")
+    ]
+    train_ids = ikem_rows.loc[
+        ikem_rows["split"].astype(str).str.lower().eq("train"), "sample_id"
+    ].astype(str).tolist()
+    validation_ids = ikem_rows.loc[
+        ikem_rows["split"].astype(str).str.lower().eq("validation"), "sample_id"
+    ].astype(str).tolist()
+    train_signature = _membership_sha256("SUPERVISED", train_ids)
+    validation_signature = _membership_sha256("SUPERVISED", validation_ids)
+    if (
+        train_signature != str(cel_provenance.get("ikem_train_sample_ids_sha256", ""))
+        or validation_signature
+        != str(cel_provenance.get("ikem_validation_sample_ids_sha256", ""))
+    ):
         raise RuntimeError(
-            "The exact IKEM preprocessing matrices use a different frozen split. "
-            "Rerun the CEL/RMA pipeline with this sweep root."
+            "The exact IKEM preprocessing matrices use different donor-safe train/validation "
+            "identities. Resume the V6 CEL/RMA rebuild before downstream evaluation."
         )
 
     sources = {method: load_ikem_source(layout, method=method) for method in requested}
@@ -312,8 +327,10 @@ def prepare_ikem_evaluation_sources(
 
     expected = {
         "format": FORMAT_VERSION,
-        "source": "GSE290167",
+        "source": "private IKEM CEL collection (GSE290167 fallback-only)",
         "prepared_sample_index_sha256": observed_split_hash,
+        "ikem_train_sample_ids_sha256": train_signature,
+        "ikem_validation_sample_ids_sha256": validation_signature,
         "cel_provenance_sha256": _sha256(cel_provenance_path),
         "shape": [reference.n_samples, len(method_columns[requested[0]])],
         "source_matrices": source_signature,
@@ -338,18 +355,20 @@ def prepare_ikem_evaluation_sources(
                 "using parameters fitted only on outcome-blind IKEM molecular-"
                 "pretraining train rows."
             ),
-            "uses_egfr": False,
+            "uses_outcome_values_in_fit": False,
+            "uses_outcome_availability_for_partition": True,
             "uses_egfr_cv_fold": False,
             "transductive_across_egfr_folds": False,
         },
         METHOD_PER_GSE_RMA: {
             "native_cel_matrix": "rma_per_gse.npy",
             "algorithm": (
-                "IKEM-specific RMA reference fitted only on frozen outcome-free "
-                "molecular-pretraining train CELs; every other CEL is transformed "
+                "IKEM-specific RMA reference fitted only on frozen donor-clean no-eGFR "
+                "pretraining-train CELs; validation and held-out CELs are transformed "
                 "independently."
             ),
-            "uses_egfr": False,
+            "uses_outcome_values_in_fit": False,
+            "uses_outcome_availability_for_partition": True,
             "uses_egfr_cv_fold": False,
             "transductive_across_egfr_folds": False,
         },
@@ -357,10 +376,11 @@ def prepare_ikem_evaluation_sources(
             "native_cel_matrix": "rma_global.npy",
             "algorithm": (
                 "CEL-level RMA with quantile target and median-polish probe effects "
-                "fitted only on frozen GEO molecular-pretraining train arrays; each "
-                "IKEM CEL is transformed independently."
+                "fitted only on frozen GEO train plus donor-clean IKEM train arrays; "
+                "each remaining IKEM CEL is transformed independently."
             ),
-            "uses_egfr": False,
+            "uses_outcome_values_in_fit": False,
+            "uses_outcome_availability_for_partition": True,
             "uses_egfr_cv_fold": False,
             "transductive_across_egfr_folds": False,
         },

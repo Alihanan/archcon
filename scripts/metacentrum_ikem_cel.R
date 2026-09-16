@@ -5,10 +5,11 @@
 # The script works in small blocks and resumes after interruption.
 #
 # The driver calls this file twice:
-#   prepare   checks the private CEL collection, fits IKEM-local RMA from every
-#             biopsy without a measured longitudinal eGFR, and caches those
-#             same TRAIN arrays for the
-#             combined GEO+IKEM global reference;
+#   prepare   checks the private CEL collection, excludes every donor who has
+#             any measured-eGFR biopsy, freezes a donor-level train/validation
+#             split among the remaining biopsies, fits IKEM-local RMA from the
+#             TRAIN biopsies only, and caches those same arrays for the combined
+#             GEO+IKEM global reference;
 #   finalize  applies the completed combined global reference to every IKEM
 #             array without refitting it.
 #
@@ -18,8 +19,8 @@
 #   rma_global     each IKEM CEL transformed with the target and probe effects
 #                  learned from GEO TRAIN plus IKEM no-eGFR TRAIN arrays
 #
-# eGFR values are read only to make the binary TRAIN-versus-HELD-OUT gate.
-# Their numeric values never enter normalization or model fitting.
+# eGFR values are read only to make the donor-level eligibility gate. Their
+# numeric values never enter normalization or model fitting.
 
 IKEM_GSE <- "GSE290167"
 IKEM_EXPECTED_PLATFORM <- "GPL15207"
@@ -28,17 +29,55 @@ IKEM_EXPECTED_SAMPLES <- as.integer(Sys.getenv(
   "ARCHCON_IKEM_EXPECTED_SAMPLES",
   unset = "288"
 ))
-IKEM_EXPECTED_NO_EGFR_TRAIN <- as.integer(Sys.getenv(
-  "ARCHCON_IKEM_EXPECTED_NO_EGFR_TRAIN",
+IKEM_EXPECTED_NO_EGFR_TOTAL <- as.integer(Sys.getenv(
+  "ARCHCON_IKEM_EXPECTED_NO_EGFR_TOTAL",
   unset = "34"
 ))
+IKEM_EXPECTED_PRETRAIN_ELIGIBLE <- as.integer(Sys.getenv(
+  "ARCHCON_IKEM_EXPECTED_PRETRAIN_ELIGIBLE",
+  unset = "30"
+))
+IKEM_EXPECTED_PRETRAIN_TRAIN <- as.integer(Sys.getenv(
+  "ARCHCON_IKEM_EXPECTED_PRETRAIN_TRAIN",
+  unset = "24"
+))
+IKEM_EXPECTED_PRETRAIN_VALIDATION <- as.integer(Sys.getenv(
+  "ARCHCON_IKEM_EXPECTED_PRETRAIN_VALIDATION",
+  unset = "6"
+))
+IKEM_SPLIT_SEED <- as.integer(Sys.getenv(
+  "ARCHCON_IKEM_SPLIT_SEED",
+  unset = "20260915"
+))
+IKEM_VALIDATION_FRACTION <- as.numeric(Sys.getenv(
+  "ARCHCON_IKEM_VALIDATION_FRACTION",
+  unset = "0.20"
+))
+IKEM_EXPECTED_VALIDATION_DONORS <- c("D076", "D097", "D184", "D204")
+IKEM_EXPECTED_VALIDATION_SAMPLES <- c(
+  "D076_L", "D076_P", "D097_L", "D097_P", "D184_P", "D204_L"
+)
+IKEM_EXPECTED_RELATED_HELD_OUT_SAMPLES <- c(
+  "D006_L", "D037_P", "D106_P", "D118_L"
+)
 if (is.na(IKEM_EXPECTED_SAMPLES) || IKEM_EXPECTED_SAMPLES < 2L ||
-    is.na(IKEM_EXPECTED_NO_EGFR_TRAIN) ||
-    IKEM_EXPECTED_NO_EGFR_TRAIN < 2L ||
-    IKEM_EXPECTED_NO_EGFR_TRAIN >= IKEM_EXPECTED_SAMPLES) {
+    any(is.na(c(
+      IKEM_EXPECTED_NO_EGFR_TOTAL,
+      IKEM_EXPECTED_PRETRAIN_ELIGIBLE,
+      IKEM_EXPECTED_PRETRAIN_TRAIN,
+      IKEM_EXPECTED_PRETRAIN_VALIDATION,
+      IKEM_SPLIT_SEED,
+      IKEM_VALIDATION_FRACTION
+    ))) ||
+    IKEM_EXPECTED_PRETRAIN_TRAIN < 2L ||
+    IKEM_EXPECTED_PRETRAIN_VALIDATION < 1L ||
+    IKEM_EXPECTED_PRETRAIN_TRAIN + IKEM_EXPECTED_PRETRAIN_VALIDATION !=
+      IKEM_EXPECTED_PRETRAIN_ELIGIBLE ||
+    IKEM_EXPECTED_PRETRAIN_ELIGIBLE > IKEM_EXPECTED_NO_EGFR_TOTAL ||
+    IKEM_EXPECTED_NO_EGFR_TOTAL >= IKEM_EXPECTED_SAMPLES ||
+    IKEM_VALIDATION_FRACTION <= 0 || IKEM_VALIDATION_FRACTION >= 1) {
   stop(
-    "Invalid ARCHCON_IKEM_EXPECTED_SAMPLES or ",
-    "ARCHCON_IKEM_EXPECTED_NO_EGFR_TRAIN.",
+    "Invalid IKEM sample-count/split environment settings.",
     call. = FALSE
   )
 }
@@ -105,7 +144,11 @@ IKEM_GLOBAL_PROGRESS <- file.path(
   IKEM_PROGRESS_DIR,
   "global_done_sample.txt"
 )
-IKEM_PIPELINE_VERSION <- "5-private-cel-outcome-gated-reference"
+IKEM_PIPELINE_VERSION <- paste(
+  "7-donor-separated-train-validation-reference",
+  "native-hdf5-layout-v2",
+  sep = "-"
+)
 
 IKEM_MODE <- tolower(trimws(Sys.getenv("ARCHCON_IKEM_MODE", unset = "all")))
 if (!(IKEM_MODE %in% c("prepare", "finalize", "all"))) {
@@ -196,6 +239,305 @@ atomic_write_lines_ikem <- function(object, path) {
   if (!file.rename(partial, path)) {
     stop("Could not atomically install ", path, call. = FALSE)
   }
+}
+
+h5_dataset_dims_ikem <- function(file, dataset, native) {
+  fid <- rhdf5::H5Fopen(
+    file,
+    flags = "H5F_ACC_RDONLY",
+    native = native
+  )
+  on.exit(rhdf5::H5Fclose(fid), add = TRUE)
+
+  did <- rhdf5::H5Dopen(fid, dataset)
+  on.exit(rhdf5::H5Dclose(did), add = TRUE)
+
+  sid <- rhdf5::H5Dget_space(did)
+  on.exit(rhdf5::H5Sclose(sid), add = TRUE)
+
+  as.integer(rhdf5::H5Sget_simple_extent_dims(sid)$size)
+}
+
+create_native_matrix_dataset_ikem <- function(
+  file,
+  dataset,
+  dims,
+  chunk,
+  h5_type,
+  compression_level,
+  fill_value = NaN
+) {
+  dims <- as.integer(dims)
+  chunk <- as.integer(pmin(chunk, dims))
+
+  fid <- rhdf5::H5Fopen(file, flags = "H5F_ACC_RDWR", native = TRUE)
+  on.exit(rhdf5::H5Fclose(fid), add = TRUE)
+
+  # rhdf5 2.38.x does not reliably propagate native=TRUE from the high-level
+  # dataset creator to its dataspace. Create the physical samples x probes
+  # dataspace explicitly so Python and native=TRUE R access see the same shape.
+  sid <- rhdf5::H5Screate_simple(dims, maxdims = dims, native = TRUE)
+  on.exit(rhdf5::H5Sclose(sid), add = TRUE)
+
+  dcpl <- rhdf5::H5Pcreate("H5P_DATASET_CREATE", native = TRUE)
+  on.exit(rhdf5::H5Pclose(dcpl), add = TRUE)
+
+  rhdf5::H5Pset_chunk(dcpl, chunk)
+  rhdf5::H5Pset_fill_time(dcpl, "H5D_FILL_TIME_ALLOC")
+  rhdf5::H5Pset_fill_value(dcpl, fill_value)
+  rhdf5::H5Pset_obj_track_times(dcpl, FALSE)
+
+  if (compression_level > 0L) {
+    rhdf5::H5Pset_shuffle(dcpl)
+    rhdf5::H5Pset_deflate(dcpl, compression_level)
+  }
+
+  did <- rhdf5::H5Dcreate(
+    fid,
+    dataset,
+    h5_type,
+    sid,
+    dcpl = dcpl
+  )
+  if (!methods::is(did, "H5IdComponent")) {
+    stop("Could not create IKEM HDF5 dataset: ", dataset, call. = FALSE)
+  }
+
+  verify_sid <- rhdf5::H5Dget_space(did)
+  actual <- as.integer(rhdf5::H5Sget_simple_extent_dims(verify_sid)$size)
+  rhdf5::H5Sclose(verify_sid)
+  rhdf5::H5Dclose(did)
+
+  if (!identical(actual, dims)) {
+    stop(
+      "IKEM HDF5 dataset ", dataset, " has physical dimensions ",
+      paste(actual, collapse = " x "), "; expected ",
+      paste(dims, collapse = " x "), ".",
+      call. = FALSE
+    )
+  }
+
+  invisible(TRUE)
+}
+
+h5_write_native_block_checked_ikem <- function(
+  value,
+  file,
+  dataset,
+  start
+) {
+  if (!is.matrix(value)) value <- as.matrix(value)
+
+  start <- as.integer(start)
+  count <- as.integer(dim(value))
+  dataset_dims <- h5_dataset_dims_ikem(file, dataset, native = TRUE)
+  if (
+    length(start) != 2L ||
+    length(count) != 2L ||
+    any(start < 1L) ||
+    any(start + count - 1L > dataset_dims)
+  ) {
+    stop(
+      "Refusing out-of-bounds IKEM HDF5 write to ", dataset,
+      ": start=", paste(start, collapse = ","),
+      ", count=", paste(count, collapse = ","),
+      ", dataset=", paste(dataset_dims, collapse = " x "),
+      call. = FALSE
+    )
+  }
+
+  rhdf5::h5write(
+    value,
+    file,
+    dataset,
+    start = start,
+    count = count,
+    native = TRUE
+  )
+
+  # rhdf5 2.38.x can print HDF5 errors without raising an R condition. Verify
+  # deterministic sentinels before the caller is allowed to save progress.
+  check_rows <- unique(as.integer(round(seq(
+    1L,
+    nrow(value),
+    length.out = min(5L, nrow(value))
+  ))))
+  check_cols <- unique(as.integer(round(seq(
+    1L,
+    ncol(value),
+    length.out = min(7L, ncol(value))
+  ))))
+  observed <- rhdf5::h5read(
+    file,
+    dataset,
+    index = list(
+      start[[1L]] - 1L + check_rows,
+      start[[2L]] - 1L + check_cols
+    ),
+    drop = FALSE,
+    native = TRUE
+  )
+  expected <- value[check_rows, check_cols, drop = FALSE]
+  if (!identical(dim(observed), dim(expected))) {
+    stop(
+      "IKEM HDF5 read-back returned the wrong dimensions for ",
+      dataset,
+      call. = FALSE
+    )
+  }
+
+  error <- max(abs(as.numeric(observed) - as.numeric(expected)))
+  tolerance <- 5e-6 * max(1, max(abs(as.numeric(expected))))
+  if (!is.finite(error) || error > tolerance) {
+    stop(
+      "IKEM HDF5 write verification failed for ", dataset,
+      ": max sentinel error=", format(error, digits = 8L),
+      ", tolerance=", format(tolerance, digits = 8L),
+      call. = FALSE
+    )
+  }
+
+  invisible(TRUE)
+}
+
+h5_write_r_matrix_checked_ikem <- function(
+  value,
+  file,
+  dataset,
+  rows,
+  columns,
+  tolerance_multiplier = 5e-6
+) {
+  if (!is.matrix(value)) value <- as.matrix(value)
+  rows <- as.integer(rows)
+  columns <- as.integer(columns)
+  dataset_dims <- h5_dataset_dims_ikem(file, dataset, native = FALSE)
+  expected_dims <- c(length(rows), length(columns))
+
+  if (
+    !identical(as.integer(dim(value)), as.integer(expected_dims)) ||
+    any(rows < 1L) ||
+    any(columns < 1L) ||
+    max(rows) > dataset_dims[[1L]] ||
+    max(columns) > dataset_dims[[2L]]
+  ) {
+    stop(
+      "Refusing invalid IKEM working-HDF5 write to ", dataset,
+      ": value=", paste(dim(value), collapse = " x "),
+      ", selection=", paste(expected_dims, collapse = " x "),
+      ", dataset=", paste(dataset_dims, collapse = " x "),
+      call. = FALSE
+    )
+  }
+
+  rhdf5::h5write(
+    value,
+    file,
+    dataset,
+    index = list(rows, columns),
+    native = FALSE
+  )
+
+  check_rows <- unique(as.integer(round(seq(
+    1L,
+    nrow(value),
+    length.out = min(5L, nrow(value))
+  ))))
+  check_cols <- unique(as.integer(round(seq(
+    1L,
+    ncol(value),
+    length.out = min(5L, ncol(value))
+  ))))
+  observed <- rhdf5::h5read(
+    file,
+    dataset,
+    index = list(rows[check_rows], columns[check_cols]),
+    drop = FALSE,
+    native = FALSE
+  )
+  expected <- value[check_rows, check_cols, drop = FALSE]
+  if (!identical(dim(observed), dim(expected))) {
+    stop(
+      "IKEM working-HDF5 read-back returned the wrong dimensions for ",
+      dataset,
+      call. = FALSE
+    )
+  }
+
+  error <- max(abs(as.numeric(observed) - as.numeric(expected)))
+  tolerance <- tolerance_multiplier * max(
+    1,
+    max(abs(as.numeric(expected)))
+  )
+  if (!is.finite(error) || error > tolerance) {
+    stop(
+      "IKEM working-HDF5 write verification failed for ", dataset,
+      ": max sentinel error=", format(error, digits = 8L),
+      ", tolerance=", format(tolerance, digits = 8L),
+      call. = FALSE
+    )
+  }
+
+  invisible(TRUE)
+}
+
+h5_write_vector_checked_ikem <- function(
+  value,
+  file,
+  dataset,
+  rows,
+  tolerance_multiplier = 1e-12
+) {
+  value <- as.numeric(value)
+  rows <- as.integer(rows)
+  dataset_dims <- h5_dataset_dims_ikem(file, dataset, native = TRUE)
+  if (
+    length(dataset_dims) != 1L ||
+    length(value) != length(rows) ||
+    any(rows < 1L) ||
+    max(rows) > dataset_dims[[1L]] ||
+    any(!is.finite(value))
+  ) {
+    stop(
+      "Refusing invalid IKEM parameter-HDF5 write to ", dataset,
+      call. = FALSE
+    )
+  }
+
+  rhdf5::h5write(
+    value,
+    file,
+    dataset,
+    index = list(rows),
+    native = TRUE
+  )
+  check <- unique(as.integer(round(seq(
+    1L,
+    length(value),
+    length.out = min(7L, length(value))
+  ))))
+  observed <- as.numeric(rhdf5::h5read(
+    file,
+    dataset,
+    index = list(rows[check]),
+    native = TRUE
+  ))
+  expected <- value[check]
+  error <- max(abs(observed - expected))
+  tolerance <- tolerance_multiplier * max(1, max(abs(expected)))
+  if (
+    length(observed) != length(expected) ||
+    !is.finite(error) ||
+    error > tolerance
+  ) {
+    stop(
+      "IKEM parameter-HDF5 write verification failed for ", dataset,
+      ": max sentinel error=", format(error, digits = 8L),
+      call. = FALSE
+    )
+  }
+
+  invisible(TRUE)
 }
 
 read_done_ikem <- function(path) {
@@ -472,18 +814,174 @@ find_private_cels <- function(directory, canonical) {
   )
 }
 
-ikem_training_reference <- function(metadata) {
-  positions <- which(!metadata$has_measured_egfr)
-  if (length(positions) != IKEM_EXPECTED_NO_EGFR_TRAIN) {
+assign_ikem_pretraining_roles <- function(metadata) {
+  metadata$donor_id <- sub("_[LP]$", "", metadata$sample_key_upper)
+  metadata$tissue <- sub("^.*_", "", metadata$sample_key_upper)
+  donor_has_egfr <- vapply(
+    split(metadata$has_measured_egfr, metadata$donor_id),
+    any,
+    logical(1)
+  )
+  metadata$donor_has_measured_egfr <- unname(
+    donor_has_egfr[metadata$donor_id]
+  )
+
+  no_egfr_count <- sum(!metadata$has_measured_egfr)
+  eligible <- !metadata$donor_has_measured_egfr
+  eligible_count <- sum(eligible)
+  if (no_egfr_count != IKEM_EXPECTED_NO_EGFR_TOTAL ||
+      eligible_count != IKEM_EXPECTED_PRETRAIN_ELIGIBLE) {
     stop(
-      "The outcome gate found ", length(positions),
-      " IKEM samples without measured longitudinal eGFR; expected ",
-      IKEM_EXPECTED_NO_EGFR_TRAIN, ". Do not continue until egfr_data.xlsx ",
-      "and sample_metadata.csv are verified (or explicitly set ",
-      "ARCHCON_IKEM_EXPECTED_NO_EGFR_TRAIN).",
+      "IKEM donor-level eligibility differs from the frozen contract: ",
+      no_egfr_count, " biopsies have no measured eGFR (expected ",
+      IKEM_EXPECTED_NO_EGFR_TOTAL, "); ", eligible_count,
+      " biopsies belong to donors with no measured-eGFR biopsy (expected ",
+      IKEM_EXPECTED_PRETRAIN_ELIGIBLE, ").",
       call. = FALSE
     )
   }
+
+  eligible_donors <- sort(unique(metadata$donor_id[eligible]))
+  donor_pattern <- vapply(eligible_donors, function(donor) {
+    paste(sort(unique(metadata$tissue[metadata$donor_id == donor])), collapse = "")
+  }, character(1))
+  donor_number <- suppressWarnings(as.numeric(sub("^D0*", "", eligible_donors)))
+  if (any(!is.finite(donor_number))) {
+    stop("IKEM donor IDs cannot be deterministically ranked.", call. = FALSE)
+  }
+  # Stable integer-like score: deterministic across reruns and independent of
+  # row order. The frozen seed is recorded in every output manifest.
+  seed_component <- IKEM_SPLIT_SEED %% 100000
+  donor_score <- (
+    donor_number * 2654435761 + seed_component * 1013904223
+  ) %% 2147483647
+
+  validation_donors <- character()
+  for (pattern in sort(unique(donor_pattern))) {
+    in_stratum <- which(donor_pattern == pattern)
+    n_donors <- length(in_stratum)
+    if (n_donors < 2L) {
+      next
+    }
+    n_validation <- max(
+      1L,
+      as.integer(round(n_donors * IKEM_VALIDATION_FRACTION))
+    )
+    n_validation <- min(n_validation, n_donors - 1L)
+    ranked <- in_stratum[order(
+      donor_score[in_stratum], eligible_donors[in_stratum]
+    )]
+    validation_donors <- c(
+      validation_donors,
+      eligible_donors[head(ranked, n_validation)]
+    )
+  }
+
+  metadata$training_role <- "held_out_measured_egfr"
+  metadata$training_role[
+    !metadata$has_measured_egfr & metadata$donor_has_measured_egfr
+  ] <- "held_out_related_to_measured_egfr"
+  metadata$training_role[
+    eligible & !(metadata$donor_id %in% validation_donors)
+  ] <- "pretrain_train_no_egfr"
+  metadata$training_role[
+    eligible & metadata$donor_id %in% validation_donors
+  ] <- "pretrain_validation_no_egfr"
+  metadata$pretraining_split <- ifelse(
+    metadata$training_role == "pretrain_train_no_egfr",
+    "train",
+    ifelse(
+      metadata$training_role == "pretrain_validation_no_egfr",
+      "validation",
+      NA_character_
+    )
+  )
+  metadata$use_for_molecular_pretraining <- !is.na(metadata$pretraining_split)
+  metadata$split_unit <- "donor"
+  metadata$split_seed <- IKEM_SPLIT_SEED
+  metadata$validation_fraction <- IKEM_VALIDATION_FRACTION
+
+  observed_train <- sum(metadata$pretraining_split == "train", na.rm = TRUE)
+  observed_validation <- sum(
+    metadata$pretraining_split == "validation",
+    na.rm = TRUE
+  )
+  if (observed_train != IKEM_EXPECTED_PRETRAIN_TRAIN ||
+      observed_validation != IKEM_EXPECTED_PRETRAIN_VALIDATION) {
+    stop(
+      "The deterministic IKEM donor split produced train/validation=",
+      observed_train, "/", observed_validation, "; expected ",
+      IKEM_EXPECTED_PRETRAIN_TRAIN, "/",
+      IKEM_EXPECTED_PRETRAIN_VALIDATION, ".",
+      call. = FALSE
+    )
+  }
+  train_donors <- unique(metadata$donor_id[
+    metadata$pretraining_split == "train" &
+      !is.na(metadata$pretraining_split)
+  ])
+  validation_donors_observed <- unique(metadata$donor_id[
+    metadata$pretraining_split == "validation" &
+      !is.na(metadata$pretraining_split)
+  ])
+  if (!identical(
+    sort(validation_donors_observed),
+    sort(IKEM_EXPECTED_VALIDATION_DONORS)
+  )) {
+    stop(
+      "The frozen IKEM validation donors changed: observed ",
+      paste(sort(validation_donors_observed), collapse = ", "),
+      "; expected ",
+      paste(sort(IKEM_EXPECTED_VALIDATION_DONORS), collapse = ", "),
+      ".",
+      call. = FALSE
+    )
+  }
+  validation_samples_observed <- metadata$sample_key_upper[
+    metadata$training_role == "pretrain_validation_no_egfr"
+  ]
+  related_samples_observed <- metadata$sample_key_upper[
+    metadata$training_role == "held_out_related_to_measured_egfr"
+  ]
+  if (!identical(
+    sort(validation_samples_observed),
+    sort(IKEM_EXPECTED_VALIDATION_SAMPLES)
+  )) {
+    stop(
+      "The frozen IKEM validation biopsies changed: observed ",
+      paste(sort(validation_samples_observed), collapse = ", "),
+      "; expected ",
+      paste(sort(IKEM_EXPECTED_VALIDATION_SAMPLES), collapse = ", "),
+      ".",
+      call. = FALSE
+    )
+  }
+  if (!identical(
+    sort(related_samples_observed),
+    sort(IKEM_EXPECTED_RELATED_HELD_OUT_SAMPLES)
+  )) {
+    stop(
+      "The frozen related-donor exclusions changed: observed ",
+      paste(sort(related_samples_observed), collapse = ", "),
+      "; expected ",
+      paste(sort(IKEM_EXPECTED_RELATED_HELD_OUT_SAMPLES), collapse = ", "),
+      ".",
+      call. = FALSE
+    )
+  }
+  held_out_donors <- unique(metadata$donor_id[
+    metadata$donor_has_measured_egfr
+  ])
+  if (length(intersect(train_donors, validation_donors_observed)) > 0L ||
+      length(intersect(train_donors, held_out_donors)) > 0L ||
+      length(intersect(validation_donors_observed, held_out_donors)) > 0L) {
+    stop("IKEM donor-level train/validation/eGFR separation failed.", call. = FALSE)
+  }
+  metadata
+}
+
+ikem_training_reference <- function(metadata) {
+  positions <- which(metadata$training_role == "pretrain_train_no_egfr")
   data.frame(
     reference_order = seq_along(positions),
     sample_id = metadata$sample_id[positions],
@@ -494,8 +992,11 @@ ikem_training_reference <- function(metadata) {
     public_GSM = metadata$GSM[positions],
     gse290167_row_r = positions,
     gse290167_row_python = positions - 1L,
-    training_role = "train_no_measured_egfr",
-    outcome_status = "no measured longitudinal eGFR",
+    training_role = "pretrain_train_no_egfr",
+    pretraining_split = "train",
+    split_unit = "donor",
+    split_seed = IKEM_SPLIT_SEED,
+    outcome_status = "no measured longitudinal eGFR in this donor",
     stringsAsFactors = FALSE
   )
 }
@@ -764,20 +1265,10 @@ if (length(missing_private) > 0L) {
 
 metadata$appears_in_egfr_workbook <- availability$appears_in_egfr_workbook
 metadata$has_measured_egfr <- availability$has_measured_egfr
-metadata$training_role <- ifelse(
-  metadata$has_measured_egfr,
-  "held_out_measured_egfr",
-  "train_no_measured_egfr"
-)
-metadata$donor_id <- sub("_[LP]$", "", metadata$sample_key_upper)
-donor_role_count <- vapply(
-  split(metadata$training_role, metadata$donor_id),
-  function(roles) length(unique(roles)),
-  integer(1)
-)
-donors_crossing_outcome_gate <- names(donor_role_count)[donor_role_count > 1L]
-metadata$donor_crosses_outcome_gate <- metadata$donor_id %in%
-  donors_crossing_outcome_gate
+# Assign the outcome gate and the frozen molecular-pretraining split at donor
+# level. A donor with eGFR for either biopsy contributes no biopsy to molecular
+# pretraining; every remaining donor belongs wholly to train or validation.
+metadata <- assign_ikem_pretraining_roles(metadata)
 metadata$legacy_row_index_python <- NA_integer_
 legacy_index_path <- file.path(IKEM_LEGACY_STORE, "sample_index.csv")
 if (nzchar(IKEM_LEGACY_STORE) && file.exists(legacy_index_path)) {
@@ -810,18 +1301,32 @@ message(
   sum(!metadata$has_private_cel), " public GSE290167 fallback."
 )
 message(
-  "Outcome gate: ", length(local_reference_positions),
-  " no-measured-eGFR TRAIN; ", sum(metadata$has_measured_egfr),
-  " measured-eGFR HELD OUT."
+  "Outcome gate: ", sum(!metadata$has_measured_egfr),
+  " biopsies have no measured eGFR; ",
+  sum(metadata$training_role == "held_out_related_to_measured_egfr"),
+  " are excluded because their donor has another biopsy with measured eGFR."
 )
 message(
-  "Outcome gate unit: biopsy. Donors represented on both sides: ",
-  length(donors_crossing_outcome_gate),
-  if (length(donors_crossing_outcome_gate) > 0L) {
-    paste0(" (", paste(donors_crossing_outcome_gate, collapse = ", "), ").")
-  } else {
-    "."
-  }
+  "Frozen donor-level pretraining split: ",
+  sum(metadata$pretraining_split == "train", na.rm = TRUE), " biopsies / ",
+  length(unique(metadata$donor_id[metadata$pretraining_split == "train" &
+    !is.na(metadata$pretraining_split)])), " donors TRAIN; ",
+  sum(metadata$pretraining_split == "validation", na.rm = TRUE),
+  " biopsies / ",
+  length(unique(metadata$donor_id[
+    metadata$pretraining_split == "validation" &
+      !is.na(metadata$pretraining_split)
+  ])), " donors VALIDATION."
+)
+message(
+  "Validation donors: ", paste(sort(unique(metadata$donor_id[
+    metadata$pretraining_split == "validation" &
+      !is.na(metadata$pretraining_split)
+  ])), collapse = ", "), "."
+)
+message(
+  "Measured-eGFR evaluation pool: ", sum(metadata$has_measured_egfr),
+  " biopsies; none fit an IKEM normalization reference."
 )
 
 # A compact manifest detects private CEL replacement without hashing many GB of
@@ -938,10 +1443,12 @@ metadata$private_cel_filename <- ifelse(
 )
 correspondence <- metadata[, c(
   "row_index_python", "sample_id", "sample_id_geo", "sample_key_upper",
-  "donor_id", "donor_crosses_outcome_gate", "GSM", "patient_id_geo",
+  "donor_id", "donor_has_measured_egfr", "GSM", "patient_id_geo",
   "tissue_geo", "platform", "cel_source",
   "private_cel_filename", "raw_member", "appears_in_egfr_workbook",
-  "has_measured_egfr", "training_role", "legacy_row_index_python",
+  "has_measured_egfr", "training_role", "pretraining_split",
+  "use_for_molecular_pretraining", "split_unit", "split_seed",
+  "validation_fraction", "legacy_row_index_python",
   "is_local_rma_reference_train"
 )]
 correspondence$metadata_match <- TRUE
@@ -1161,16 +1668,31 @@ if (file.exists(IKEM_COMPLETE)) {
   )) {
     full <- paste0("/expression/", dataset)
     if (!any(paste0(objects$group, "/", objects$name) == full)) {
-      rhdf5::h5createDataset(
+      create_native_matrix_dataset_ikem(
         IKEM_FINAL_H5,
         paste0("expression/", dataset),
         dims = final_dims,
-        H5type = "H5T_IEEE_F32LE",
         chunk = c(min(16L, n_samples), min(1024L, n_probes)),
-        level = IKEM_H5_LEVEL,
-        fillValue = NaN,
+        h5_type = "H5T_IEEE_F32LE",
+        compression_level = IKEM_H5_LEVEL,
+        fill_value = NaN
+      )
+    } else {
+      actual_dims <- h5_dataset_dims_ikem(
+        IKEM_FINAL_H5,
+        paste0("expression/", dataset),
         native = TRUE
       )
+      if (!identical(actual_dims, as.integer(final_dims))) {
+        stop(
+          "Existing IKEM HDF5 dataset expression/", dataset,
+          " has physical dimensions ", paste(actual_dims, collapse = " x "),
+          "; expected ", paste(final_dims, collapse = " x "),
+          ". The V7 signature should have removed every pre-layout-v2 ",
+          "checkpoint; stop and inspect ", IKEM_FINAL_H5, ".",
+          call. = FALSE
+        )
+      }
     }
   }
 
@@ -1187,7 +1709,7 @@ if (file.exists(IKEM_COMPLETE)) {
       if (nrow(values) == 1L) return(as.numeric(values[1L, ]))
       apply(values, 2L, stats::median)
     }, FUN.VALUE = numeric(n_batch))
-    result
+    matrix(result, nrow = n_batch, ncol = length(common_probes))
   }
 
   # Cache background-corrected PM values for the frozen IKEM no-eGFR
@@ -1230,6 +1752,23 @@ if (file.exists(IKEM_COMPLETE)) {
       native = FALSE
     )
   }
+  background_dims <- h5_dataset_dims_ikem(
+    IKEM_GLOBAL_TRAIN_BG_H5,
+    "background_corrected_all_pm",
+    native = FALSE
+  )
+  expected_background_dims <- as.integer(c(
+    template$n_all_pm,
+    length(local_reference_positions)
+  ))
+  if (!identical(background_dims, expected_background_dims)) {
+    stop(
+      "IKEM TRAIN background cache has dimensions ",
+      paste(background_dims, collapse = " x "), "; expected ",
+      paste(expected_background_dims, collapse = " x "), ".",
+      call. = FALSE
+    )
+  }
 
   if (file.exists(pass1_state_path)) {
     target_state <- readRDS(pass1_state_path)
@@ -1264,12 +1803,12 @@ if (file.exists(IKEM_COMPLETE)) {
       if (batch[[k]] %in% local_reference_positions) {
         sorted_corrected <- sort(corrected)
         reference_column <- match(batch[[k]], local_reference_positions)
-        rhdf5::h5write(
-          corrected,
+        h5_write_r_matrix_checked_ikem(
+          matrix(corrected, ncol = 1L),
           IKEM_GLOBAL_TRAIN_BG_H5,
           "background_corrected_all_pm",
-          index = list(seq_len(template$n_all_pm), reference_column),
-          native = FALSE
+          rows = seq_len(template$n_all_pm),
+          columns = reference_column
         )
         train_sum <- train_sum + sorted_corrected
         train_n <- train_n + 1L
@@ -1278,12 +1817,11 @@ if (file.exists(IKEM_COMPLETE)) {
       rm(intensity, pm, corrected)
     }
     raw_block <- raw_for_batch(common_pm)
-    rhdf5::h5write(
+    h5_write_native_block_checked_ikem(
       raw_block,
       IKEM_FINAL_H5,
       "expression/raw_original",
-      index = list(batch, seq_len(n_probes)),
-      native = TRUE
+      start = c(batch_start, 1L)
     )
     target_state$local_train_sum <- train_sum
     target_state$local_train_n <- train_n
@@ -1378,6 +1916,20 @@ if (file.exists(IKEM_COMPLETE)) {
       native = FALSE
     )
   }
+  normalized_dims <- h5_dataset_dims_ikem(
+    IKEM_PROBE_H5,
+    "local_normalized_common_pm",
+    native = FALSE
+  )
+  expected_normalized_dims <- as.integer(c(template$n_common_pm, n_samples))
+  if (!identical(normalized_dims, expected_normalized_dims)) {
+    stop(
+      "IKEM local-normalized cache has dimensions ",
+      paste(normalized_dims, collapse = " x "), "; expected ",
+      paste(expected_normalized_dims, collapse = " x "), ".",
+      call. = FALSE
+    )
+  }
 
   global_for_batch <- function(common_normalized) {
     n_batch <- ncol(common_normalized)
@@ -1387,7 +1939,7 @@ if (file.exists(IKEM_COMPLETE)) {
       if (nrow(adjusted) == 1L) return(as.numeric(adjusted[1L, ]))
       apply(adjusted, 2L, stats::median)
     }, FUN.VALUE = numeric(n_batch))
-    result
+    matrix(result, nrow = n_batch, ncol = length(common_probes))
   }
 
   pass2_done <- read_done_ikem(file.path(IKEM_PROGRESS_DIR, "pass2_done_sample.txt"))
@@ -1414,12 +1966,12 @@ if (file.exists(IKEM_COMPLETE)) {
     if (any(!is.finite(local_common))) {
       stop("Non-finite IKEM RMA value in PASS2.", call. = FALSE)
     }
-    rhdf5::h5write(
+    h5_write_r_matrix_checked_ikem(
       local_common,
       IKEM_PROBE_H5,
       "local_normalized_common_pm",
-      index = list(seq_len(template$n_common_pm), batch),
-      native = FALSE
+      rows = seq_len(template$n_common_pm),
+      columns = batch
     )
     for (key in keys) append_done_ikem(
       file.path(IKEM_PROGRESS_DIR, "pass2_done_sample.txt"), key
@@ -1524,19 +2076,17 @@ if (file.exists(IKEM_COMPLETE)) {
         any(!is.finite(local_effect_block))) {
       stop("Invalid local-RMA summary in IKEM PASS3 block ", block_id, call. = FALSE)
     }
-    rhdf5::h5write(
+    h5_write_native_block_checked_ikem(
       t(local_summarized),
       IKEM_FINAL_H5,
       "expression/rma_per_gse",
-      index = list(seq_len(n_samples), probe_ids),
-      native = TRUE
+      start = c(1L, first_probe)
     )
-    rhdf5::h5write(
+    h5_write_vector_checked_ikem(
       local_effect_block,
       IKEM_LOCAL_PARAMETERS,
       "probe_effect_common_pm",
-      index = list(pm_rows),
-      native = TRUE
+      rows = pm_rows
     )
     append_done_ikem(pass3_path, as.character(block_id))
     rm(
@@ -1638,12 +2188,11 @@ if (file.exists(IKEM_COMPLETE)) {
       if (any(!is.finite(global_block))) {
         stop("Non-finite combined-global IKEM RMA output.", call. = FALSE)
       }
-      rhdf5::h5write(
+      h5_write_native_block_checked_ikem(
         global_block,
         IKEM_FINAL_H5,
         "expression/rma_global",
-        index = list(batch, seq_len(n_probes)),
-        native = TRUE
+        start = c(batch_start, 1L)
       )
       for (key in keys) append_done_ikem(IKEM_GLOBAL_PROGRESS, key)
       global_done <- c(global_done, keys)
