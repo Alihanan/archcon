@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from importlib.resources import as_file, files
 from pathlib import Path
+
+import pandas as pd
 
 from .data.defaults import project_data_layout
 from .data.downstream import (
@@ -23,10 +26,30 @@ from .data.downstream import (
     select_molecular_group_winners,
     summarize_fixed_encoder_results,
 )
-from .data.geo_rma import METHOD_PER_GSE_RMA
 from .data.ikem_preprocessing import prepare_ikem_evaluation_sources
+from .data.probe_lasso import (
+    ProbeExpressionArm,
+    ProbeLassoConfig,
+    evaluate_probe_lasso_mixed_models,
+    summarize_probe_lasso_against_time,
+)
 
 LINE = "=" * 88
+
+
+def expected_sweep_groups(config_directory: Path) -> set[tuple[str, str]]:
+    """Read the preprocessing×architecture groups actually generated in a sweep."""
+
+    groups: set[tuple[str, str]] = set()
+    for path in sorted(config_directory.glob("run_*.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        training = payload.get("training", {})
+        method = str(payload.get("method", "")).strip()
+        architecture = str(training.get("architecture_family", "")).strip()
+        if not method or not architecture:
+            raise ValueError(f"Generated run config lacks method/architecture: {path}")
+        groups.add((method, architecture))
+    return groups
 
 
 def choose_device(name: str) -> str:
@@ -88,7 +111,7 @@ def main() -> None:
         "--inner-folds",
         type=int,
         default=5,
-        help="Deprecated compatibility option; fixed-encoder evaluation has no inner CV.",
+        help="Inner donor-grouped folds used to select the probe-LASSO penalty.",
     )
     parser.add_argument("--cv-seed", type=int, default=0)
     parser.add_argument(
@@ -113,8 +136,8 @@ def main() -> None:
         "--no-non-stadniuk",
         action="store_true",
         help=(
-            "Deprecated compatibility flag; the paper workflow always retains all six "
-            "preprocessing×architecture group winners."
+            "Deprecated compatibility flag; the paper workflow retains every "
+            "preprocessing×architecture group winner declared by this sweep."
         ),
     )
     parser.add_argument("--no-pca", action="store_true")
@@ -139,6 +162,18 @@ def main() -> None:
             "and frozen-pretraining provenance still match."
         ),
     )
+    parser.add_argument(
+        "--no-probe-lasso",
+        action="store_true",
+        help="Skip the all-probe nested-CV LASSO mixed-model baseline.",
+    )
+    parser.add_argument(
+        "--lasso-alpha-fractions",
+        default="1,0.5,0.2,0.1,0.05,0.02,0.01,0.005,0.002,0.001",
+        help="Descending fractions of each fold's lambda_max used for LASSO tuning.",
+    )
+    parser.add_argument("--lasso-max-iter", type=int, default=5_000)
+    parser.add_argument("--lasso-tolerance", type=float, default=1e-4)
     args = parser.parse_args()
     if args.evaluate_all_readable_checkpoints:
         raise SystemExit(
@@ -189,9 +224,8 @@ def main() -> None:
         print(f"WARNING: {warning}", file=sys.stderr)
     if not readable_records:
         raise SystemExit("No readable run_*/best.pt checkpoints were found.")
-    expected_names = {
-        path.stem for path in (sweep_root / "configs").glob("run_*.json")
-    }
+    config_directory = sweep_root / "configs"
+    expected_names = {path.stem for path in config_directory.glob("run_*.json")}
     expected_runs = len(expected_names)
     if not expected_names:
         raise SystemExit(f"No generated run configs were found under {sweep_root / 'configs'}.")
@@ -231,10 +265,15 @@ def main() -> None:
             "touches GEO test or eGFR outcomes."
         )
     groups = {(record.method, record.architecture) for record in records}
-    if complete and len(groups) != 6:
-        readable = ", ".join(f"{method} × {architecture}" for method, architecture in sorted(groups))
+    expected_groups = expected_sweep_groups(config_directory)
+    if complete and groups != expected_groups:
+        readable = ", ".join(
+            f"{method} × {architecture}" for method, architecture in sorted(groups)
+        )
         raise SystemExit(
-            f"Expected six preprocessing×architecture groups, found {len(groups)}: {readable}."
+            "Completed checkpoints do not cover the preprocessing×architecture groups "
+            f"declared by the sweep configs. Observed {len(groups)}/{len(expected_groups)}: "
+            f"{readable}."
         )
     print(LINE)
     print("MOLECULAR CONFIGURATION SELECTION" if complete else "PRELIMINARY MOLECULAR SELECTION")
@@ -244,7 +283,8 @@ def main() -> None:
         print(
             f"PRELIMINARY: using {len(records)}/{expected_runs or '?'} readable checkpoints "
             f"({len(completed_records)} completed + {running_count} in-progress) from "
-            f"{len(groups)}/6 currently represented preprocessing×architecture groups."
+            f"{len(groups)}/{len(expected_groups)} currently represented "
+            "preprocessing×architecture groups."
         )
         if args.include_running_checkpoints:
             print(
@@ -278,7 +318,7 @@ def main() -> None:
         progress=report_progress,
     )
     group_winners = select_molecular_group_winners(
-        scored, expected_groups=6 if complete else None
+        scored, expected_groups=len(expected_groups) if complete else None
     )
 
     if not complete:
@@ -286,7 +326,10 @@ def main() -> None:
             scored, group_winners, output_root / "molecular_selection"
         )
         print("\n" + LINE)
-        print(f"PRELIMINARY VALIDATION-ONLY WINNERS ({len(group_winners)}/6 GROUPS)")
+        print(
+            "PRELIMINARY VALIDATION-ONLY WINNERS "
+            f"({len(group_winners)}/{len(expected_groups)} GROUPS)"
+        )
         print(LINE)
         for _, _, record in group_winners:
             print(
@@ -303,7 +346,9 @@ def main() -> None:
         )
         return
 
-    print("Evaluating the 584-row GEO test partition for the six frozen winners only...")
+    print(
+        "Evaluating the 584-row GEO test partition for the frozen group winners only..."
+    )
     group_winners = evaluate_frozen_molecular_test_records(
         group_winners,
         layout,
@@ -318,7 +363,7 @@ def main() -> None:
 
     print("\n" + LINE)
     print(
-        "SIX FROZEN MOLECULAR GROUP WINNERS"
+        f"{len(group_winners)} FROZEN MOLECULAR GROUP WINNERS"
     )
     print(LINE)
     for _, _, record in group_winners:
@@ -333,7 +378,7 @@ def main() -> None:
     print(f"\nAll molecular scores: {score_path}")
     print(f"Group winners: {group_path}")
     print(
-        "GEO test was evaluated only after validation froze all six group winners; it did "
+        "GEO test was evaluated only after validation froze all group winners; it did "
         "not participate in checkpoint or hyperparameter selection."
     )
     print(
@@ -348,9 +393,7 @@ def main() -> None:
 
     print("\nPreparing method-matched IKEM inputs without using eGFR outcomes or CV folds...")
     required_ikem_methods = tuple(
-        dict.fromkeys(
-            [METHOD_PER_GSE_RMA, *(record.method for _, _, record in selected)]
-        )
+        dict.fromkeys(record.method for _, _, record in selected)
     )
     ikem_sources = prepare_ikem_evaluation_sources(
         layout,
@@ -396,20 +439,77 @@ def main() -> None:
     if args.embeddings_only:
         return
 
-    winner_input_dim = int(embeddings[0].record.input_dim)
-    expression, expression_samples = aligned_ikem_matrix(
-        layout,
-        prepared_root,
-        winner_input_dim,
-        source=ikem_sources[METHOD_PER_GSE_RMA].source,
-    )
-    egfr = load_egfr_wide(layout, expression_samples["sample_id"])
+    input_dimensions = {int(result.record.input_dim) for result in embeddings}
+    if len(input_dimensions) != 1:
+        raise RuntimeError(
+            f"Frozen encoders disagree on input dimension: {sorted(input_dimensions)}"
+        )
+    winner_input_dim = input_dimensions.pop()
+    expressions: dict[str, object] = {}
+    expression_samples: dict[str, object] = {}
+    for method in required_ikem_methods:
+        matrix, samples = aligned_ikem_matrix(
+            layout,
+            prepared_root,
+            winner_input_dim,
+            source=ikem_sources[method].source,
+        )
+        expressions[method] = matrix
+        expression_samples[method] = samples
+    reference_samples = expression_samples[required_ikem_methods[0]]
+    reference_ids = reference_samples["sample_id"].astype(str).tolist()
+    for method, samples in expression_samples.items():
+        if samples["sample_id"].astype(str).tolist() != reference_ids:
+            raise RuntimeError(f"IKEM sample order differs after {method} preprocessing.")
+    egfr = load_egfr_wide(layout, reference_ids)
     stratify_column = None if args.stratify_column.lower() == "none" else args.stratify_column
     benchmark_root = output_root / "mixed_models"
+
+    lasso_fold_metrics = None
+    if not args.no_probe_lasso:
+        try:
+            alpha_fractions = tuple(
+                float(value.strip())
+                for value in args.lasso_alpha_fractions.split(",")
+                if value.strip()
+            )
+        except ValueError as exc:
+            raise SystemExit("--lasso-alpha-fractions must be comma-separated numbers.") from exc
+        lasso_arms = {
+            method: ProbeExpressionArm(
+                method=method,
+                matrix=expressions[method],
+                samples=expression_samples[method],
+                probe_ids=ikem_sources[method].source.probe_ids,
+            )
+            for method in required_ikem_methods
+        }
+        print(
+            "Running all-probe LASSO mixed models with nested donor-grouped CV; "
+            "the same outer folds are reused for every preprocessing strategy..."
+        )
+        lasso_fold_metrics, lasso_summary = evaluate_probe_lasso_mixed_models(
+            egfr,
+            lasso_arms,
+            output_root / "probe_lasso",
+            n_splits=args.folds,
+            n_repeats=args.repeats,
+            seed=args.cv_seed,
+            stratify_column=stratify_column,
+            config=ProbeLassoConfig(
+                alpha_fractions=alpha_fractions,
+                inner_splits=args.inner_folds,
+                max_iter=args.lasso_max_iter,
+                tolerance=args.lasso_tolerance,
+            ),
+        )
+        print("\nALL-PROBE LASSO MIXED-MODEL BASELINES")
+        print(lasso_summary.to_string(index=False, float_format=lambda value: f"{value:.6g}"))
+
     design_path, specs_path, specs = prepare_mixed_model_design(
         egfr,
         embeddings,
-        expression,
+        expressions,
         expression_samples,
         benchmark_root,
         n_splits=args.folds,
@@ -437,6 +537,13 @@ def main() -> None:
     summary, fixed_encoder_summary, comparisons = summarize_fixed_encoder_results(
         metrics_path, predictions_path, embeddings, benchmark_root
     )
+    lasso_comparison = None
+    if lasso_fold_metrics is not None:
+        lasso_comparison = summarize_probe_lasso_against_time(
+            lasso_fold_metrics,
+            pd.read_csv(metrics_path),
+            output_root / "probe_lasso",
+        )
 
     print("\n" + LINE)
     print("FIXED-ENCODER eGFR EVALUATION")
@@ -466,6 +573,20 @@ def main() -> None:
     if not comparisons.empty:
         print(
             "\nMatched-fold comparisons (positive gain favors the frozen encoder model):"
+        )
+    if lasso_comparison is not None:
+        print("\nAll-probe LASSO compared with the same-fold lme4 time-only baseline:")
+        print(
+            lasso_comparison[
+                [
+                    "model_label",
+                    "mean_rmse",
+                    "mean_rmse_ci95_low",
+                    "mean_rmse_ci95_high",
+                    "mean_delta_vs_time",
+                    "positive_folds_vs_time",
+                ]
+            ].to_string(index=False, float_format=lambda value: f"{value:.6g}")
         )
         comparison_columns = [
             "candidate_id",

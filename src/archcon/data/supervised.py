@@ -129,7 +129,11 @@ def classify_supervised_samples(
     eGFR measurements are all missing, is classified as ``without eGFR``.
     """
 
-    ids = [normalize_sample_id(value) for value in sample_ids]
+    # Biopsy suffixes in the source workbooks are not consistently cased
+    # (notably D205_p), whereas the CEL manifest uses canonical uppercase IDs.
+    # Identity matching must therefore be case-insensitive and all downstream
+    # sample keys use the uppercase canonical representation.
+    ids = [normalize_sample_id(value).upper() for value in sample_ids]
     if len(ids) != len(set(ids)):
         raise ValueError("Supervised expression data contain duplicate sample IDs.")
     result = pd.DataFrame(
@@ -149,7 +153,7 @@ def classify_supervised_samples(
     egfr = load_table(layout.egfr_table)
     id_column = _find_id_column(egfr)
     egfr = egfr.copy()
-    egfr[id_column] = egfr[id_column].map(normalize_sample_id)
+    egfr[id_column] = egfr[id_column].map(normalize_sample_id).str.upper()
     known_columns = tuple(column for column in EGFR_COLUMNS if column in egfr.columns)
     if not known_columns:
         raise ValueError(

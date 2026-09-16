@@ -217,6 +217,17 @@ def test_recommended_comparison_sweep_has_1440_architecture_preprocessing_runs(t
     compile(first_job, str(jobs[0]), "exec")
 
 
+def test_recommended_comparison_sweep_can_be_restricted_to_per_gse() -> None:
+    from archcon.batch import _expand_sweep_variants, recommended_comparison_grid_json
+    from archcon.data.geo_rma import METHOD_PER_GSE_RMA
+
+    variants = _expand_sweep_variants(
+        recommended_comparison_grid_json([METHOD_PER_GSE_RMA])
+    )
+    assert len(variants) == 480
+    assert {overrides["method"] for _, overrides in variants} == {METHOD_PER_GSE_RMA}
+
+
 def test_generated_python_job_model_is_checkpoint_compatible_with_canonical_builder() -> None:
     pytest.importorskip("torch")
     from archcon.data.pretraining import ARCH_RESNET_LN

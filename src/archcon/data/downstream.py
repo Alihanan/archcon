@@ -619,6 +619,20 @@ def _slug(value: str) -> str:
     return result or "model"
 
 
+def pca_model_id(
+    method: str,
+    latent_dim: int,
+    *,
+    preprocessing_count: int,
+    dimension_count: int,
+) -> str:
+    """Name a PCA baseline without conflating preprocessing strategies."""
+
+    method_part = f"_{_slug(method)}" if preprocessing_count > 1 else ""
+    dimension_part = f"_d{int(latent_dim)}" if dimension_count > 1 else ""
+    return f"pca{method_part}{dimension_part}"
+
+
 def select_embedding_checkpoints(
     records: list[ValidationCheckpoint],
     *,
@@ -1014,8 +1028,8 @@ def _impute_standardize_train_test(
 def prepare_mixed_model_design(
     egfr_wide: pd.DataFrame,
     embeddings: list[EmbeddingResult],
-    aligned_expression: np.ndarray,
-    expression_samples: pd.DataFrame,
+    aligned_expression: np.ndarray | dict[str, np.ndarray],
+    expression_samples: pd.DataFrame | dict[str, pd.DataFrame],
     output_root: str | Path,
     *,
     n_splits: int = 5,
@@ -1035,12 +1049,45 @@ def prepare_mixed_model_design(
     root.mkdir(parents=True, exist_ok=True)
     patients = egfr_wide.reset_index(drop=True).copy()
     long = egfr_long(patients)
-    sample_lookup = {value: index for index, value in enumerate(expression_samples["sample_id"])}
-    missing = [value for value in patients["patient"] if value not in sample_lookup]
-    if missing:
-        raise ValueError(f"eGFR patients are missing molecular rows: {missing[:5]}")
-    expression_rows = np.asarray([sample_lookup[value] for value in patients["patient"]], dtype=np.int64)
-    expression = np.asarray(aligned_expression[expression_rows], dtype=np.float32)
+    embedding_methods = tuple(dict.fromkeys(result.record.method for result in embeddings))
+    if isinstance(aligned_expression, dict):
+        expression_by_method = aligned_expression
+    else:
+        if len(embedding_methods) != 1:
+            raise ValueError(
+                "Multiple preprocessing strategies require one aligned expression matrix "
+                "per strategy."
+            )
+        expression_by_method = {embedding_methods[0]: aligned_expression}
+    if isinstance(expression_samples, dict):
+        samples_by_method = expression_samples
+    else:
+        samples_by_method = {method: expression_samples for method in expression_by_method}
+    if set(expression_by_method) != set(embedding_methods):
+        raise ValueError(
+            "Method-specific expression matrices do not match the frozen encoder "
+            f"preprocessing strategies: matrices={sorted(expression_by_method)}, "
+            f"encoders={sorted(embedding_methods)}."
+        )
+    if set(samples_by_method) != set(expression_by_method):
+        raise ValueError("Method-specific expression sample indexes are incomplete.")
+
+    expressions: dict[str, np.ndarray] = {}
+    for method in embedding_methods:
+        current_samples = samples_by_method[method]
+        sample_ids = current_samples["sample_id"].astype(str)
+        if sample_ids.duplicated().any():
+            raise ValueError(f"{method} expression contains duplicate sample IDs.")
+        sample_lookup = {value: index for index, value in enumerate(sample_ids)}
+        missing = [value for value in patients["patient"] if value not in sample_lookup]
+        if missing:
+            raise ValueError(f"{method} is missing eGFR molecular rows: {missing[:5]}")
+        expression_rows = np.asarray(
+            [sample_lookup[value] for value in patients["patient"]], dtype=np.int64
+        )
+        expressions[method] = np.asarray(
+            expression_by_method[method][expression_rows], dtype=np.float32
+        )
 
     if include_clinical:
         clinical_columns = CLINICAL_COLUMNS
@@ -1139,6 +1186,8 @@ def prepare_mixed_model_design(
     embedding_dimensions = sorted(
         {int(matrix.shape[1]) for matrix in embedding_matrices.values()}
     )
+    preprocessing_count = len(embedding_methods)
+    dimension_count = len(embedding_dimensions)
 
     for repeat, fold, train_index, test_index in fold_definitions:
         empty_train = np.empty((len(train_index), 0), dtype=np.float32)
@@ -1170,42 +1219,48 @@ def prepare_mixed_model_design(
                 test_features,
                 feature_description=f"{model_id} latent components",
             )
-        pca_by_dimension: dict[int, tuple[np.ndarray, np.ndarray, str]] = {}
+        pca_by_method_dimension: dict[
+            tuple[str, int], tuple[np.ndarray, np.ndarray, str]
+        ] = {}
         if include_pca:
-            for requested_dimension in embedding_dimensions:
-                n_components = min(
-                    requested_dimension, len(train_index) - 1, expression.shape[1]
-                )
-                pca = PCA(
-                    n_components=n_components,
-                    svd_solver="randomized",
-                    random_state=seed + repeat,
-                )
-                train_pca = pca.fit_transform(expression[train_index])
-                test_pca = pca.transform(expression[test_index])
-                train_pca, test_pca = _standardize_train_test(train_pca, test_pca)
-                pca_id = (
-                    "pca"
-                    if len(embedding_dimensions) == 1
-                    else f"pca_d{requested_dimension}"
-                )
-                labels[pca_id] = f"Fold-fitted PCA ({n_components} components)"
-                pca_by_dimension[requested_dimension] = (
-                    train_pca,
-                    test_pca,
-                    pca_id,
-                )
-                append_model(
-                    pca_id,
-                    labels[pca_id],
-                    repeat,
-                    fold,
-                    train_index,
-                    test_index,
-                    train_pca,
-                    test_pca,
-                    feature_description="fold-fitted PCA components",
-                )
+            for method, expression in expressions.items():
+                for requested_dimension in embedding_dimensions:
+                    n_components = min(
+                        requested_dimension, len(train_index) - 1, expression.shape[1]
+                    )
+                    pca = PCA(
+                        n_components=n_components,
+                        svd_solver="randomized",
+                        random_state=seed + repeat,
+                    )
+                    train_pca = pca.fit_transform(expression[train_index])
+                    test_pca = pca.transform(expression[test_index])
+                    train_pca, test_pca = _standardize_train_test(train_pca, test_pca)
+                    pca_id = pca_model_id(
+                        method,
+                        requested_dimension,
+                        preprocessing_count=preprocessing_count,
+                        dimension_count=dimension_count,
+                    )
+                    labels[pca_id] = (
+                        f"Fold-fitted PCA ({n_components} components) - {method}"
+                    )
+                    pca_by_method_dimension[(method, requested_dimension)] = (
+                        train_pca,
+                        test_pca,
+                        pca_id,
+                    )
+                    append_model(
+                        pca_id,
+                        labels[pca_id],
+                        repeat,
+                        fold,
+                        train_index,
+                        test_index,
+                        train_pca,
+                        test_pca,
+                        feature_description=f"fold-fitted PCA components from {method}",
+                    )
 
         if include_clinical:
             train_clinical, test_clinical = _impute_standardize_train_test(
@@ -1278,11 +1333,11 @@ def prepare_mixed_model_design(
                     feature_description=model_id + " + " + " + ".join(clinical_columns),
                 )
 
-            for requested_dimension, (
+            for (method, requested_dimension), (
                 train_pca,
                 test_pca,
                 pca_id,
-            ) in pca_by_dimension.items():
+            ) in pca_by_method_dimension.items():
                 append_model(
                     f"{pca_id}_kdri",
                     f"{labels[pca_id]} + KDRI × time",
@@ -1294,7 +1349,7 @@ def prepare_mixed_model_design(
                     test_pca,
                     train_clinical[:, [kdri_index]],
                     test_clinical[:, [kdri_index]],
-                    feature_description=f"PCA({requested_dimension}) + KDRI_8",
+                    feature_description=f"PCA({requested_dimension}, {method}) + KDRI_8",
                 )
                 append_model(
                     f"{pca_id}_clinical",
@@ -1308,7 +1363,7 @@ def prepare_mixed_model_design(
                     train_clinical,
                     test_clinical,
                     feature_description=(
-                        f"PCA({requested_dimension}) + "
+                        f"PCA({requested_dimension}, {method}) + "
                         + " + ".join(clinical_columns)
                     ),
                 )
@@ -2056,10 +2111,16 @@ def summarize_fixed_encoder_results(
             }
         )
 
-    multiple_dimensions = len({int(result.z.shape[1]) for result in embeddings}) > 1
+    dimension_count = len({int(result.z.shape[1]) for result in embeddings})
+    preprocessing_count = len({result.record.method for result in embeddings})
     for result in embeddings:
         candidate_id = result.model_id
-        pca_id = f"pca_d{int(result.z.shape[1])}" if multiple_dimensions else "pca"
+        pca_id = pca_model_id(
+            result.record.method,
+            int(result.z.shape[1]),
+            preprocessing_count=preprocessing_count,
+            dimension_count=dimension_count,
+        )
         append_comparison(candidate_id, candidate_id, "time_only", "z vs time only")
         append_comparison(candidate_id, candidate_id, pca_id, "z vs matched PCA")
         append_comparison(

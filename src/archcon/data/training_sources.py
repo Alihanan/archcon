@@ -38,9 +38,7 @@ from .supervised import (
     IKEM_ROLE_TRAIN,
     IKEM_ROLE_VALIDATION,
     IKEM_VALIDATION_FRACTION,
-    classify_supervised_samples,
     donor_id_from_sample_id,
-    split_outcome_blind_samples,
 )
 
 
@@ -771,56 +769,38 @@ def _ikem_pretraining_split(
     layout: ProjectDataLayout,
     source: ExpressionMatrixSource,
 ) -> pd.DataFrame:
-    """Recompute the donor gate once and verify the audited CEL manifest."""
+    """Load the outcome gate and donor split frozen by the CEL/RMA rebuild.
 
-    source_ids = source.sample_index[source.sample_id_column].map(normalize_sample_id)
-    status = classify_supervised_samples(layout, source_ids)
-    expected_donors = IKEM_PAPER_VALIDATION_DONORS if len(status.table) == 288 else None
-    split = split_outcome_blind_samples(
-        status,
-        seed=IKEM_PRETRAINING_SPLIT_SEED,
-        validation_fraction=IKEM_VALIDATION_FRACTION,
-        expected_validation_donors=expected_donors,
-    )
+    The R rebuild is the single authority for outcome availability because it
+    reads the workbook, verifies all canonical identities, freezes roles before
+    fitting any preprocessing, and records membership hashes in provenance.
+    Re-reading the Excel workbook with a second library here can disagree on
+    cached/formula cells and would violate the freeze-once contract.
+    """
 
     manifest = _validated_ikem_role_manifest(source)
-    audited = manifest[["sample_id", "donor_id", "training_role"]].copy()
-    audited["pretraining_split"] = (
-        manifest["pretraining_split"].fillna("").astype(str).str.strip().str.lower()
+    result = manifest.loc[
+        manifest["training_role"].isin([IKEM_ROLE_TRAIN, IKEM_ROLE_VALIDATION])
+    ].copy()
+    result["sample_key"] = result["sample_id"].map(
+        lambda value: f"SUPERVISED:{normalize_sample_id(value)}"
     )
-    expected_roles = status.table[["sample_id", "donor_id", "training_role"]].copy()
-    eligible_roles = split[["sample_id", "training_role", "split"]].rename(
-        columns={"training_role": "eligible_role", "split": "eligible_split"}
+    result["tissue"] = result["sample_id"].map(
+        lambda value: str(value).rsplit("_", 1)[-1].upper()
     )
-    expected_roles = expected_roles.merge(
-        eligible_roles, on="sample_id", how="left", validate="one_to_one"
-    )
-    expected_roles["training_role"] = expected_roles["eligible_role"].fillna(
-        expected_roles["training_role"]
-    )
-    expected_roles["pretraining_split"] = expected_roles["eligible_split"].fillna("")
-    expected_roles = expected_roles.drop(columns=["eligible_role", "eligible_split"])
-    comparison = audited.merge(
-        expected_roles,
-        on="sample_id",
-        how="outer",
-        suffixes=("_audited", "_expected"),
-        indicator=True,
-    )
-    mismatch = comparison.loc[
-        comparison["_merge"].ne("both")
-        | comparison["donor_id_audited"].ne(comparison["donor_id_expected"])
-        | comparison["training_role_audited"].ne(comparison["training_role_expected"])
-        | comparison["pretraining_split_audited"].ne(
-            comparison["pretraining_split_expected"]
-        )
-    ]
-    if not mismatch.empty:
-        raise RuntimeError(
-            "The audited IKEM CEL roles disagree with the eGFR-derived donor-safe split; "
-            f"first mismatches: {mismatch['sample_id'].head(5).tolist()}."
-        )
-    return split
+    result["has_egfr"] = False
+    result["donor_has_egfr"] = False
+    result["use_for_molecular_pretraining"] = True
+    result["outcome_group"] = "no eGFR · donor-clean"
+    result["split"] = result["pretraining_split"].astype(str).str.lower()
+    result["pretraining_split"] = result["split"]
+    result["dataset_role"] = "IKEM · donor-clean no eGFR"
+    result["split_unit"] = "donor"
+    result["seed"] = IKEM_PRETRAINING_SPLIT_SEED
+    result["train_fraction"] = 1.0 - IKEM_VALIDATION_FRACTION
+    result["validation_fraction"] = IKEM_VALIDATION_FRACTION
+    result["test_fraction"] = 0.0
+    return result.reset_index(drop=True)
 
 
 def _probe_alignment_indices(

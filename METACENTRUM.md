@@ -227,6 +227,44 @@ reclassify outcomes or recompute a split.
 Expected prepared counts are 10,546 train, 591 validation, and 584 test. `prepared.json` records
 24/6 IKEM membership and the 50/50 selection policy.
 
+### Start a per-study-RMA pilot before Global RMA finishes
+
+Once the rebuild has printed both `[IKEM PASS3] block 336/336` and
+`IKEM local RMA ... ready`, the completed local-RMA matrix can be exported into an isolated data
+overlay. This does not write into the running rebuild or replace production data:
+
+```bash
+cd /storage/brno2/home/anuarali/DP/ARCHCON
+source .venv/bin/activate
+python -m pip install 'h5py>=3.10,<4'
+
+.venv/bin/python scripts/export_ready_per_gse_training_data.py \
+  --project-root /storage/brno2/home/anuarali/DP/ARCHCON \
+  --work-root /storage/brno2/home/anuarali/DP/ARCHCON/data/GEO_DWNLD_TRAIN_REFERENCE_REBUILD
+```
+
+Generate a fresh 480-run sweep containing only the per-study-RMA arm:
+
+```bash
+.venv/bin/python scripts/generate_final_paper_sweep.py \
+  --project-root /storage/brno2/home/anuarali/DP/ARCHCON \
+  --data-dir /storage/brno2/home/anuarali/DP/ARCHCON/data-per-gse-ready \
+  --sweep-name archcon-pretrain-0516-per-gse \
+  --methods per-gse
+```
+
+This pilot is already final-method compatible for the per-study arm: it contains 180 dropout-0.1
+Stadniuk-MLP runs, 180 dropout-0 Stadniuk-MLP runs, and 120 ResNet-LN runs. Do not call it the
+complete three-preprocessing sweep. After Stage 4 installs the production stores, generate the
+complete 1,440-run sweep with:
+
+```bash
+.venv/bin/python scripts/generate_final_paper_sweep.py \
+  --project-root /storage/brno2/home/anuarali/DP/ARCHCON \
+  --sweep-name archcon-pretrain-0516 \
+  --methods all
+```
+
 ## 5. Preflight and submit
 
 Run one generated job inside an interactive PBS allocation:

@@ -211,9 +211,35 @@ RECOMMENDED_COMPARISON_SWEEP = {
 }
 
 
-def recommended_comparison_grid_json() -> str:
-    """Return the 1,440-run three-preprocessing architecture comparison grid."""
-    return json.dumps(RECOMMENDED_COMPARISON_SWEEP, indent=2, ensure_ascii=False)
+def recommended_comparison_grid_json(
+    methods: list[str] | tuple[str, ...] | None = None,
+) -> str:
+    """Return the recommended grid, optionally restricted to preprocessing arms.
+
+    Restricting the grid is useful for an early per-study-RMA pilot while the
+    much slower combined-reference Global RMA rebuild is still running.  It is
+    deliberately explicit: unknown, duplicate, or unavailable method names are
+    rejected instead of silently producing an incomplete comparison.
+    """
+    if methods is None:
+        grid = RECOMMENDED_COMPARISON_SWEEP
+    else:
+        requested = tuple(str(method) for method in methods)
+        if not requested:
+            raise ValueError("At least one preprocessing method is required.")
+        if len(set(requested)) != len(requested):
+            raise ValueError("Preprocessing method restriction contains duplicates.")
+        unknown = sorted(set(requested) - set(TRAINING_PREPROCESSING_OPTIONS))
+        if unknown:
+            raise ValueError(f"Unknown preprocessing method(s): {unknown}")
+        grid = json.loads(json.dumps(RECOMMENDED_COMPARISON_SWEEP))
+        for branch in grid["branches"]:
+            branch["grid"]["method"] = [
+                method
+                for method in branch["grid"]["method"]
+                if method in requested
+            ]
+    return json.dumps(grid, indent=2, ensure_ascii=False)
 
 
 

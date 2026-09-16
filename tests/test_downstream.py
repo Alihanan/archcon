@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,6 +22,13 @@ from archcon.data.downstream import (
     summarize_mixed_model_results,
 )
 from archcon.data.training import TrainingConfig
+from archcon.evaluate_egfr import expected_sweep_groups
+from archcon.data.probe_lasso import (
+    ProbeExpressionArm,
+    ProbeLassoConfig,
+    evaluate_probe_lasso_mixed_models,
+    summarize_probe_lasso_against_time,
+)
 
 
 def _record(run: str, architecture: str, mse: float, method: str = "Per-dataset RMA"):
@@ -60,6 +68,27 @@ def _patients(n_donors: int = 10) -> pd.DataFrame:
                 }
             )
     return pd.DataFrame(rows)
+
+
+def test_expected_sweep_groups_follow_generated_configs(tmp_path: Path) -> None:
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    payloads = [
+        {
+            "method": "Per-dataset RMA",
+            "training": {"architecture_family": "Stadniuk MLP"},
+        },
+        {
+            "method": "Per-dataset RMA",
+            "training": {"architecture_family": "ResNet-LN"},
+        },
+    ]
+    for index, payload in enumerate(payloads, start=1):
+        (configs / f"run_{index:04d}.json").write_text(json.dumps(payload))
+    assert expected_sweep_groups(configs) == {
+        ("Per-dataset RMA", "Stadniuk MLP"),
+        ("Per-dataset RMA", "ResNet-LN"),
+    }
 
 
 def test_checkpoint_scan_retains_metadata_not_tensor_payload(tmp_path, monkeypatch) -> None:
@@ -365,6 +394,145 @@ def test_mixed_model_design_can_disable_clinical_models(tmp_path: Path) -> None:
         include_clinical=False,
     )
     assert set(specs["model_id"]) == {"time_only", "winner_z", "pca"}
+
+
+def test_mixed_model_pca_is_specific_to_preprocessing_arm(tmp_path: Path) -> None:
+    patients = _patients()
+    samples = pd.DataFrame(
+        {
+            "source_row_index": np.arange(len(patients)),
+            "sample_id": patients["patient"],
+            "donor_id": patients["donor"],
+            "has_egfr": True,
+        }
+    )
+    first_record = _record(
+        "run_0001", "Stadniuk MLP", 0.1, "Per-dataset standardization"
+    )
+    second_record = _record("run_0002", "Stadniuk MLP", 0.1, "Per-dataset RMA")
+    embeddings = [
+        EmbeddingResult(
+            "standardized_z",
+            "Standardized z",
+            first_record,
+            np.ones((len(patients), 2), dtype=np.float32),
+            samples,
+            0.01,
+        ),
+        EmbeddingResult(
+            "rma_z",
+            "RMA z",
+            second_record,
+            np.ones((len(patients), 2), dtype=np.float32),
+            samples,
+            0.01,
+        ),
+    ]
+    expressions = {
+        "Per-dataset standardization": np.arange(
+            len(patients) * 4, dtype=np.float32
+        ).reshape(len(patients), 4),
+        "Per-dataset RMA": np.arange(
+            len(patients) * 4, dtype=np.float32
+        ).reshape(len(patients), 4)[::-1].copy(),
+    }
+    _, _, specs = prepare_mixed_model_design(
+        patients,
+        embeddings,
+        expressions,
+        {method: samples for method in expressions},
+        tmp_path,
+        n_splits=5,
+        n_repeats=1,
+        include_pca=True,
+        include_clinical=False,
+    )
+    pca_ids = set(specs.loc[specs["model_id"].str.startswith("pca"), "model_id"])
+    assert pca_ids == {
+        "pca_per_dataset_standardization",
+        "pca_per_dataset_rma",
+    }
+
+
+def test_probe_lasso_uses_nested_shared_donor_folds_for_each_arm(tmp_path: Path) -> None:
+    patients = _patients(6)
+    rng = np.random.default_rng(12)
+    expression = rng.normal(size=(len(patients), 8)).astype(np.float32)
+    molecular_signal = 3.0 * expression[:, 0]
+    for column in ("egfr_7d", "egfr_3m", "egfr_6m", "egfr_12m"):
+        patients[column] = patients[column].to_numpy(dtype=float) + molecular_signal
+    samples = pd.DataFrame(
+        {
+            "sample_id": patients["patient"],
+            "donor_id": patients["donor"],
+        }
+    )
+    arms = {
+        "standardized": ProbeExpressionArm(
+            "standardized",
+            expression,
+            samples,
+            tuple(f"probe_{index}" for index in range(expression.shape[1])),
+        ),
+        "per-study RMA": ProbeExpressionArm(
+            "per-study RMA",
+            expression * 2.0 + 5.0,
+            samples,
+            tuple(f"probe_{index}" for index in range(expression.shape[1])),
+        ),
+    }
+    metrics, summary = evaluate_probe_lasso_mixed_models(
+        patients,
+        arms,
+        tmp_path,
+        n_splits=3,
+        n_repeats=1,
+        seed=4,
+        config=ProbeLassoConfig(
+            alpha_fractions=(1.0, 0.2, 0.05),
+            inner_splits=2,
+            max_iter=2_000,
+            tolerance=1e-6,
+        ),
+    )
+    assert len(metrics) == 6
+    assert len(summary) == 2
+    assert set(metrics["preprocessing"]) == set(arms)
+    fold_sizes = metrics.groupby(["repeat", "fold"])["n_test_donors"].nunique()
+    assert (fold_sizes == 1).all()
+    assert (metrics["n_nonzero"] >= 0).all()
+    assert (tmp_path / "inner_cv_tuning.csv").is_file()
+    assert (tmp_path / "selected_probe_coefficients.csv").is_file()
+    resumed_metrics, resumed_summary = evaluate_probe_lasso_mixed_models(
+        patients,
+        arms,
+        tmp_path,
+        n_splits=3,
+        n_repeats=1,
+        seed=4,
+        config=ProbeLassoConfig(
+            alpha_fractions=(1.0, 0.2, 0.05),
+            inner_splits=2,
+            max_iter=2_000,
+            tolerance=1e-6,
+        ),
+    )
+    pd.testing.assert_frame_equal(metrics, resumed_metrics, check_dtype=False)
+    pd.testing.assert_frame_equal(summary, resumed_summary, check_dtype=False)
+
+    time_metrics = pd.DataFrame(
+        {
+            "model_id": ["time_only"] * 3,
+            "repeat": [0, 0, 0],
+            "fold": [0, 1, 2],
+            "rmse": [20.0, 20.0, 20.0],
+        }
+    )
+    comparison = summarize_probe_lasso_against_time(
+        metrics, time_metrics, tmp_path
+    )
+    assert len(comparison) == 2
+    assert (comparison["mean_delta_vs_time"] == 20.0 - comparison["mean_rmse"]).all()
 
 
 def test_fixed_design_supports_multiple_frozen_encoders_without_a_winner(
