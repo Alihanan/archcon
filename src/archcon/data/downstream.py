@@ -905,14 +905,17 @@ def load_egfr_wide(layout: ProjectDataLayout, sample_ids: Iterable[str]) -> pd.D
     id_column = next((column for column in candidates if column in frame.columns), None)
     if id_column is None:
         raise ValueError("Could not identify patient/sample ID in the eGFR table.")
-    frame["patient"] = frame[id_column].map(normalize_sample_id)
+    # Source workbooks are inconsistent about the case of the tissue suffix
+    # (notably D205_p), while CEL/sample manifests use canonical uppercase IDs.
+    # Use the same case-insensitive identity contract as the pretraining gate.
+    frame["patient"] = frame[id_column].map(normalize_sample_id).str.upper()
     if frame["patient"].duplicated().any():
         duplicates = frame.loc[frame["patient"].duplicated(keep=False), "patient"].head(5)
         raise ValueError(f"eGFR table contains duplicate patient rows: {duplicates.tolist()}")
     known = [column for column in EGFR_COLUMNS if column in frame.columns]
     if not known:
         raise ValueError("eGFR table has none of the canonical longitudinal outcome columns.")
-    wanted = {str(value) for value in sample_ids}
+    wanted = {normalize_sample_id(value).upper() for value in sample_ids}
     frame = frame.loc[frame["patient"].isin(wanted)].copy()
     frame = frame.dropna(subset=known, how="all").reset_index(drop=True)
     frame["donor"] = frame["patient"].map(lambda value: str(value).split("_", 1)[0])
@@ -1038,6 +1041,8 @@ def prepare_mixed_model_design(
     stratify_column: str | None = "KDRI_8",
     include_pca: bool = True,
     include_clinical: bool = True,
+    pca_dimensions: Iterable[int] | None = None,
+    include_standalone_baselines: bool = True,
 ) -> tuple[Path, Path, pd.DataFrame]:
     """Build fold-specific, standardized train/test rows for R ``lme4``.
 
@@ -1049,31 +1054,36 @@ def prepare_mixed_model_design(
     root.mkdir(parents=True, exist_ok=True)
     patients = egfr_wide.reset_index(drop=True).copy()
     long = egfr_long(patients)
-    embedding_methods = tuple(dict.fromkeys(result.record.method for result in embeddings))
     if isinstance(aligned_expression, dict):
         expression_by_method = aligned_expression
+        expression_methods = tuple(expression_by_method)
     else:
+        embedding_methods = tuple(
+            dict.fromkeys(result.record.method for result in embeddings)
+        )
         if len(embedding_methods) != 1:
             raise ValueError(
-                "Multiple preprocessing strategies require one aligned expression matrix "
-                "per strategy."
+                "A single expression matrix requires exactly one frozen-encoder "
+                "preprocessing strategy."
             )
         expression_by_method = {embedding_methods[0]: aligned_expression}
+        expression_methods = embedding_methods
+    embedding_methods = tuple(dict.fromkeys(result.record.method for result in embeddings))
+    missing_embedding_methods = sorted(set(embedding_methods) - set(expression_methods))
+    if missing_embedding_methods:
+        raise ValueError(
+            "Frozen encoders lack matching method-specific expression matrices: "
+            f"{missing_embedding_methods}."
+        )
     if isinstance(expression_samples, dict):
         samples_by_method = expression_samples
     else:
         samples_by_method = {method: expression_samples for method in expression_by_method}
-    if set(expression_by_method) != set(embedding_methods):
-        raise ValueError(
-            "Method-specific expression matrices do not match the frozen encoder "
-            f"preprocessing strategies: matrices={sorted(expression_by_method)}, "
-            f"encoders={sorted(embedding_methods)}."
-        )
     if set(samples_by_method) != set(expression_by_method):
         raise ValueError("Method-specific expression sample indexes are incomplete.")
 
     expressions: dict[str, np.ndarray] = {}
-    for method in embedding_methods:
+    for method in expression_methods:
         current_samples = samples_by_method[method]
         sample_ids = current_samples["sample_id"].astype(str)
         if sample_ids.duplicated().any():
@@ -1183,25 +1193,38 @@ def prepare_mixed_model_design(
                 ]
             rows.append(subset)
 
-    embedding_dimensions = sorted(
-        {int(matrix.shape[1]) for matrix in embedding_matrices.values()}
+    embedding_dimensions = {
+        int(matrix.shape[1]) for matrix in embedding_matrices.values()
+    }
+    requested_pca_dimensions = (
+        embedding_dimensions
+        if pca_dimensions is None
+        else {int(value) for value in pca_dimensions}
     )
-    preprocessing_count = len(embedding_methods)
-    dimension_count = len(embedding_dimensions)
+    if include_pca and not requested_pca_dimensions:
+        raise ValueError(
+            "PCA was requested without frozen encoder dimensions; provide pca_dimensions."
+        )
+    if any(value < 1 for value in requested_pca_dimensions):
+        raise ValueError("PCA dimensions must be positive integers.")
+    all_pca_dimensions = sorted(embedding_dimensions | requested_pca_dimensions)
+    preprocessing_count = len(expression_methods)
+    dimension_count = len(all_pca_dimensions)
 
     for repeat, fold, train_index, test_index in fold_definitions:
         empty_train = np.empty((len(train_index), 0), dtype=np.float32)
         empty_test = np.empty((len(test_index), 0), dtype=np.float32)
-        append_model(
-            "time_only",
-            labels["time_only"],
-            repeat,
-            fold,
-            train_index,
-            test_index,
-            empty_train,
-            empty_test,
-        )
+        if include_standalone_baselines:
+            append_model(
+                "time_only",
+                labels["time_only"],
+                repeat,
+                fold,
+                train_index,
+                test_index,
+                empty_train,
+                empty_test,
+            )
         standardized_embeddings: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         for model_id, matrix in embedding_matrices.items():
             train_features, test_features = _standardize_train_test(
@@ -1224,17 +1247,20 @@ def prepare_mixed_model_design(
         ] = {}
         if include_pca:
             for method, expression in expressions.items():
-                for requested_dimension in embedding_dimensions:
-                    n_components = min(
-                        requested_dimension, len(train_index) - 1, expression.shape[1]
-                    )
-                    pca = PCA(
-                        n_components=n_components,
-                        svd_solver="randomized",
-                        random_state=seed + repeat,
-                    )
-                    train_pca = pca.fit_transform(expression[train_index])
-                    test_pca = pca.transform(expression[test_index])
+                maximum_components = min(
+                    max(all_pca_dimensions), len(train_index) - 1, expression.shape[1]
+                )
+                pca = PCA(
+                    n_components=maximum_components,
+                    svd_solver="randomized",
+                    random_state=seed + repeat,
+                )
+                full_train_pca = pca.fit_transform(expression[train_index])
+                full_test_pca = pca.transform(expression[test_index])
+                for requested_dimension in all_pca_dimensions:
+                    n_components = min(requested_dimension, maximum_components)
+                    train_pca = full_train_pca[:, :n_components]
+                    test_pca = full_test_pca[:, :n_components]
                     train_pca, test_pca = _standardize_train_test(train_pca, test_pca)
                     pca_id = pca_model_id(
                         method,
@@ -1268,39 +1294,40 @@ def prepare_mixed_model_design(
             )
             clinical_indices = {column: index for index, column in enumerate(clinical_columns)}
 
-            for column, model_id in (
-                ("don_patient_age", "clinical_age"),
-                ("KDRI_8", "clinical_kdri"),
-                ("Cold_ischemia_hours", "clinical_cold_ischemia"),
-            ):
-                index = clinical_indices[column]
+            if include_standalone_baselines:
+                for column, model_id in (
+                    ("don_patient_age", "clinical_age"),
+                    ("KDRI_8", "clinical_kdri"),
+                    ("Cold_ischemia_hours", "clinical_cold_ischemia"),
+                ):
+                    index = clinical_indices[column]
+                    append_model(
+                        model_id,
+                        f"{CLINICAL_LABELS[column]} × time",
+                        repeat,
+                        fold,
+                        train_index,
+                        test_index,
+                        empty_train,
+                        empty_test,
+                        train_clinical[:, [index]],
+                        test_clinical[:, [index]],
+                        feature_description=column,
+                    )
+
                 append_model(
-                    model_id,
-                    f"{CLINICAL_LABELS[column]} × time",
+                    "clinical_full",
+                    "Clinical (KDRI + donor age + cold ischemia) × time",
                     repeat,
                     fold,
                     train_index,
                     test_index,
                     empty_train,
                     empty_test,
-                    train_clinical[:, [index]],
-                    test_clinical[:, [index]],
-                    feature_description=column,
+                    train_clinical,
+                    test_clinical,
+                    feature_description=" + ".join(clinical_columns),
                 )
-
-            append_model(
-                "clinical_full",
-                "Clinical (KDRI + donor age + cold ischemia) × time",
-                repeat,
-                fold,
-                train_index,
-                test_index,
-                empty_train,
-                empty_test,
-                train_clinical,
-                test_clinical,
-                feature_description=" + ".join(clinical_columns),
-            )
 
             kdri_index = clinical_indices["KDRI_8"]
             for model_id, (embedding_train, embedding_test) in (
@@ -2152,6 +2179,84 @@ def summarize_fixed_encoder_results(
     fixed.to_csv(root / "fixed_encoder_cv_summary.csv", index=False)
     comparison_frame.to_csv(root / "fixed_encoder_comparisons.csv", index=False)
     return summary, fixed, comparison_frame
+
+
+def summarize_baseline_mixed_model_results(
+    metrics_path: str | Path,
+    predictions_path: str | Path,
+    output_root: str | Path,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Summarize checkpoint-free time, clinical, and PCA mixed-model baselines."""
+
+    metrics = pd.read_csv(metrics_path)
+    predictions = pd.read_csv(predictions_path)
+    required = {"model_id", "model_label", "repeat", "fold", "rmse", "mae"}
+    missing = required.difference(metrics.columns)
+    if missing:
+        raise ValueError(f"Mixed-model metrics are missing columns: {sorted(missing)}")
+    if metrics.duplicated(["model_id", "repeat", "fold"]).any():
+        raise ValueError("Mixed-model metrics contain duplicate model/fold rows.")
+    key = ["repeat", "fold"]
+    time = metrics.loc[
+        metrics["model_id"].eq("time_only"), key + ["rmse"]
+    ].rename(columns={"rmse": "rmse_time_only"})
+    if time.empty or time.duplicated(key).any():
+        raise ValueError("Exactly one time-only result is required for every fold.")
+    matched = metrics.merge(time, on=key, how="left", validate="many_to_one")
+    if matched["rmse_time_only"].isna().any():
+        raise ValueError("Some baseline folds have no matching time-only result.")
+    matched["delta_vs_time_only"] = matched["rmse_time_only"] - matched["rmse"]
+
+    prediction_required = {"model_id", "egfr", "prediction"}
+    prediction_missing = prediction_required.difference(predictions.columns)
+    if prediction_missing:
+        raise ValueError(
+            "Mixed-model predictions are missing columns: "
+            f"{sorted(prediction_missing)}"
+        )
+    pooled = (
+        predictions.assign(
+            squared_error=lambda value: (value["egfr"] - value["prediction"]) ** 2
+        )
+        .groupby("model_id", as_index=False)["squared_error"]
+        .mean()
+        .rename(columns={"squared_error": "pooled_mse"})
+    )
+    pooled["pooled_rmse"] = np.sqrt(pooled["pooled_mse"])
+    summary = (
+        matched.groupby(["model_id", "model_label"], as_index=False)
+        .agg(
+            mean_rmse=("rmse", "mean"),
+            sd_rmse=("rmse", "std"),
+            mean_mae=("mae", "mean"),
+            mean_delta_vs_time=("delta_vs_time_only", "mean"),
+            sd_delta_vs_time=("delta_vs_time_only", "std"),
+            positive_folds_vs_time=(
+                "delta_vs_time_only", lambda values: float((values > 0).mean())
+            ),
+            n_folds=("rmse", "count"),
+        )
+        .merge(pooled[["model_id", "pooled_rmse"]], on="model_id", how="left")
+    )
+    summary["se_rmse"] = summary["sd_rmse"] / np.sqrt(summary["n_folds"])
+    summary["mean_rmse_ci95_low"] = summary["mean_rmse"] - 1.96 * summary["se_rmse"]
+    summary["mean_rmse_ci95_high"] = summary["mean_rmse"] + 1.96 * summary["se_rmse"]
+    summary["se_delta_vs_time"] = summary["sd_delta_vs_time"] / np.sqrt(
+        summary["n_folds"]
+    )
+    summary["delta_vs_time_ci95_low"] = (
+        summary["mean_delta_vs_time"] - 1.96 * summary["se_delta_vs_time"]
+    )
+    summary["delta_vs_time_ci95_high"] = (
+        summary["mean_delta_vs_time"] + 1.96 * summary["se_delta_vs_time"]
+    )
+    summary = summary.sort_values(["mean_rmse", "model_id"]).reset_index(drop=True)
+
+    root = Path(output_root).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    matched.to_csv(root / "baseline_fold_metrics_with_deltas.csv", index=False)
+    summary.to_csv(root / "baseline_mixed_model_summary.csv", index=False)
+    return summary, matched
 
 
 def summarize_mixed_model_results(

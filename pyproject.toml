@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "archcon"
-version = "0.5.16.post4"
+version = "0.5.16.post7"
 description = "A local web interface and Python toolkit for transparent gene-expression data exploration."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -65,6 +65,7 @@ Issues = "https://github.com/YOUR_GITHUB_USERNAME/archcon/issues"
 [project.scripts]
 archcon = "archcon.cli:main"
 archcon-evaluate-egfr = "archcon.evaluate_egfr:main"
+archcon-evaluate-egfr-baselines = "archcon.evaluate_egfr_baselines:main"
 archcon-rebuild-global-normalization = "archcon.rebuild_global_normalization:main"
 
 [tool.hatch.build.targets.wheel]

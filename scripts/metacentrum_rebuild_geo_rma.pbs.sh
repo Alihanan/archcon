@@ -575,12 +575,6 @@ with (candidate / "legacy_rma_comparison.csv").open("w", newline="", encoding="u
     writer.writeheader()
     writer.writerow(comparison)
 
-with (geo_store / "sample_index.csv").open(newline="", encoding="utf-8") as handle:
-    geo_rows = list(csv.DictReader(handle))
-geo_train_count = sum(
-    str(row.get("pretraining_split", "")).strip().lower() == "train"
-    for row in geo_rows
-)
 with (candidate / "ikem_rma_reference_samples.csv").open(
     newline="", encoding="utf-8"
 ) as handle:
@@ -599,16 +593,48 @@ def frozen_sample_id(row: dict[str, str]) -> str:
         return sample_key.split(":", 1)[1].strip().upper()
     return str(row.get("sample_id", row.get("GSM", ""))).strip().upper()
 
+
+def installed_geo_sample_id(row: dict[str, str]) -> str:
+    """Read a GEO identity without depending on optional split metadata."""
+
+    for column in ("GSM", "sample_id", "Sample_ID", "sample", "id"):
+        value = str(row.get(column, "")).strip().upper()
+        match = re.search(r"GSM[0-9]+", value)
+        if match is not None:
+            return match.group(0)
+    raise RuntimeError(
+        "Installed GEO sample index contains a row without a recognizable GSM ID."
+    )
+
 with split_path.open(newline="", encoding="utf-8-sig") as handle:
     frozen_rows = list(csv.DictReader(handle))
-geo_train_rows = [
+frozen_geo_rows = [
     row for row in frozen_rows
-    if str(row.get("split", "")).strip().lower() == "train"
-    and (
+    if (
         str(row.get("sample_key", "")).upper().startswith("GEO:")
         or str(row.get("sample_id", row.get("GSM", ""))).upper().startswith("GSM")
     )
 ]
+geo_train_rows = [
+    row for row in frozen_geo_rows
+    if str(row.get("split", "")).strip().lower() == "train"
+]
+with (geo_store / "sample_index.csv").open(
+    newline="", encoding="utf-8-sig"
+) as handle:
+    installed_geo_rows = list(csv.DictReader(handle))
+installed_geo_ids = [installed_geo_sample_id(row) for row in installed_geo_rows]
+frozen_geo_ids = [frozen_sample_id(row) for row in frozen_geo_rows]
+if len(installed_geo_ids) != len(set(installed_geo_ids)):
+    raise RuntimeError("Installed GEO sample index contains duplicate GSM IDs.")
+if set(installed_geo_ids) != set(frozen_geo_ids):
+    raise RuntimeError(
+        "Installed GEO identities differ from the frozen split: "
+        f"missing={sorted(set(frozen_geo_ids) - set(installed_geo_ids))[:10]}, "
+        f"unexpected={sorted(set(installed_geo_ids) - set(frozen_geo_ids))[:10]}."
+    )
+geo_train_ids = {frozen_sample_id(row) for row in geo_train_rows}
+geo_train_count = sum(sample_id in geo_train_ids for sample_id in installed_geo_ids)
 geo_train_signature = membership_sha256(
     "GEO", [frozen_sample_id(row) for row in geo_train_rows]
 )
@@ -737,11 +763,11 @@ install_names = [
     "ikem_cel_correspondence.csv",
     "ikem_gse290167_correspondence.csv",
     "ikem_rma_reference_samples.csv",
-    "legacy_probe_correspondence.csv",
     "legacy_rma_comparison.csv",
     "preprocessing_provenance.json",
 ]
 for optional_name in (
+    "legacy_probe_correspondence.csv",
     "IKEM_LOCAL_RMA_COMPLETE.txt",
     "IKEM_CEL_PREPROCESSING_COMPLETE.txt",
 ):

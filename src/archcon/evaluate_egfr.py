@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from importlib.resources import as_file, files
@@ -107,12 +108,6 @@ def main() -> None:
     )
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=5)
-    parser.add_argument(
-        "--inner-folds",
-        type=int,
-        default=5,
-        help="Inner donor-grouped folds used to select the probe-LASSO penalty.",
-    )
     parser.add_argument("--cv-seed", type=int, default=0)
     parser.add_argument(
         "--rscript",
@@ -163,9 +158,18 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--reuse-baseline-root",
+        type=Path,
+        default=None,
+        help=(
+            "Completed output of archcon-evaluate-egfr-baselines. Matching time, "
+            "clinical, PCA, and probe-LASSO folds are reused instead of recomputed."
+        ),
+    )
+    parser.add_argument(
         "--no-probe-lasso",
         action="store_true",
-        help="Skip the all-probe nested-CV LASSO mixed-model baseline.",
+        help="Skip the all-probe LASSO-AIC and LASSO-BIC mixed-model baselines.",
     )
     parser.add_argument(
         "--lasso-alpha-fractions",
@@ -465,8 +469,76 @@ def main() -> None:
     stratify_column = None if args.stratify_column.lower() == "none" else args.stratify_column
     benchmark_root = output_root / "mixed_models"
 
+    reused_baseline_metrics = reused_baseline_predictions = None
+    reused_lasso_metrics = None
+    if args.reuse_baseline_root is not None:
+        baseline_root = args.reuse_baseline_root.expanduser().resolve()
+        contract_path = baseline_root / "baseline_contract.json"
+        if not contract_path.is_file():
+            raise SystemExit(f"Missing reusable baseline contract: {contract_path}")
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+        patient_hash = hashlib.sha256(
+            "\n".join(egfr["patient"].astype(str)).encode("utf-8")
+        ).hexdigest()
+        expected_contract = {
+            "format": 2,
+            "complete": True,
+            "checkpoint_free": True,
+            "input_dim": winner_input_dim,
+            "patient_ids_sha256": patient_hash,
+            "folds": args.folds,
+            "repeats": args.repeats,
+            "cv_seed": args.cv_seed,
+            "stratify_column": stratify_column,
+            "include_clinical": not args.no_clinical,
+            "include_pca": not args.no_pca,
+        }
+        if not args.no_probe_lasso:
+            expected_contract.update(
+                {
+                    "include_lasso": True,
+                    "lasso_models": ["LASSO-AIC", "LASSO-BIC"],
+                }
+            )
+        mismatches = {
+            key: (contract.get(key), expected)
+            for key, expected in expected_contract.items()
+            if contract.get(key) != expected
+        }
+        baseline_methods = set(str(value) for value in contract.get("methods", []))
+        missing_methods = sorted(set(required_ikem_methods) - baseline_methods)
+        if missing_methods:
+            mismatches["methods"] = (
+                sorted(baseline_methods),
+                f"must include {missing_methods}",
+            )
+        if mismatches:
+            raise SystemExit(
+                "Reusable baseline contract does not match this evaluation: "
+                + "; ".join(
+                    f"{key}={observed!r}, expected {expected!r}"
+                    for key, (observed, expected) in mismatches.items()
+                )
+            )
+        reused_baseline_metrics = baseline_root / str(contract["mixed_model_metrics"])
+        reused_baseline_predictions = baseline_root / str(
+            contract["mixed_model_predictions"]
+        )
+        if not reused_baseline_metrics.is_file() or not reused_baseline_predictions.is_file():
+            raise SystemExit("Reusable baseline contract points to missing result files.")
+        candidate_lasso = baseline_root / "probe_lasso" / "fold_metrics.csv"
+        if (
+            not args.no_probe_lasso
+            and contract.get("include_lasso") is True
+            and candidate_lasso.is_file()
+        ):
+            reused_lasso_metrics = pd.read_csv(candidate_lasso)
+        print(f"Reusing checkpoint-free baseline results from: {baseline_root}")
+
     lasso_fold_metrics = None
-    if not args.no_probe_lasso:
+    if reused_lasso_metrics is not None:
+        lasso_fold_metrics = reused_lasso_metrics
+    elif not args.no_probe_lasso and args.reuse_baseline_root is None:
         try:
             alpha_fractions = tuple(
                 float(value.strip())
@@ -485,8 +557,8 @@ def main() -> None:
             for method in required_ikem_methods
         }
         print(
-            "Running all-probe LASSO mixed models with nested donor-grouped CV; "
-            "the same outer folds are reused for every preprocessing strategy..."
+            "Running all-probe LASSO-AIC and LASSO-BIC mixed models from one "
+            "shared training-fold path per preprocessing strategy..."
         )
         lasso_fold_metrics, lasso_summary = evaluate_probe_lasso_mixed_models(
             egfr,
@@ -498,7 +570,6 @@ def main() -> None:
             stratify_column=stratify_column,
             config=ProbeLassoConfig(
                 alpha_fractions=alpha_fractions,
-                inner_splits=args.inner_folds,
                 max_iter=args.lasso_max_iter,
                 tolerance=args.lasso_tolerance,
             ),
@@ -516,8 +587,9 @@ def main() -> None:
         n_repeats=args.repeats,
         seed=args.cv_seed,
         stratify_column=stratify_column,
-        include_pca=not args.no_pca,
+        include_pca=not args.no_pca and args.reuse_baseline_root is None,
         include_clinical=not args.no_clinical,
+        include_standalone_baselines=args.reuse_baseline_root is None,
     )
     print(
         f"Prepared {len(specs)} fixed-model fits from {egfr['patient'].nunique()} patients "
@@ -534,6 +606,26 @@ def main() -> None:
             rscript=args.rscript,
             output_prefix="fixed_",
         )
+    if reused_baseline_metrics is not None and reused_baseline_predictions is not None:
+        encoder_metrics = pd.read_csv(metrics_path)
+        baseline_metrics = pd.read_csv(reused_baseline_metrics)
+        duplicate_keys = ["model_id", "repeat", "fold"]
+        if set(encoder_metrics["model_id"]).intersection(baseline_metrics["model_id"]):
+            raise RuntimeError("Reusable baseline and encoder model IDs overlap.")
+        combined_metrics = pd.concat(
+            [baseline_metrics, encoder_metrics], ignore_index=True, sort=False
+        )
+        if combined_metrics.duplicated(duplicate_keys).any():
+            raise RuntimeError("Combined reusable baseline metrics contain duplicate folds.")
+        combined_predictions = pd.concat(
+            [pd.read_csv(reused_baseline_predictions), pd.read_csv(predictions_path)],
+            ignore_index=True,
+            sort=False,
+        )
+        metrics_path = benchmark_root / "combined_fixed_fold_metrics.csv"
+        predictions_path = benchmark_root / "combined_fixed_oof_predictions.csv"
+        combined_metrics.to_csv(metrics_path, index=False)
+        combined_predictions.to_csv(predictions_path, index=False)
     summary, fixed_encoder_summary, comparisons = summarize_fixed_encoder_results(
         metrics_path, predictions_path, embeddings, benchmark_root
     )

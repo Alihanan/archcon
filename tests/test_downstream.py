@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 
-from archcon.data import downstream
+from archcon.data import downstream, probe_lasso as probe_lasso_module
 from archcon.data.downstream import (
     EmbeddingResult,
     ValidationCheckpoint,
@@ -18,11 +18,13 @@ from archcon.data.downstream import (
     scan_validation_checkpoints,
     select_embedding_checkpoints,
     select_molecular_group_winners,
+    summarize_baseline_mixed_model_results,
     summarize_fixed_encoder_results,
     summarize_mixed_model_results,
 )
 from archcon.data.training import TrainingConfig
 from archcon.evaluate_egfr import expected_sweep_groups
+from archcon.evaluate_egfr_baselines import parse_methods, parse_positive_ints
 from archcon.data.probe_lasso import (
     ProbeExpressionArm,
     ProbeLassoConfig,
@@ -89,6 +91,15 @@ def test_expected_sweep_groups_follow_generated_configs(tmp_path: Path) -> None:
         ("Per-dataset RMA", "Stadniuk MLP"),
         ("Per-dataset RMA", "ResNet-LN"),
     }
+
+
+def test_checkpoint_free_baseline_cli_aliases() -> None:
+    assert parse_methods("standardized,per-study,global") == (
+        "Per-dataset standardization",
+        "Per-dataset RMA",
+        "Global RMA",
+    )
+    assert parse_positive_ints("3,8,16,8", "--pca-dimensions") == (3, 8, 16)
 
 
 def test_checkpoint_scan_retains_metadata_not_tensor_payload(tmp_path, monkeypatch) -> None:
@@ -293,6 +304,27 @@ def test_egfr_long_uses_ordered_categorical_time() -> None:
     assert set(long["patient"]) == {"0_1", "0_2"}
 
 
+def test_load_egfr_wide_matches_tissue_suffix_case_insensitively(
+    tmp_path: Path, monkeypatch
+) -> None:
+    table = pd.DataFrame(
+        {
+            "patient": ["D205_p", "D206_L"],
+            "egfr_7d": [0.35, np.nan],
+            "egfr_3m": [0.79, np.nan],
+            "egfr_6m": [0.85, np.nan],
+            "egfr_12m": [0.98, np.nan],
+        }
+    )
+    monkeypatch.setattr(pd, "read_excel", lambda _path: table.copy())
+    layout = SimpleNamespace(egfr_table=tmp_path / "egfr_data.xlsx")
+
+    observed = downstream.load_egfr_wide(layout, ["D205_P", "D206_L"])
+
+    assert observed["patient"].tolist() == ["D205_P"]
+    assert observed["donor"].tolist() == ["D205"]
+
+
 def test_repeated_folds_never_split_sibling_kidneys() -> None:
     patients = _patients()
     folds = repeated_donor_folds(patients, n_splits=5, n_repeats=3, seed=7)
@@ -396,6 +428,86 @@ def test_mixed_model_design_can_disable_clinical_models(tmp_path: Path) -> None:
     assert set(specs["model_id"]) == {"time_only", "winner_z", "pca"}
 
 
+def test_checkpoint_free_design_saves_method_specific_input_pca(tmp_path: Path) -> None:
+    patients = _patients()
+    samples = pd.DataFrame(
+        {
+            "source_row_index": np.arange(len(patients)),
+            "sample_id": patients["patient"],
+            "donor_id": patients["donor"],
+            "has_egfr": True,
+        }
+    )
+    expressions = {
+        "Per-dataset standardization": np.arange(
+            len(patients) * 6, dtype=np.float32
+        ).reshape(len(patients), 6),
+        "Per-dataset RMA": np.arange(
+            len(patients) * 6, dtype=np.float32
+        ).reshape(len(patients), 6)[::-1].copy(),
+    }
+    _, _, specs = prepare_mixed_model_design(
+        patients,
+        [],
+        expressions,
+        {method: samples for method in expressions},
+        tmp_path,
+        n_splits=5,
+        n_repeats=1,
+        include_pca=True,
+        include_clinical=False,
+        pca_dimensions=(3, 5),
+    )
+    assert set(specs["model_id"]) == {
+        "time_only",
+        "pca_per_dataset_standardization_d3",
+        "pca_per_dataset_standardization_d5",
+        "pca_per_dataset_rma_d3",
+        "pca_per_dataset_rma_d5",
+    }
+
+
+def test_reused_baseline_design_omits_already_saved_common_models(tmp_path: Path) -> None:
+    patients = _patients()
+    samples = pd.DataFrame(
+        {
+            "source_row_index": np.arange(len(patients)),
+            "sample_id": patients["patient"],
+            "donor_id": patients["donor"],
+            "has_egfr": True,
+        }
+    )
+    record = _record("run_0001", "Stadniuk MLP", 0.1)
+    embedding = EmbeddingResult(
+        "candidate_z",
+        "Candidate z",
+        record,
+        np.ones((len(patients), 2), dtype=np.float32),
+        samples,
+        0.01,
+    )
+    expression = np.arange(len(patients) * 4, dtype=np.float32).reshape(
+        len(patients), 4
+    )
+    _, _, specs = prepare_mixed_model_design(
+        patients,
+        [embedding],
+        expression,
+        samples,
+        tmp_path,
+        n_splits=5,
+        n_repeats=1,
+        include_pca=False,
+        include_clinical=True,
+        include_standalone_baselines=False,
+    )
+    assert set(specs["model_id"]) == {
+        "candidate_z",
+        "candidate_z_kdri",
+        "candidate_z_clinical",
+    }
+
+
 def test_mixed_model_pca_is_specific_to_preprocessing_arm(tmp_path: Path) -> None:
     patients = _patients()
     samples = pd.DataFrame(
@@ -454,7 +566,10 @@ def test_mixed_model_pca_is_specific_to_preprocessing_arm(tmp_path: Path) -> Non
     }
 
 
-def test_probe_lasso_uses_nested_shared_donor_folds_for_each_arm(tmp_path: Path) -> None:
+def test_probe_lasso_selects_aic_and_bic_from_shared_outer_fold_path(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
     patients = _patients(6)
     rng = np.random.default_rng(12)
     expression = rng.normal(size=(len(patients), 8)).astype(np.float32)
@@ -481,6 +596,15 @@ def test_probe_lasso_uses_nested_shared_donor_folds_for_each_arm(tmp_path: Path)
             tuple(f"probe_{index}" for index in range(expression.shape[1])),
         ),
     }
+    actual_fit_path = probe_lasso_module._fit_path
+    path_fit_calls = 0
+
+    def counted_fit_path(*args, **kwargs):
+        nonlocal path_fit_calls
+        path_fit_calls += 1
+        return actual_fit_path(*args, **kwargs)
+
+    monkeypatch.setattr(probe_lasso_module, "_fit_path", counted_fit_path)
     metrics, summary = evaluate_probe_lasso_mixed_models(
         patients,
         arms,
@@ -490,18 +614,26 @@ def test_probe_lasso_uses_nested_shared_donor_folds_for_each_arm(tmp_path: Path)
         seed=4,
         config=ProbeLassoConfig(
             alpha_fractions=(1.0, 0.2, 0.05),
-            inner_splits=2,
             max_iter=2_000,
             tolerance=1e-6,
         ),
     )
-    assert len(metrics) == 6
-    assert len(summary) == 2
+    assert len(metrics) == 12
+    assert len(summary) == 4
+    assert path_fit_calls == 2 * 3  # preprocessing arms × outer folds, not × criteria
     assert set(metrics["preprocessing"]) == set(arms)
+    assert set(metrics["selection_criterion"]) == {"AIC", "BIC"}
     fold_sizes = metrics.groupby(["repeat", "fold"])["n_test_donors"].nunique()
     assert (fold_sizes == 1).all()
     assert (metrics["n_nonzero"] >= 0).all()
-    assert (tmp_path / "inner_cv_tuning.csv").is_file()
+    criterion_path = pd.read_csv(tmp_path / "information_criterion_path.csv")
+    assert len(criterion_path) == 2 * 3 * 3
+    assert criterion_path.groupby(["preprocessing", "repeat", "fold"])[
+        "selected_by_aic"
+    ].sum().eq(1).all()
+    assert criterion_path.groupby(["preprocessing", "repeat", "fold"])[
+        "selected_by_bic"
+    ].sum().eq(1).all()
     assert (tmp_path / "selected_probe_coefficients.csv").is_file()
     resumed_metrics, resumed_summary = evaluate_probe_lasso_mixed_models(
         patients,
@@ -512,13 +644,13 @@ def test_probe_lasso_uses_nested_shared_donor_folds_for_each_arm(tmp_path: Path)
         seed=4,
         config=ProbeLassoConfig(
             alpha_fractions=(1.0, 0.2, 0.05),
-            inner_splits=2,
             max_iter=2_000,
             tolerance=1e-6,
         ),
     )
     pd.testing.assert_frame_equal(metrics, resumed_metrics, check_dtype=False)
     pd.testing.assert_frame_equal(summary, resumed_summary, check_dtype=False)
+    assert path_fit_calls == 2 * 3  # completed fold parts were reused
 
     time_metrics = pd.DataFrame(
         {
@@ -531,7 +663,7 @@ def test_probe_lasso_uses_nested_shared_donor_folds_for_each_arm(tmp_path: Path)
     comparison = summarize_probe_lasso_against_time(
         metrics, time_metrics, tmp_path
     )
-    assert len(comparison) == 2
+    assert len(comparison) == 4
     assert (comparison["mean_delta_vs_time"] == 20.0 - comparison["mean_rmse"]).all()
 
 
@@ -691,6 +823,46 @@ def test_summary_uses_matched_fold_deltas(tmp_path: Path) -> None:
     ]
     assert beyond_full["mean_gain"] == 1.0
     assert (tmp_path / "clinical_incremental_summary.csv").is_file()
+
+
+def test_checkpoint_free_baseline_summary_uses_time_matched_folds(
+    tmp_path: Path,
+) -> None:
+    metrics = pd.DataFrame(
+        [
+            {
+                "model_id": model_id,
+                "model_label": label,
+                "repeat": 0,
+                "fold": fold,
+                "rmse": rmse,
+                "mae": rmse / 2,
+            }
+            for fold in range(2)
+            for model_id, label, rmse in (
+                ("time_only", "Time only", 4.0 + fold),
+                ("pca_standardized_d3", "PCA standardized", 3.0 + fold),
+            )
+        ]
+    )
+    predictions = metrics.assign(
+        patient="p1",
+        donor="d1",
+        time="3m",
+        egfr=lambda frame: frame["rmse"],
+        prediction=0.0,
+    )
+    metrics_path = tmp_path / "metrics.csv"
+    predictions_path = tmp_path / "predictions.csv"
+    metrics.to_csv(metrics_path, index=False)
+    predictions.to_csv(predictions_path, index=False)
+    summary, matched = summarize_baseline_mixed_model_results(
+        metrics_path, predictions_path, tmp_path
+    )
+    pca = summary.set_index("model_id").loc["pca_standardized_d3"]
+    assert pca["mean_delta_vs_time"] == 1.0
+    assert len(matched) == 4
+    assert (tmp_path / "baseline_mixed_model_summary.csv").is_file()
 
 
 def test_fixed_encoder_summary_reports_each_encoder_without_selecting_one(

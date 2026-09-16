@@ -41,6 +41,22 @@ def test_evaluation_console_script_is_packaged() -> None:
     assert callable(main)
 
 
+def test_checkpoint_free_baseline_console_script_is_packaged() -> None:
+    from pathlib import Path
+
+    import tomllib
+
+    project_root = Path(__file__).resolve().parents[1]
+    config = tomllib.loads((project_root / "pyproject.toml").read_text())
+    assert config["project"]["scripts"]["archcon-evaluate-egfr-baselines"] == (
+        "archcon.evaluate_egfr_baselines:main"
+    )
+
+    from archcon.evaluate_egfr_baselines import main
+
+    assert callable(main)
+
+
 def test_global_normalization_console_script_is_packaged() -> None:
     from pathlib import Path
 
@@ -97,5 +113,6 @@ def test_standalone_scripts_are_organized_under_scripts_directory() -> None:
     assert not (project_root / "run_array.pbs.sh").exists()
     assert not (project_root / "submit.sh").exists()
     assert (project_root / "scripts" / "evaluate_molecular_egfr.py").is_file()
+    assert (project_root / "scripts" / "evaluate_egfr_baselines.py").is_file()
     assert (project_root / "scripts" / "metacentrum_run_array.pbs.sh").is_file()
     assert (project_root / "scripts" / "metacentrum_submit.sh").is_file()

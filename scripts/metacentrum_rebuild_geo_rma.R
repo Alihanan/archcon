@@ -305,15 +305,6 @@ ikem_reference_samples <- utils::read.csv(
 )
 
 write_npy_float32 <- function(h5_path, dataset, output_path, n_rows, n_cols) {
-  part_path <- paste0(output_path, ".part")
-  if (file.exists(part_path)) unlink(part_path, force = TRUE)
-  con <- file(part_path, open = "wb")
-  ok <- FALSE
-  on.exit({
-    if (inherits(con, "connection") && isOpen(con)) close(con)
-    if (!ok && file.exists(part_path)) unlink(part_path, force = TRUE)
-  }, add = TRUE)
-
   magic <- as.raw(c(0x93, as.integer(charToRaw("NUMPY")), 0x01, 0x00))
   header_core <- sprintf(
     "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }",
@@ -322,6 +313,40 @@ write_npy_float32 <- function(h5_path, dataset, output_path, n_rows, n_cols) {
   )
   padding <- (16L - ((10L + nchar(header_core, type = "bytes") + 1L) %% 16L)) %% 16L
   header <- paste0(header_core, strrep(" ", padding), "\n")
+  expected_size <- 10 + nchar(header, type = "bytes") + 4 * n_rows * n_cols
+
+  existing_is_valid <- FALSE
+  if (file.exists(output_path) && isTRUE(file.info(output_path)$size == expected_size)) {
+    existing_is_valid <- local({
+      check_con <- file(output_path, open = "rb")
+      on.exit(try(close(check_con), silent = TRUE), add = TRUE)
+      prefix <- readBin(check_con, what = "raw", n = 10L)
+      if (length(prefix) != 10L || !identical(prefix[seq_len(8L)], magic)) {
+        FALSE
+      } else {
+        header_length <- as.integer(prefix[[9L]]) + 256L * as.integer(prefix[[10L]])
+        stored_header <- readBin(check_con, what = "raw", n = header_length)
+        identical(stored_header, charToRaw(header))
+      }
+    })
+  }
+  if (existing_is_valid) {
+    message(
+      "NumPy export already complete; reusing ", n_rows, " x ", n_cols,
+      " float32 matrix: ", output_path
+    )
+    return(invisible(output_path))
+  }
+
+  part_path <- paste0(output_path, ".part")
+  if (file.exists(part_path)) unlink(part_path, force = TRUE)
+  con <- NULL
+  ok <- FALSE
+  on.exit({
+    if (!is.null(con)) try(close(con), silent = TRUE)
+    if (!ok && file.exists(part_path)) unlink(part_path, force = TRUE)
+  }, add = TRUE)
+  con <- file(part_path, open = "wb")
 
   writeBin(magic, con)
   writeBin(as.integer(nchar(header, type = "bytes")), con, size = 2L, endian = "little")
@@ -343,6 +368,7 @@ write_npy_float32 <- function(h5_path, dataset, output_path, n_rows, n_cols) {
   }
 
   close(con)
+  con <- NULL
   ok <- TRUE
   if (!file.rename(part_path, output_path)) {
     stop("Could not atomically install NumPy matrix: ", output_path)
@@ -483,21 +509,37 @@ if (!is.null(ikem_store)) {
   # Preserve the established local sample spelling while adding GSM provenance.
   utils::write.csv(built_samples, target_sample_path, row.names = FALSE, na = "")
   utils::write.csv(built_probes, target_probe_path, row.names = FALSE, na = "")
-  file.copy(
-    file.path(work_root, "IKEM_MATRIX_STORE", "ikem_cel_correspondence.csv"),
-    file.path(ikem_store, "ikem_cel_correspondence.csv"),
-    overwrite = TRUE
+  required_audit_files <- c(
+    "ikem_cel_correspondence.csv",
+    "ikem_gse290167_correspondence.csv",
+    "ikem_rma_reference_samples.csv"
   )
-  file.copy(
-    file.path(work_root, "IKEM_MATRIX_STORE", "ikem_gse290167_correspondence.csv"),
-    file.path(ikem_store, "ikem_gse290167_correspondence.csv"),
-    overwrite = TRUE
+  for (name in required_audit_files) {
+    source_path <- file.path(work_root, "IKEM_MATRIX_STORE", name)
+    if (!file.exists(source_path) || !file.copy(
+      source_path,
+      file.path(ikem_store, name),
+      overwrite = TRUE
+    )) {
+      stop("Could not install required IKEM audit file: ", source_path)
+    }
+  }
+
+  # The legacy comparison is descriptive and may be absent when no historical
+  # store was supplied. Preserve it when available, but never make production
+  # preprocessing depend on an optional comparison artifact.
+  legacy_probe_audit <- file.path(
+    work_root,
+    "IKEM_MATRIX_STORE",
+    "legacy_probe_correspondence.csv"
   )
-  file.copy(
-    file.path(work_root, "IKEM_MATRIX_STORE", "ikem_rma_reference_samples.csv"),
-    file.path(ikem_store, "ikem_rma_reference_samples.csv"),
+  if (file.exists(legacy_probe_audit) && !file.copy(
+    legacy_probe_audit,
+    file.path(ikem_store, "legacy_probe_correspondence.csv"),
     overwrite = TRUE
-  )
+  )) {
+    stop("Could not install optional legacy probe audit: ", legacy_probe_audit)
+  }
   for (name in c(
     "IKEM_LOCAL_RMA_COMPLETE.txt",
     "IKEM_CEL_PREPROCESSING_COMPLETE.txt"

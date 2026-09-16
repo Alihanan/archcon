@@ -6,9 +6,10 @@ The model is a Gaussian random-intercept linear mixed model
 
 with an L1 penalty on probe coefficients only.  The random-intercept variance
 ratio is estimated from training data, its marginal covariance is whitened,
-and the unpenalized time effects are projected out before a coordinate-descent
-LASSO path is fitted.  Penalty fractions are selected by inner donor-grouped
-cross-validation inside every outer donor-grouped evaluation fold.
+and the unpenalized time effects are projected out before one coordinate-descent
+LASSO path is fitted.  The minimum-AIC and minimum-BIC points on that shared
+path become two separate models.  Only the outer donor-grouped test fold is
+used for evaluation.
 
 This module deliberately contains no neural-network code.  It is a direct
 all-probe baseline, fitted independently for each frozen preprocessing arm.
@@ -32,7 +33,7 @@ from .downstream import TIME_LEVELS, egfr_long, repeated_donor_folds
 
 @dataclass(frozen=True)
 class ProbeLassoConfig:
-    """Numerical and nested-CV controls for the all-probe baseline."""
+    """Numerical controls for the shared all-probe LASSO path."""
 
     alpha_fractions: tuple[float, ...] = (
         1.0,
@@ -46,13 +47,10 @@ class ProbeLassoConfig:
         0.002,
         0.001,
     )
-    inner_splits: int = 5
     max_iter: int = 5_000
     tolerance: float = 1e-4
 
     def validate(self) -> None:
-        if self.inner_splits < 2:
-            raise ValueError("Probe-LASSO inner_splits must be at least two.")
         fractions = np.asarray(self.alpha_fractions, dtype=np.float64)
         if (
             fractions.ndim != 1
@@ -78,6 +76,21 @@ class ProbeExpressionArm:
     probe_ids: tuple[str, ...] | None = None
 
 
+@dataclass(frozen=True)
+class FittedLassoPath:
+    """One shared training-fold path and its mixed-model diagnostics."""
+
+    coefficients: np.ndarray
+    time_coefficients: np.ndarray
+    alphas: np.ndarray
+    alpha_fractions: np.ndarray
+    n_nonzero: np.ndarray
+    negative_twice_log_likelihood: np.ndarray
+    aic: np.ndarray
+    bic: np.ndarray
+    variance_ratio: float
+
+
 def _slug(value: str) -> str:
     result = "".join(character.lower() if character.isalnum() else "_" for character in value)
     return "_".join(part for part in result.split("_") if part)
@@ -86,12 +99,6 @@ def _slug(value: str) -> str:
 def _atomic_csv(frame: pd.DataFrame, path: Path) -> None:
     temporary = path.with_suffix(path.suffix + ".part")
     frame.to_csv(temporary, index=False)
-    temporary.replace(path)
-
-
-def _atomic_json(payload: dict[str, object], path: Path) -> None:
-    temporary = path.with_suffix(path.suffix + ".part")
-    temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     temporary.replace(path)
 
 
@@ -242,18 +249,99 @@ def _fit_path(
     return coefficients, requested, ratio
 
 
-def _time_coefficients(
+def _random_intercept_log_determinant(
+    groups: np.ndarray,
+    variance_ratio: float,
+) -> float:
+    counts = pd.Series(groups).value_counts().to_numpy(dtype=np.int64)
+    return float(np.log1p(variance_ratio * counts).sum())
+
+
+def _information_criteria_for_path(
     y: np.ndarray,
     expression: np.ndarray,
     time_design: np.ndarray,
     groups: np.ndarray,
+    coefficients: np.ndarray,
     variance_ratio: float,
-    probe_coefficients: np.ndarray,
-) -> np.ndarray:
-    yw = _whiten_random_intercept(y[:, None], groups, variance_ratio)[:, 0]
-    xw = _whiten_random_intercept(expression, groups, variance_ratio)
-    tw = _whiten_random_intercept(time_design, groups, variance_ratio)
-    return np.linalg.lstsq(tw, yw - xw @ probe_coefficients, rcond=None)[0]
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Score every lambda using the training-fold marginal Gaussian likelihood.
+
+    The random-intercept covariance is estimated once from the complete outer
+    training fold and is therefore common to every point on the shared path.
+    Degrees of freedom are the active probe count, unpenalized time rank, and
+    the two variance parameters (random-intercept and residual variance).
+    """
+
+    n_observations = len(y)
+    if n_observations < 1:
+        raise ValueError("Cannot score an empty LASSO training fold.")
+    whitened_y = _whiten_random_intercept(y[:, None], groups, variance_ratio)[:, 0]
+    whitened_x = _whiten_random_intercept(expression, groups, variance_ratio)
+    whitened_time = _whiten_random_intercept(time_design, groups, variance_ratio)
+    time_rank = int(np.linalg.matrix_rank(whitened_time))
+    log_determinant = _random_intercept_log_determinant(groups, variance_ratio)
+
+    n_candidates = coefficients.shape[1]
+    gammas = np.empty((time_design.shape[1], n_candidates), dtype=np.float64)
+    negative_twice_log_likelihood = np.empty(n_candidates, dtype=np.float64)
+    n_nonzero = np.count_nonzero(coefficients, axis=0).astype(np.int64)
+    for index in range(n_candidates):
+        beta = coefficients[:, index]
+        gamma = np.linalg.lstsq(
+            whitened_time,
+            whitened_y - whitened_x @ beta,
+            rcond=None,
+        )[0]
+        gammas[:, index] = gamma
+        residual = whitened_y - whitened_time @ gamma - whitened_x @ beta
+        residual_variance = max(
+            float(residual @ residual) / n_observations,
+            np.finfo(float).tiny,
+        )
+        negative_twice_log_likelihood[index] = (
+            n_observations
+            * (math.log(2.0 * math.pi) + 1.0 + math.log(residual_variance))
+            + log_determinant
+        )
+
+    degrees_of_freedom = n_nonzero + time_rank + 2
+    aic = negative_twice_log_likelihood + 2.0 * degrees_of_freedom
+    bic = negative_twice_log_likelihood + math.log(n_observations) * degrees_of_freedom
+    return gammas, n_nonzero, negative_twice_log_likelihood, aic, bic
+
+
+def _fit_and_score_shared_path(
+    y: np.ndarray,
+    expression: np.ndarray,
+    time_design: np.ndarray,
+    groups: np.ndarray,
+    config: ProbeLassoConfig,
+) -> FittedLassoPath:
+    coefficients, alphas, variance_ratio = _fit_path(
+        y, expression, time_design, groups, config
+    )
+    gammas, n_nonzero, negative_twice_log_likelihood, aic, bic = (
+        _information_criteria_for_path(
+            y,
+            expression,
+            time_design,
+            groups,
+            coefficients,
+            variance_ratio,
+        )
+    )
+    return FittedLassoPath(
+        coefficients=coefficients,
+        time_coefficients=gammas,
+        alphas=alphas,
+        alpha_fractions=np.asarray(config.alpha_fractions, dtype=np.float64),
+        n_nonzero=n_nonzero,
+        negative_twice_log_likelihood=negative_twice_log_likelihood,
+        aic=aic,
+        bic=bic,
+        variance_ratio=variance_ratio,
+    )
 
 
 def _donor_balanced_rmse(frame: pd.DataFrame, prediction: np.ndarray) -> float:
@@ -282,6 +370,139 @@ def _aligned_patient_expression(
     return matrix
 
 
+def _longitudinal_fold_arrays(
+    patients: pd.DataFrame,
+    long_all: pd.DataFrame,
+    standardized_expression: np.ndarray,
+    train_indices: np.ndarray,
+    test_indices: np.ndarray,
+) -> tuple[pd.DataFrame, pd.DataFrame, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build the training/test response, time, and expression blocks once."""
+
+    train_ids = set(patients.iloc[train_indices]["patient"].astype(str))
+    test_ids = set(patients.iloc[test_indices]["patient"].astype(str))
+    train_long = long_all.loc[long_all["patient"].isin(train_ids)].reset_index(drop=True)
+    test_long = long_all.loc[long_all["patient"].isin(test_ids)].reset_index(drop=True)
+    return (
+        train_long,
+        test_long,
+        _expand_expression(standardized_expression, patients, train_long),
+        _expand_expression(standardized_expression, patients, test_long),
+        _time_design(train_long),
+        _time_design(test_long),
+    )
+
+
+def _path_diagnostics(
+    fitted: FittedLassoPath,
+    *,
+    method: str,
+    repeat: int,
+    fold: int,
+) -> pd.DataFrame:
+    """Create the complete auditable AIC/BIC table for one shared path."""
+
+    selected_aic = int(np.argmin(fitted.aic))
+    selected_bic = int(np.argmin(fitted.bic))
+    return pd.DataFrame(
+        {
+            "preprocessing": method,
+            "repeat": repeat,
+            "fold": fold,
+            "path_index": np.arange(len(fitted.alphas), dtype=np.int64),
+            "alpha_fraction": fitted.alpha_fractions,
+            "alpha": fitted.alphas,
+            "n_nonzero": fitted.n_nonzero,
+            "negative_twice_log_likelihood": fitted.negative_twice_log_likelihood,
+            "aic": fitted.aic,
+            "bic": fitted.bic,
+            "selected_by_aic": np.arange(len(fitted.alphas)) == selected_aic,
+            "selected_by_bic": np.arange(len(fitted.alphas)) == selected_bic,
+            "random_intercept_variance_ratio": fitted.variance_ratio,
+        }
+    )
+
+
+def _selected_candidate_outputs(
+    fitted: FittedLassoPath,
+    *,
+    criterion: str,
+    method: str,
+    arm: ProbeExpressionArm,
+    repeat: int,
+    fold: int,
+    train_indices: np.ndarray,
+    test_indices: np.ndarray,
+    patients: pd.DataFrame,
+    test_long: pd.DataFrame,
+    test_expression: np.ndarray,
+    test_time: np.ndarray,
+) -> tuple[dict[str, object], pd.DataFrame, list[dict[str, object]]]:
+    """Evaluate one AIC/BIC-selected point without touching model fitting."""
+
+    values = fitted.aic if criterion == "aic" else fitted.bic
+    selected_index = int(np.argmin(values))
+    beta = fitted.coefficients[:, selected_index]
+    gamma = fitted.time_coefficients[:, selected_index]
+    prediction = test_time @ gamma + test_expression @ beta
+    observed = test_long["egfr"].to_numpy(dtype=np.float64)
+    errors = observed - prediction
+    nonzero = np.flatnonzero(beta)
+    model_id = f"probe_lasso_{criterion}_{_slug(method)}"
+    model_label = f"All-probe LASSO-{criterion.upper()} mixed model - {method}"
+
+    metric = {
+        "model_id": model_id,
+        "model_label": model_label,
+        "selection_criterion": criterion.upper(),
+        "preprocessing": method,
+        "repeat": repeat,
+        "fold": fold,
+        "rmse": float(np.sqrt(np.mean(errors**2))),
+        "donor_balanced_rmse": _donor_balanced_rmse(test_long, prediction),
+        "mae": float(np.mean(np.abs(errors))),
+        "selected_path_index": selected_index,
+        "selected_alpha_fraction": float(fitted.alpha_fractions[selected_index]),
+        "selected_alpha": float(fitted.alphas[selected_index]),
+        "selected_aic": float(fitted.aic[selected_index]),
+        "selected_bic": float(fitted.bic[selected_index]),
+        "negative_twice_log_likelihood": float(
+            fitted.negative_twice_log_likelihood[selected_index]
+        ),
+        "n_nonzero": int(fitted.n_nonzero[selected_index]),
+        "random_intercept_variance_ratio": fitted.variance_ratio,
+        "n_train_patients": len(train_indices),
+        "n_test_patients": len(test_indices),
+        "n_train_donors": int(patients.iloc[train_indices]["donor"].nunique()),
+        "n_test_donors": int(patients.iloc[test_indices]["donor"].nunique()),
+    }
+    predictions = test_long.loc[:, ["patient", "donor", "time", "egfr"]].copy()
+    predictions.insert(0, "fold", fold)
+    predictions.insert(0, "repeat", repeat)
+    predictions.insert(0, "preprocessing", method)
+    predictions.insert(0, "selection_criterion", criterion.upper())
+    predictions.insert(0, "model_id", model_id)
+    predictions["prediction"] = prediction
+
+    probe_ids = arm.probe_ids
+    coefficients = [
+        {
+            "model_id": model_id,
+            "selection_criterion": criterion.upper(),
+            "preprocessing": method,
+            "repeat": repeat,
+            "fold": fold,
+            "probe_index_python": int(probe_index),
+            "probe_id": (
+                probe_ids[probe_index] if probe_ids is not None else str(probe_index)
+            ),
+            "coefficient": float(beta[probe_index]),
+        }
+        for probe_index in nonzero
+    ]
+    return metric, predictions, coefficients
+
+
 def evaluate_probe_lasso_mixed_models(
     egfr_wide: pd.DataFrame,
     arms: Mapping[str, ProbeExpressionArm],
@@ -293,7 +514,7 @@ def evaluate_probe_lasso_mixed_models(
     stratify_column: str | None = "KDRI_8",
     config: ProbeLassoConfig | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Run nested donor-CV once per preprocessing strategy and save results."""
+    """Fit one path per outer train fold and evaluate LASSO-AIC and LASSO-BIC."""
 
     if not arms:
         raise ValueError("At least one preprocessing arm is required for probe LASSO.")
@@ -324,7 +545,6 @@ def evaluate_probe_lasso_mixed_models(
         "stratify_column": stratify_column,
         "config": {
             "alpha_fractions": list(config.alpha_fractions),
-            "inner_splits": config.inner_splits,
             "max_iter": config.max_iter,
             "tolerance": config.tolerance,
         },
@@ -352,169 +572,83 @@ def evaluate_probe_lasso_mixed_models(
     fold_rows: list[dict[str, object]] = []
     prediction_rows: list[pd.DataFrame] = []
     coefficient_rows: list[dict[str, object]] = []
-    tuning_rows: list[dict[str, object]] = []
+    path_diagnostic_frames: list[pd.DataFrame] = []
 
     for repeat, fold, outer_train, outer_test in outer_folds:
-        outer_train_patients = patients.iloc[outer_train].reset_index(drop=True)
-        inner_count = min(config.inner_splits, outer_train_patients["donor"].nunique())
-        if inner_count < 2:
-            raise ValueError("An outer fold has fewer than two donor groups for tuning.")
-        inner_folds = repeated_donor_folds(
-            outer_train_patients,
-            n_splits=inner_count,
-            n_repeats=1,
-            seed=seed + 10_000 * repeat + 101 * fold + 1,
-            stratify_column=stratify_column,
-        )
-
         for method, arm in arms.items():
             part_name = f"r{repeat:03d}_f{fold:03d}_{_slug(method)}"
-            metric_part = parts_root / f"{part_name}.metric.json"
+            metric_part = parts_root / f"{part_name}.metrics.csv"
             prediction_part = parts_root / f"{part_name}.predictions.csv"
             coefficient_part = parts_root / f"{part_name}.coefficients.csv"
-            tuning_part = parts_root / f"{part_name}.tuning.csv"
+            path_part = parts_root / f"{part_name}.information_criteria.csv"
             if all(
                 path.is_file()
                 for path in (
                     metric_part,
                     prediction_part,
                     coefficient_part,
-                    tuning_part,
+                    path_part,
                 )
             ):
-                fold_rows.append(json.loads(metric_part.read_text(encoding="utf-8")))
+                fold_rows.extend(pd.read_csv(metric_part).to_dict("records"))
                 prediction_rows.append(pd.read_csv(prediction_part))
-                saved_coefficients = pd.read_csv(coefficient_part)
-                coefficient_rows.extend(saved_coefficients.to_dict("records"))
-                tuning_rows.extend(pd.read_csv(tuning_part).to_dict("records"))
+                coefficient_rows.extend(pd.read_csv(coefficient_part).to_dict("records"))
+                path_diagnostic_frames.append(pd.read_csv(path_part))
                 continue
 
-            tuning_start = len(tuning_rows)
             matrix = matrices[method]
-            inner_scores = np.zeros((len(inner_folds), len(config.alpha_fractions)))
-            for inner_number, (_, _, inner_train_local, inner_test_local) in enumerate(inner_folds):
-                inner_train = outer_train[inner_train_local]
-                inner_test = outer_train[inner_test_local]
-                standardized, _, _ = _standardize_from_train(matrix, inner_train)
-                inner_train_ids = set(patients.iloc[inner_train]["patient"].astype(str))
-                inner_test_ids = set(patients.iloc[inner_test]["patient"].astype(str))
-                train_long = long_all.loc[long_all["patient"].isin(inner_train_ids)].reset_index(drop=True)
-                test_long = long_all.loc[long_all["patient"].isin(inner_test_ids)].reset_index(drop=True)
-                train_expression = _expand_expression(standardized, patients, train_long)
-                test_expression = _expand_expression(standardized, patients, test_long)
-                train_time = _time_design(train_long)
-                test_time = _time_design(test_long)
-                train_y = train_long["egfr"].to_numpy(dtype=np.float64)
-                train_groups = train_long["patient"].astype(str).to_numpy()
-                path, alphas, ratio = _fit_path(
-                    train_y, train_expression, train_time, train_groups, config
-                )
-                for alpha_index in range(path.shape[1]):
-                    beta = path[:, alpha_index]
-                    gamma = _time_coefficients(
-                        train_y,
-                        train_expression,
-                        train_time,
-                        train_groups,
-                        ratio,
-                        beta,
-                    )
-                    prediction = test_time @ gamma + test_expression @ beta
-                    score = _donor_balanced_rmse(test_long, prediction)
-                    inner_scores[inner_number, alpha_index] = score
-                    tuning_rows.append(
-                        {
-                            "preprocessing": method,
-                            "repeat": repeat,
-                            "fold": fold,
-                            "inner_fold": inner_number,
-                            "alpha_fraction": config.alpha_fractions[alpha_index],
-                            "alpha": alphas[alpha_index],
-                            "donor_balanced_rmse": score,
-                            "n_nonzero": int(np.count_nonzero(beta)),
-                        }
-                    )
-
-            mean_scores = inner_scores.mean(axis=0)
-            selected_index = int(np.argmin(mean_scores))
-            selected_fraction = config.alpha_fractions[selected_index]
-
             standardized, _, _ = _standardize_from_train(matrix, outer_train)
-            train_ids = set(patients.iloc[outer_train]["patient"].astype(str))
-            test_ids = set(patients.iloc[outer_test]["patient"].astype(str))
-            train_long = long_all.loc[long_all["patient"].isin(train_ids)].reset_index(drop=True)
-            test_long = long_all.loc[long_all["patient"].isin(test_ids)].reset_index(drop=True)
-            train_expression = _expand_expression(standardized, patients, train_long)
-            test_expression = _expand_expression(standardized, patients, test_long)
-            train_time = _time_design(train_long)
-            test_time = _time_design(test_long)
+            (
+                train_long,
+                test_long,
+                train_expression,
+                test_expression,
+                train_time,
+                test_time,
+            ) = _longitudinal_fold_arrays(
+                patients,
+                long_all,
+                standardized,
+                outer_train,
+                outer_test,
+            )
             train_y = train_long["egfr"].to_numpy(dtype=np.float64)
             train_groups = train_long["patient"].astype(str).to_numpy()
-            path, alphas, ratio = _fit_path(
+            fitted = _fit_and_score_shared_path(
                 train_y, train_expression, train_time, train_groups, config
             )
-            beta = path[:, selected_index]
-            gamma = _time_coefficients(
-                train_y, train_expression, train_time, train_groups, ratio, beta
+            diagnostics = _path_diagnostics(
+                fitted, method=method, repeat=repeat, fold=fold
             )
-            prediction = test_time @ gamma + test_expression @ beta
-            errors = test_long["egfr"].to_numpy(dtype=float) - prediction
-            nonzero = np.flatnonzero(beta)
-
-            train_prediction = train_time @ gamma + train_expression @ beta
-            train_error = train_y - train_prediction
-            marginal_scale = max(float(np.mean(train_error**2)), np.finfo(float).tiny)
-            degrees = len(gamma) + len(nonzero) + 2
-            bic = len(train_y) * math.log(marginal_scale) + degrees * math.log(len(train_y))
-            model_id = f"probe_lasso_{_slug(method)}"
-            fold_rows.append(
-                {
-                    "model_id": model_id,
-                    "model_label": f"All-probe LASSO mixed model - {method}",
-                    "preprocessing": method,
-                    "repeat": repeat,
-                    "fold": fold,
-                    "rmse": float(np.sqrt(np.mean(errors**2))),
-                    "donor_balanced_rmse": _donor_balanced_rmse(test_long, prediction),
-                    "mae": float(np.mean(np.abs(errors))),
-                    "selected_alpha_fraction": selected_fraction,
-                    "selected_alpha": float(alphas[selected_index]),
-                    "inner_cv_rmse": float(mean_scores[selected_index]),
-                    "n_nonzero": len(nonzero),
-                    "random_intercept_variance_ratio": ratio,
-                    "training_bic_diagnostic": bic,
-                    "n_train_patients": len(outer_train),
-                    "n_test_patients": len(outer_test),
-                    "n_train_donors": patients.iloc[outer_train]["donor"].nunique(),
-                    "n_test_donors": patients.iloc[outer_test]["donor"].nunique(),
-                }
-            )
-            predictions = test_long.loc[:, ["patient", "donor", "time", "egfr"]].copy()
-            predictions.insert(0, "fold", fold)
-            predictions.insert(0, "repeat", repeat)
-            predictions.insert(0, "preprocessing", method)
-            predictions.insert(0, "model_id", model_id)
-            predictions["prediction"] = prediction
-            prediction_rows.append(predictions)
-
-            probe_ids = arm.probe_ids
-            for probe_index in nonzero:
-                coefficient_rows.append(
-                    {
-                        "preprocessing": method,
-                        "repeat": repeat,
-                        "fold": fold,
-                        "probe_index_python": int(probe_index),
-                        "probe_id": (
-                            probe_ids[probe_index]
-                            if probe_ids is not None
-                            else str(probe_index)
-                        ),
-                        "coefficient": float(beta[probe_index]),
-                    }
+            path_diagnostic_frames.append(diagnostics)
+            current_metrics: list[dict[str, object]] = []
+            current_predictions: list[pd.DataFrame] = []
+            current_coefficients: list[dict[str, object]] = []
+            for criterion in ("aic", "bic"):
+                metric, predictions, coefficients = _selected_candidate_outputs(
+                    fitted,
+                    criterion=criterion,
+                    method=method,
+                    arm=arm,
+                    repeat=repeat,
+                    fold=fold,
+                    train_indices=outer_train,
+                    test_indices=outer_test,
+                    patients=patients,
+                    test_long=test_long,
+                    test_expression=test_expression,
+                    test_time=test_time,
                 )
+                current_metrics.append(metric)
+                current_predictions.append(predictions)
+                current_coefficients.extend(coefficients)
 
+            fold_rows.extend(current_metrics)
+            prediction_rows.extend(current_predictions)
+            coefficient_rows.extend(current_coefficients)
             coefficient_columns = (
+                "model_id",
+                "selection_criterion",
                 "preprocessing",
                 "repeat",
                 "fold",
@@ -522,26 +656,22 @@ def evaluate_probe_lasso_mixed_models(
                 "probe_id",
                 "coefficient",
             )
-            current_coefficients = pd.DataFrame(
-                [
-                    row
-                    for row in coefficient_rows
-                    if row["preprocessing"] == method
-                    and row["repeat"] == repeat
-                    and row["fold"] == fold
-                ],
+            current_coefficient_frame = pd.DataFrame(
+                current_coefficients,
                 columns=coefficient_columns,
             )
-            _atomic_csv(predictions, prediction_part)
-            _atomic_csv(current_coefficients, coefficient_part)
-            _atomic_csv(pd.DataFrame(tuning_rows[tuning_start:]), tuning_part)
-            _atomic_json(fold_rows[-1], metric_part)
+            _atomic_csv(pd.DataFrame(current_metrics), metric_part)
+            _atomic_csv(pd.concat(current_predictions, ignore_index=True), prediction_part)
+            _atomic_csv(current_coefficient_frame, coefficient_part)
+            _atomic_csv(diagnostics, path_part)
 
     fold_metrics = pd.DataFrame(fold_rows)
     predictions = pd.concat(prediction_rows, ignore_index=True)
     coefficients = pd.DataFrame(
         coefficient_rows,
         columns=(
+            "model_id",
+            "selection_criterion",
             "preprocessing",
             "repeat",
             "fold",
@@ -550,7 +680,7 @@ def evaluate_probe_lasso_mixed_models(
             "coefficient",
         ),
     )
-    tuning = pd.DataFrame(tuning_rows)
+    path_diagnostics = pd.concat(path_diagnostic_frames, ignore_index=True)
     summary = (
         fold_metrics.groupby(["model_id", "model_label", "preprocessing"], as_index=False)
         .agg(
@@ -569,28 +699,30 @@ def evaluate_probe_lasso_mixed_models(
     _atomic_csv(fold_metrics, root / "fold_metrics.csv")
     _atomic_csv(predictions, root / "oof_predictions.csv")
     _atomic_csv(coefficients, root / "selected_probe_coefficients.csv")
-    _atomic_csv(tuning, root / "inner_cv_tuning.csv")
+    _atomic_csv(path_diagnostics, root / "information_criterion_path.csv")
     _atomic_csv(summary, root / "summary.csv")
     _atomic_csv(pd.DataFrame(fold_assignments), root / "outer_fold_assignments.csv")
     (root / "metadata.json").write_text(
         json.dumps(
             {
-                "format": 1,
+                "format": 2,
                 "model": "Gaussian L1-penalized marginal linear mixed model",
                 "random_intercept": "patient/biopsy",
                 "unpenalized_fixed_effects": "categorical time",
                 "penalized_features": "all aligned microarray probes",
                 "outer_split": "repeated donor-grouped CV shared across preprocessing arms",
-                "tuning": "inner donor-grouped CV within each outer training fold",
-                "selection_metric": "donor-balanced RMSE",
-                "bic_policy": "training-fold diagnostic only; never used on outer test data",
+                "path_fit": "one shared LASSO path per preprocessing and outer training fold",
+                "models": ["LASSO-AIC", "LASSO-BIC"],
+                "selection": (
+                    "minimum marginal mixed-model AIC/BIC inside each complete outer "
+                    "training fold; outer test outcomes are never inspected"
+                ),
                 "n_splits": n_splits,
                 "n_repeats": n_repeats,
                 "seed": seed,
                 "stratify_column": stratify_column,
                 "config": {
                     "alpha_fractions": list(config.alpha_fractions),
-                    "inner_splits": config.inner_splits,
                     "max_iter": config.max_iter,
                     "tolerance": config.tolerance,
                 },
