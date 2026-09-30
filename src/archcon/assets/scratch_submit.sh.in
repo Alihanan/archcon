@@ -22,6 +22,8 @@ TASK_LIST="$SUBMISSION_DIR/pending_$(date -u +%Y%m%dT%H%M%SZ)_$$.txt"
 
 submitted=0
 skipped=0
+resumable=0
+fresh=0
 shopt -s nullglob
 jobs=("$SWEEP_DIR"/jobs/run_*.py)
 if (( ${#jobs[@]} == 0 )); then
@@ -37,10 +39,14 @@ for job in "${jobs[@]}"; do
         continue
     fi
     run_dir="$RESULT_ROOT/$run_name"
-    if [[ -d "$run_dir" ]] &&
-       find "$run_dir" -maxdepth 1 -type f -name '*.pt' -print -quit | grep -q .; then
+    if [[ -f "$run_dir/run_summary.json" ]]; then
         ((skipped += 1))
         continue
+    fi
+    if [[ -f "$run_dir/latest.pt" || -f "$run_dir/best.pt" ]]; then
+        ((resumable += 1))
+    else
+        ((fresh += 1))
     fi
     printf '%d\n' "$((10#$digits))" >> "$TASK_LIST"
     ((submitted += 1))
@@ -48,7 +54,7 @@ done
 
 if (( submitted == 0 )); then
     rm -f -- "$TASK_LIST"
-    echo "Nothing submitted: all $skipped discovered runs already contain a .pt file."
+    echo "Nothing submitted: all $skipped discovered runs contain run_summary.json."
     exit 0
 fi
 
@@ -82,8 +88,8 @@ if [[ $QSUB_STATUS -ne 0 ]]; then
     exit "$QSUB_STATUS"
 fi
 
-echo "Submitted $submitted runs; skipped $skipped runs whose result folders contain .pt files."
+echo "Submitted $submitted runs: $resumable resumable and $fresh starting from epoch 0."
+echo "Skipped $skipped completed runs containing run_summary.json."
 echo "The pending run indices were randomized before submission."
 echo "PBS job: $JOB_ID"
 echo "Run-index map (keep until the array finishes): $TASK_LIST"
-

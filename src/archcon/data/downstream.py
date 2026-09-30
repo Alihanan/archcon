@@ -747,6 +747,13 @@ def canonical_ikem_columns(
             "has_egfr": status.table["has_egfr"].astype(bool).to_numpy(),
         }
     )
+    # Preserve the audited outcome-blind molecular roles when the private-CEL
+    # store supplies them.  Downstream fine-tuning may reuse the 24 no-eGFR
+    # pretraining-train biopsies for reconstruction, but must continue to leave
+    # the six molecular-validation biopsies and every held-out donor untouched.
+    for column in ("training_role", "pretraining_split", "split_unit"):
+        if column in source.sample_index.columns:
+            samples[column] = source.sample_index[column].to_numpy(copy=True)
     return source, columns, samples
 
 

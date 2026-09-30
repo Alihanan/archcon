@@ -17,8 +17,8 @@ PERSISTENT_RESULT_ROOT="${ARCHCON_RESULT_ROOT:-$ARCHCON_SWEEP_DIR/results}"
 TRAIN_TIMEOUT="${ARCHCON_TRAIN_TIMEOUT:-23h}"
 TIMEOUT_KILL_AFTER="${ARCHCON_TIMEOUT_KILL_AFTER:-5m}"
 
-# submit.sh creates a compact task list containing only runs without an
-# existing .pt file. PBS_ARRAY_INDEX identifies a line in that list.
+# submit.sh creates a compact task list containing only runs without a
+# completion summary. PBS_ARRAY_INDEX identifies a line in that list.
 ARRAY_SLOT=$PBS_ARRAY_INDEX
 if [[ -n "${ARCHCON_RUN_INDEX_FILE:-}" ]]; then
     if [[ ! -f "$ARCHCON_RUN_INDEX_FILE" ]]; then
@@ -53,11 +53,10 @@ for required in \
     fi
 done
 
-# Recheck at job start in case another submission produced a checkpoint after
-# submit.sh built its task list.
-if [[ -d "$PERSISTENT_RUN_DIR" ]] &&
-   find "$PERSISTENT_RUN_DIR" -maxdepth 1 -type f -name '*.pt' -print -quit | grep -q .; then
-    echo "Skipping $RUN_NAME: persistent result folder already contains a .pt file."
+# Recheck at job start in case another submission completed this run after
+# submit.sh built its task list. Checkpoints without a summary are resumable.
+if [[ -f "$PERSISTENT_RUN_DIR/run_summary.json" ]]; then
+    echo "Skipping $RUN_NAME: persistent result folder contains run_summary.json."
     exit 0
 fi
 
@@ -117,6 +116,24 @@ copy_atomic_to_persistent() {
 echo "Staging $RUN_NAME in node-local scratch: $STAGE_ROOT"
 copy_required "$PERSISTENT_JOB" "$STAGE_JOB"
 copy_required "$PERSISTENT_CONFIG" "$STAGE_CONFIG"
+
+# Preserve the best checkpoint selected before an earlier timeout and resume
+# the exact optimizer/scheduler/history state from latest.pt. Older result
+# folders that contain only best.pt can still resume from that earlier epoch.
+RESUME_CHECKPOINT=""
+RESUME_SOURCE=""
+copy_optional "$PERSISTENT_RUN_DIR/best.pt" "$STAGE_RUN_DIR/best.pt"
+if [[ -f "$PERSISTENT_RUN_DIR/latest.pt" ]]; then
+    RESUME_SOURCE="$PERSISTENT_RUN_DIR/latest.pt"
+    RESUME_CHECKPOINT="$STAGE_RUN_DIR/latest.pt"
+    copy_required "$RESUME_SOURCE" "$RESUME_CHECKPOINT"
+elif [[ -f "$PERSISTENT_RUN_DIR/best.pt" ]]; then
+    RESUME_SOURCE="$PERSISTENT_RUN_DIR/best.pt"
+    RESUME_CHECKPOINT="$STAGE_RUN_DIR/best.pt"
+fi
+
+PREVIOUS_TRAIN_LOG="$STAGE_RUN_DIR/training.previous.log"
+copy_optional "$PERSISTENT_RUN_DIR/training.log" "$PREVIOUS_TRAIN_LOG"
 
 METHOD=$(
     "$PYTHON_BIN" - "$PERSISTENT_CONFIG" <<'PY'
@@ -288,17 +305,28 @@ echo "Python job (scratch): $STAGE_JOB"
 echo "Training data (scratch): $STAGE_DATA"
 echo "Result directory during training (scratch): $STAGE_RUN_DIR"
 echo "Persistent checkpoint destination after training: $PERSISTENT_RUN_DIR"
+if [[ -n "$RESUME_CHECKPOINT" ]]; then
+    echo "Resume checkpoint (persistent): $RESUME_SOURCE"
+    echo "Resume checkpoint (scratch):    $RESUME_CHECKPOINT"
+else
+    echo "Resume checkpoint: none; training starts from epoch 0"
+fi
 echo "Training timeout: $TRAIN_TIMEOUT; PBS walltime: @@WALLTIME@@"
 du -sh "$STAGE_PREPARED" "$STAGED_MATRIX" 2>/dev/null || true
 
 cd "$STAGE_ROOT"
 echo "Verified execution working directory: $(pwd -P)"
+RESUME_ARGS=()
+if [[ -n "$RESUME_CHECKPOINT" ]]; then
+    RESUME_ARGS=(--resume-checkpoint "$RESUME_CHECKPOINT")
+fi
 set +e
 timeout --signal=TERM --kill-after="$TIMEOUT_KILL_AFTER" "$TRAIN_TIMEOUT" \
     "$PYTHON_BIN" "$STAGE_JOB" \
         --data-dir "$STAGE_DATA" \
         --output-root "$STAGE_RESULT_ROOT" \
         --run-directory "$STAGE_RUN_DIR" \
+        "${RESUME_ARGS[@]}" \
         >"$TRAIN_LOG" 2>&1
 TRAIN_STATUS=$?
 set -e
@@ -316,6 +344,18 @@ fi
 shopt -s nullglob
 CHECKPOINTS=("$STAGE_RUN_DIR"/*.pt)
 mkdir -p "$PERSISTENT_RUN_DIR"
+
+# Retain earlier logs across multiple time-limited continuation jobs.
+if [[ -f "$PREVIOUS_TRAIN_LOG" ]]; then
+    MERGED_TRAIN_LOG="$STAGE_RUN_DIR/training.merged.log"
+    {
+        cat "$PREVIOUS_TRAIN_LOG"
+        printf '\n===== RESUMED %s · PBS job %s =====\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${PBS_JOBID:-manual}"
+        cat "$TRAIN_LOG"
+    } > "$MERGED_TRAIN_LOG"
+    mv -f -- "$MERGED_TRAIN_LOG" "$TRAIN_LOG"
+fi
 copy_atomic_to_persistent "$TRAIN_LOG" "$PERSISTENT_RUN_DIR/training.log"
 if (( ${#CHECKPOINTS[@]} == 0 )); then
     echo "ERROR: $RUN_NAME produced no complete .pt checkpoint in scratch." >&2

@@ -29,6 +29,7 @@ import pandas as pd
 from sklearn.linear_model import lasso_path
 
 from .downstream import TIME_LEVELS, egfr_long, repeated_donor_folds
+from .nested_cv import manifest_sha256, outer_folds_from_manifest
 
 
 @dataclass(frozen=True)
@@ -120,7 +121,10 @@ def _expand_expression(
     patients: pd.DataFrame,
     long_frame: pd.DataFrame,
 ) -> np.ndarray:
-    lookup = {patient: index for index, patient in enumerate(patients["patient"].astype(str))}
+    lookup = {
+        patient: index
+        for index, patient in enumerate(patients["patient"].astype(str))
+    }
     indices = np.asarray([lookup[value] for value in long_frame["patient"].astype(str)], dtype=np.int64)
     return np.asarray(patient_expression[indices], dtype=np.float64)
 
@@ -513,8 +517,14 @@ def evaluate_probe_lasso_mixed_models(
     seed: int = 0,
     stratify_column: str | None = "KDRI_8",
     config: ProbeLassoConfig | None = None,
+    split_manifest: pd.DataFrame | str | Path | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Fit one path per outer train fold and evaluate LASSO-AIC and LASSO-BIC."""
+    """Fit one path per outer train fold and evaluate LASSO-AIC and LASSO-BIC.
+
+    When ``split_manifest`` is supplied, its persisted donor-grouped outer folds
+    replace fold generation.  This lets the LASSO alternatives use exactly the
+    same outer test donors as nested InfoNCE, PCA, and every lme4 comparison.
+    """
 
     if not arms:
         raise ValueError("At least one preprocessing arm is required for probe LASSO.")
@@ -527,13 +537,34 @@ def evaluate_probe_lasso_mixed_models(
     if patients["patient"].duplicated().any():
         raise ValueError("Probe-LASSO input must contain one row per biopsy.")
     long_all = egfr_long(patients)
-    outer_folds = repeated_donor_folds(
-        patients,
-        n_splits=n_splits,
-        n_repeats=n_repeats,
-        seed=seed,
-        stratify_column=stratify_column,
-    )
+    manifest_frame: pd.DataFrame | None = None
+    if split_manifest is None:
+        outer_folds = repeated_donor_folds(
+            patients,
+            n_splits=n_splits,
+            n_repeats=n_repeats,
+            seed=seed,
+            stratify_column=stratify_column,
+        )
+    else:
+        manifest_frame = (
+            split_manifest.copy()
+            if isinstance(split_manifest, pd.DataFrame)
+            else pd.read_csv(Path(split_manifest).expanduser().resolve())
+        )
+        outer_folds = outer_folds_from_manifest(patients, manifest_frame)
+        observed_repeats = {int(item[0]) for item in outer_folds}
+        observed_by_repeat = {
+            repeat: {int(item[1]) for item in outer_folds if int(item[0]) == repeat}
+            for repeat in observed_repeats
+        }
+        expected_folds = set(range(int(n_splits)))
+        if observed_repeats != set(range(int(n_repeats))) or any(
+            folds != expected_folds for folds in observed_by_repeat.values()
+        ):
+            raise ValueError(
+                "Shared nested manifest does not match the requested outer folds/repeats."
+            )
     matrices = {method: _aligned_patient_expression(arm, patients) for method, arm in arms.items()}
     resume_contract = {
         "patients": patients["patient"].astype(str).tolist(),
@@ -549,6 +580,8 @@ def evaluate_probe_lasso_mixed_models(
             "tolerance": config.tolerance,
         },
     }
+    if manifest_frame is not None:
+        resume_contract["split_manifest_sha256"] = manifest_sha256(manifest_frame)
     contract_hash = hashlib.sha256(
         json.dumps(resume_contract, sort_keys=True).encode("utf-8")
     ).hexdigest()[:16]
@@ -711,6 +744,11 @@ def evaluate_probe_lasso_mixed_models(
                 "unpenalized_fixed_effects": "categorical time",
                 "penalized_features": "all aligned microarray probes",
                 "outer_split": "repeated donor-grouped CV shared across preprocessing arms",
+                "split_manifest_sha256": (
+                    manifest_sha256(manifest_frame)
+                    if manifest_frame is not None
+                    else None
+                ),
                 "path_fit": "one shared LASSO path per preprocessing and outer training fold",
                 "models": ["LASSO-AIC", "LASSO-BIC"],
                 "selection": (

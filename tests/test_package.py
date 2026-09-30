@@ -57,6 +57,22 @@ def test_checkpoint_free_baseline_console_script_is_packaged() -> None:
     assert callable(main)
 
 
+def test_nested_egfr_console_script_is_packaged() -> None:
+    from pathlib import Path
+
+    import tomllib
+
+    project_root = Path(__file__).resolve().parents[1]
+    config = tomllib.loads((project_root / "pyproject.toml").read_text())
+    assert config["project"]["scripts"]["archcon-evaluate-egfr-nested"] == (
+        "archcon.evaluate_egfr_nested:main"
+    )
+
+    from archcon.evaluate_egfr_nested import main
+
+    assert callable(main)
+
+
 def test_global_normalization_console_script_is_packaged() -> None:
     from pathlib import Path
 
@@ -102,7 +118,10 @@ def test_scratch_launcher_templates_are_packaged() -> None:
     submit_script = assets.joinpath("scratch_submit.sh.in").read_text()
     assert 'STAGE_ROOT=$(mktemp -d "$SCRATCHDIR/' in run_script
     assert 'timeout --signal=TERM' in run_script
+    assert 'RESUME_ARGS=(--resume-checkpoint "$RESUME_CHECKPOINT")' in run_script
+    assert 'if [[ -f "$PERSISTENT_RUN_DIR/run_summary.json" ]]' in run_script
     assert 'shuf --output="$TASK_LIST"' in submit_script
+    assert 'if [[ -f "$run_dir/run_summary.json" ]]' in submit_script
 
 
 def test_standalone_scripts_are_organized_under_scripts_directory() -> None:
@@ -114,5 +133,6 @@ def test_standalone_scripts_are_organized_under_scripts_directory() -> None:
     assert not (project_root / "submit.sh").exists()
     assert (project_root / "scripts" / "evaluate_molecular_egfr.py").is_file()
     assert (project_root / "scripts" / "evaluate_egfr_baselines.py").is_file()
+    assert (project_root / "scripts" / "evaluate_egfr_nested.py").is_file()
     assert (project_root / "scripts" / "metacentrum_run_array.pbs.sh").is_file()
     assert (project_root / "scripts" / "metacentrum_submit.sh").is_file()

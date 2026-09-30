@@ -207,6 +207,44 @@ def test_exact_resume_rejects_different_split(tmp_path: Path) -> None:
         next(stream)
 
 
+def test_exact_resume_at_maximum_epoch_retains_checkpoint_paths(tmp_path: Path) -> None:
+    from archcon.data.training import CHECKPOINT_RESUME
+
+    matrix = np.random.default_rng(62).normal(size=(20, 8)).astype(np.float32)
+    run_dir = tmp_path / "persistent" / "run_0001"
+    config = _tiny_config(LOSS_MSE, epochs=1)
+    first = list(
+        train_autoencoder_stream(
+            matrix,
+            np.arange(16),
+            np.arange(16, 20),
+            config,
+            tmp_path / "persistent",
+            method="per-gse",
+            run_directory=run_dir,
+        )
+    )[-1]
+
+    resumed = list(
+        train_autoencoder_stream(
+            matrix,
+            np.arange(16),
+            np.arange(16, 20),
+            config,
+            tmp_path / "persistent",
+            method="per-gse",
+            run_directory=run_dir,
+            checkpoint_path=first.latest_checkpoint,
+            checkpoint_mode=CHECKPOINT_RESUME,
+        )
+    )[-1]
+
+    assert resumed.done
+    assert resumed.latest_checkpoint == str((run_dir / "latest.pt").resolve())
+    assert resumed.best_checkpoint == str((run_dir / "best.pt").resolve())
+    assert resumed.epoch == 1
+
+
 @pytest.mark.parametrize("family", [ARCH_DENSE, ARCH_RESIDUAL, ARCH_GATED_RESIDUAL, ARCH_LOW_RANK])
 def test_advanced_architecture_families_forward(family: str) -> None:
     config = TrainingConfig(

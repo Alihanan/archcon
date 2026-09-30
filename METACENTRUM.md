@@ -68,7 +68,7 @@ gate and never enter normalization or autoencoder fitting.
 The final coherent 288-row output is installed into `data/IKEM_CEL_NUMPY_STORE/`. The historical
 `IKEM_NUMPY_STORE/` is retained for audit comparison and is never overwritten.
 
-## 2. Build and install 0.5.16
+## 2. Build and install 0.5.16.post9
 
 Build into a version-specific directory so older distributions need not be deleted:
 
@@ -76,8 +76,8 @@ Build into a version-specific directory so older distributions need not be delet
 cd /path/to/archcon
 source .venv/bin/activate
 python -m pip install --upgrade build
-python -m build --outdir dist-0516
-python -m zipfile -l dist-0516/archcon-0.5.16-py3-none-any.whl \
+python -m build --outdir dist-post9
+python -m zipfile -l dist-post9/archcon-0.5.16.post9-py3-none-any.whl \
   | grep 'archcon/data/training_sources.py'
 ```
 
@@ -87,12 +87,12 @@ CPU-PyTorch environment:
 ```bash
 cd /storage/brno2/home/anuarali/DP/ARCHCON
 source .venv/bin/activate
-python -m pip install --upgrade ./archcon-0.5.16-py3-none-any.whl
+python -m pip install --upgrade ./archcon-0.5.16.post9-py3-none-any.whl
 python -m pip show archcon
 python -c 'import torch; print(torch.__version__, torch.cuda.is_available())'
 ```
 
-Python 3.9 or newer is required. `CUDA: False` is expected for the CPU sweep.
+Python 3.10 or newer is required. `CUDA: False` is expected for the CPU sweep.
 
 The R rebuild needs `affxparser`, `preprocessCore`, `rhdf5`, `R.utils`, and `readxl` in the
 configured MetaCentrum R library.
@@ -363,4 +363,121 @@ mixed_models/
 ├── all_model_cv_summary.csv
 ├── fixed_encoder_cv_summary.csv
 └── fixed_encoder_comparisons.csv
+```
+
+## 7. Nested eGFR selection: reconstruction control versus soft InfoNCE
+
+ArchCon 0.5.16.post9 adds a separate, resumable final evaluation command. It does not change or
+refit the CEL preprocessing references. It first freezes the same molecular-validation winner in
+each of the six preprocessing×architecture groups, then creates one persisted donor manifest with
+these columns:
+
+```text
+outer_repeat, outer_fold, patient, donor, outer_role, inner_role
+```
+
+Within every outer fold, outer-training donors are divided into one inner-training and one
+inner-validation partition. All biopsies from a donor stay together. The same identities select
+the encoder fine-tuning loss and PCA dimension. The chosen configuration is reloaded from the
+original molecular checkpoint, refitted on all outer-training donors, and evaluated once on the
+untouched outer-test donors. Population-level lme4 predictions exclude unseen patient random
+effects.
+
+The encoder candidates are one reconstruction-only control (`none`) and the Cartesian product of
+the requested soft-InfoNCE weights and temperatures. Both arms receive otherwise identical IKEM
+fine-tuning and preserve the winning checkpoint's MSE or masked-MSE reconstruction objective.
+Soft targets are Gaussian similarities in training-fold-scaled clinical space; the
+default columns are Stadniuk's prespecified eight-feature pool (`Donor_age`, `AKI`, `don_bio_cv`,
+`don_bio_ah`, `don_bio_ifta`, `DCD`, `ECD_1`, and `BMI_donor`) from the classifier workbook. They
+can be explicitly changed with `--contrastive-clinical-columns`. The bandwidth is the median
+nonzero clinical distance in measured inner training. No eGFR value enters the neural loss. The
+24 outcome-blind molecular-training biopsies are added to reconstruction/contrastive fitting in
+every fold; the six molecular-validation biopsies remain excluded. Inner-validation RMSE for
+`full clinical + z` chooses the encoder candidate. PCA dimensions are selected using
+`full clinical + PCA` on those same inner donors.
+
+Load the R module before entering the GPU container and retain the absolute `Rscript` path. The
+container must be able to execute that path because each completed inner and outer fold invokes
+the packaged lme4 helper:
+
+```bash
+cd /storage/brno2/home/anuarali/DP/ARCHCON
+
+source /cvmfs/software.metacentrum.cz/modulefiles/5.3.1/loadmodules
+module load r/4.1.3-gcc-10.2.1-6xt26dl
+export R_LIBS="/storage/praha1/home/anuarali/Rpackages"
+export ARCHCON_RSCRIPT="$(command -v Rscript)"
+
+export ARCHCON_GPU_IMAGE="/cvmfs/singularity.metacentrum.cz/NGC/PyTorch:26.06-py3.SIF"
+export ARCHCON_GPU_PACKAGES="$PWD/gpu-runtime/py312-post9-clean"
+export SINGULARITYENV_PYTHONPATH="$ARCHCON_GPU_PACKAGES"
+export SINGULARITYENV_R_LIBS="$R_LIBS"
+
+mkdir -p "$ARCHCON_GPU_PACKAGES"
+singularity exec --nv "$ARCHCON_GPU_IMAGE" \
+  python -m pip install --upgrade --target "$ARCHCON_GPU_PACKAGES" \
+  "$PWD/archcon-0.5.16.post9-py3-none-any.whl"
+
+singularity exec --nv "$ARCHCON_GPU_IMAGE" "$ARCHCON_RSCRIPT" --version
+singularity exec --nv "$ARCHCON_GPU_IMAGE" python - <<'PY'
+import archcon
+import torch
+print("ArchCon:", archcon.__version__, archcon.__file__)
+print("CUDA:", torch.cuda.is_available(), torch.cuda.get_device_name(0))
+PY
+```
+
+Run all six frozen encoder arms and all three nested-selected PCA arms with the default 5×5
+outer CV and one donor-grouped inner holdout per outer fold:
+
+```bash
+singularity exec --nv "$ARCHCON_GPU_IMAGE" \
+  python -m archcon.evaluate_egfr_nested \
+  --project-root "$PWD" \
+  --data-dir "$PWD/data" \
+  --sweep-root "$PWD/sweeps/archcon-pretrain-0516-standardized" \
+  --sweep-root "$PWD/sweeps/archcon-pretrain-0516-per-gse" \
+  --sweep-root "$PWD/sweeps/archcon-pretrain-0516-global" \
+  --output-root "$PWD/evaluations/egfr-nested-infonce-seed-0" \
+  --device cuda \
+  --folds 5 \
+  --repeats 5 \
+  --inner-folds 5 \
+  --cv-seed 0 \
+  --contrastive-weights 0.01,0.05,0.1 \
+  --temperatures 0.05,0.1,0.2 \
+  --finetune-epochs 50 \
+  --finetune-batch-size 32 \
+  --finetune-learning-rate 0.0001 \
+  --projection-dim 16 \
+  --pca-dimensions 3,8,16 \
+  --rscript "$ARCHCON_RSCRIPT" \
+  --reuse-lasso-root "$PWD/evaluations/egfr-baselines-post7-all-methods-seed-0"
+```
+
+`--reuse-lasso-root` is accepted only if every saved repeat/fold/partition/patient/donor row is
+identical to the new manifest. To refit LASSO-AIC and LASSO-BIC instead, replace that option with
+`--run-lasso`; both models then use the same persisted outer folds, while lambda remains selected
+inside each outer-training fold by AIC or BIC. Omitting both options evaluates the neural, PCA,
+time-only, KDRI, and full-clinical mixed models without touching LASSO.
+
+The command is restart-safe. Completed outer folds are skipped, each neural candidate embedding
+has a contract-checked cache, and a changed checkpoint, split, grid, or fine-tuning control is
+rejected rather than mixed into an existing result directory. Principal outputs are:
+
+```text
+evaluations/egfr-nested-infonce-seed-0/
+├── nested_split_manifest.csv
+├── nested_split_manifest.csv.json
+├── nested_command_summary.json
+├── nested_complete_model_summary.csv
+└── nested_models/
+    ├── nested_evaluation_contract.json
+    ├── nested_inner_candidate_scores.csv
+    ├── nested_encoder_selections.csv
+    ├── nested_pca_selections.csv
+    ├── nested_outer_fold_metrics.csv
+    ├── nested_outer_oof_predictions.csv
+    ├── nested_model_summary.csv
+    └── parts/rXXX_fXXX/
 ```

@@ -70,11 +70,16 @@ def test_sweep_bundle_uses_cartesian_product_and_pbs_array(tmp_path: Path) -> No
     assert "--data-dir" in run_script
     assert "--output-root" in run_script
     assert '--run-directory "$STAGE_RUN_DIR"' in run_script
+    assert 'RESUME_ARGS=(--resume-checkpoint "$RESUME_CHECKPOINT")' in run_script
+    assert 'copy_optional "$PERSISTENT_RUN_DIR/best.pt"' in run_script
+    assert 'if [[ -f "$PERSISTENT_RUN_DIR/run_summary.json" ]]' in run_script
     assert 'latest.pt' in run_script
     assert 'timeout --signal=TERM' in run_script
     assert 'copy_atomic_to_persistent' in run_script
     assert 'shuf --output="$TASK_LIST"' in submit_script
     assert 'qsub -J "1-$submitted"' in submit_script
+    assert 'if [[ -f "$run_dir/run_summary.json" ]]' in submit_script
+    assert "-name '*.pt'" not in submit_script
 
     job_source = jobs[0].read_text(encoding="utf-8")
     assert "TRAINING_CONFIG = TrainingConfig(" in job_source
@@ -187,11 +192,13 @@ def test_recommended_comparison_sweep_has_1440_architecture_preprocessing_runs(t
     assert (root / "split.csv").is_file()
     submit_script = (root / "submit.sh").read_text(encoding="utf-8")
     assert 'qsub -J "1-$submitted"' in submit_script
-    assert 'find "$run_dir" -maxdepth 1 -type f -name \'*.pt\'' in submit_script
+    assert 'if [[ -f "$run_dir/run_summary.json" ]]' in submit_script
+    assert 'resumable and $fresh starting from epoch 0' in submit_script
     run_script = (root / "run_array.pbs.sh").read_text(encoding="utf-8")
     assert "ngpus=" not in run_script
     assert "ncpus=1" in run_script
     assert 'export OMP_NUM_THREADS="${NCPUS:-1}"' in run_script
+    assert 'RESUME_ARGS=(--resume-checkpoint "$RESUME_CHECKPOINT")' in run_script
     jobs = sorted((root / "jobs").glob("run_*.py"))
     assert len(jobs) == 1440
     # The original 900-slot ordering is stable for unaffected RMA runs.

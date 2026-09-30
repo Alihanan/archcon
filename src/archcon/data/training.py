@@ -2017,6 +2017,17 @@ def train_autoencoder_stream(
             history.aux_label = _auxiliary_label(config.loss_name)
             if history.selection_score:
                 best_epoch = history.val_epoch[int(np.argmin(history.selection_score))]
+            # Make an exact-resume invocation finalizable even when the loaded
+            # checkpoint has already reached the configured maximum epoch. In
+            # that case the epoch loop is empty, but the generated job must
+            # still write run_summary.json into the requested run directory.
+            staged_latest = output_dir / "latest.pt"
+            latest_checkpoint = str(
+                staged_latest if staged_latest.is_file() else Path(checkpoint_path)
+            )
+            staged_best = output_dir / "best.pt"
+            if staged_best.is_file():
+                best_checkpoint = str(staged_best)
 
         model = base_model
         compiled = False
